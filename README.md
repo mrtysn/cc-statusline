@@ -46,7 +46,3 @@ Reloads automatically on save.
 
 - Node.js (uses only `child_process`, `fs`, `path` — no npm install)
 - `git` on `PATH` (optional; git segment is skipped when unavailable)
-
-## License
-
-MIT
