@@ -2,20 +2,14 @@
 'use strict';
 
 const { execFileSync } = require('child_process');
-const { readFileSync } = require('fs');
+const { existsSync, readFileSync } = require('fs');
+const { isAbsolute, join } = require('path');
 
 const ESC = '\x1b[';
 const RESET = ESC + '0m';
-const BOLD = ESC + '1m';
 const DIM = ESC + '2m';
 const RED = ESC + '31m';
-const GREEN = ESC + '32m';
 const YELLOW = ESC + '33m';
-const MAGENTA = ESC + '35m';
-const ORANGE = ESC + '38;5;208m';
-
-const args = process.argv.slice(2);
-const ACCENT = args.includes('--accent') ? ORANGE : MAGENTA;
 
 function paint(color, s) {
   return color + s + RESET;
@@ -63,14 +57,85 @@ function parseResetsAt(v) {
   return null;
 }
 
+function fmtSessionStart(durationMs) {
+  if (durationMs == null || durationMs < 0) return null;
+  const d = new Date(Date.now() - durationMs);
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${days[d.getDay()]} ${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
+}
+
 function git(cwd) {
   try {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] };
-    const branch = execFileSync('git', ['-C', cwd, 'branch', '--show-current'], opts).trim();
-    if (!branch) return null;
-    const dirty =
-      execFileSync('git', ['-C', cwd, 'status', '--porcelain'], opts).trim().length > 0;
-    return { branch, dirty };
+    const out = execFileSync(
+      'git',
+      ['-C', cwd, 'status', '--porcelain=v2', '--branch'],
+      opts
+    );
+
+    const info = {
+      branch: null,
+      ahead: 0,
+      behind: 0,
+      staged: 0,
+      unstaged: 0,
+      untracked: 0,
+      conflicts: 0,
+      action: null,
+    };
+    let oid = null;
+    let detached = false;
+
+    for (const line of out.split('\n')) {
+      if (!line) continue;
+      if (line.startsWith('# branch.oid ')) {
+        oid = line.slice(13);
+      } else if (line.startsWith('# branch.head ')) {
+        const head = line.slice(14);
+        if (head === '(detached)') detached = true;
+        else info.branch = head;
+      } else if (line.startsWith('# branch.ab ')) {
+        const m = line.match(/\+(\d+) -(\d+)/);
+        if (m) {
+          info.ahead = parseInt(m[1], 10);
+          info.behind = parseInt(m[2], 10);
+        }
+      } else if (line[0] === '1' || line[0] === '2') {
+        const xy = line.slice(2, 4);
+        if (xy[0] !== '.') info.staged++;
+        if (xy[1] !== '.') info.unstaged++;
+      } else if (line[0] === 'u') {
+        info.conflicts++;
+      } else if (line[0] === '?') {
+        info.untracked++;
+      }
+    }
+
+    if (detached && oid) info.branch = '@' + oid.slice(0, 7);
+    if (!info.branch) return null;
+
+    try {
+      const gitDir = execFileSync('git', ['-C', cwd, 'rev-parse', '--git-dir'], opts).trim();
+      const absGitDir = isAbsolute(gitDir) ? gitDir : join(cwd, gitDir);
+      const actionMap = [
+        ['rebase-merge', 'rebase'],
+        ['rebase-apply', 'rebase'],
+        ['MERGE_HEAD', 'merge'],
+        ['CHERRY_PICK_HEAD', 'cherry-pick'],
+        ['REVERT_HEAD', 'revert'],
+        ['BISECT_LOG', 'bisect'],
+      ];
+      for (const [file, name] of actionMap) {
+        if (existsSync(join(absGitDir, file))) {
+          info.action = name;
+          break;
+        }
+      }
+    } catch {}
+
+    return info;
   } catch {
     return null;
   }
@@ -96,6 +161,9 @@ function main() {
   }
 
   const sessionId = input.session_id || '';
+  const durationMs = input.cost?.total_duration_ms ?? null;
+  const startedAt = fmtSessionStart(durationMs);
+  const elapsed = fmtDuration(durationMs);
   const ctxPct = input.context_window?.used_percentage ?? null;
   const cwd =
     input.cwd ||
@@ -113,9 +181,17 @@ function main() {
     parts.push(paint(DIM, sessionId));
   }
 
+  if (startedAt) {
+    parts.push(paint(DIM, startedAt));
+  }
+
   if (ctxPct != null) {
     const col = threshColor(ctxPct);
     parts.push(paint(DIM, 'ctx ') + paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
+  }
+
+  if (elapsed) {
+    parts.push(paint(DIM, elapsed));
   }
 
   const five = renderBar('5h', fiveHour);
@@ -129,11 +205,22 @@ function main() {
 
   const g = git(cwd);
   if (g) {
-    parts.push(paint(DIM, ` ${g.branch}${g.dirty ? '*' : ''}`));
+    let s = ` ${g.branch}`;
+    if (g.ahead) s += ` ⇡${g.ahead}`;
+    if (g.behind) s += ` ⇣${g.behind}`;
+    if (g.action) s += ` ${g.action}`;
+    if (g.conflicts) s += ` ~${g.conflicts}`;
+    if (g.staged) s += ` +${g.staged}`;
+    if (g.unstaged) s += ` !${g.unstaged}`;
+    if (g.untracked) s += ` ?${g.untracked}`;
+    parts.push(paint(DIM, s));
   }
 
-  const sep = paint(DIM, ' │ ');
-  process.stdout.write(parts.join(sep));
+  if (parts.length === 0) return;
+  const sep = paint(DIM, ' ▸ ');
+  const open = paint(DIM, '◆ ');
+  const close = paint(DIM, ' ◆');
+  process.stdout.write(open + parts.join(sep) + close);
 }
 
 try {
