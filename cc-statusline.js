@@ -45,6 +45,11 @@ function fmtDuration(ms) {
   return `${Math.floor(hrs / 24)}d`;
 }
 
+function fmtHoursRemaining(etaMs) {
+  if (etaMs == null || etaMs <= 0) return null;
+  return `${(etaMs / 3600000).toFixed(1)}h`;
+}
+
 function parseResetsAt(v) {
   if (v == null) return null;
   // Claude Code pipes resets_at as unix epoch seconds; tolerate ISO strings too.
@@ -141,14 +146,22 @@ function git(cwd) {
   }
 }
 
-function renderBar(label, limit) {
+function renderBar(label, limit, opts = {}) {
   const pct = limit?.used_percentage;
   if (pct == null) return null;
   const col = threshColor(pct);
   const resetMs = parseResetsAt(limit.resets_at);
   const etaMs = resetMs != null ? resetMs - Date.now() : null;
-  const eta = pct >= 90 && etaMs && etaMs > 0 ? ' ' + paint(DIM, '⟳' + fmtDuration(etaMs)) : '';
-  return paint(DIM, `${label} `) + paint(col, `${bar(pct)} ${Math.round(pct)}%`) + eta;
+  let displayLabel = label;
+  if (opts.liveCountdown) {
+    const live = fmtHoursRemaining(etaMs);
+    if (live) displayLabel = live;
+  }
+  const eta =
+    !opts.liveCountdown && pct >= 90 && etaMs && etaMs > 0
+      ? ' ' + paint(DIM, '⟳' + fmtDuration(etaMs))
+      : '';
+  return paint(DIM, `${displayLabel} `) + paint(col, `${bar(pct)} ${Math.round(pct)}%`) + eta;
 }
 
 function main() {
@@ -181,20 +194,17 @@ function main() {
     parts.push(paint(DIM, sessionId));
   }
 
-  if (startedAt) {
-    parts.push(paint(DIM, startedAt));
+  const timeCluster = [startedAt, elapsed].filter(Boolean).join(' · ');
+  if (timeCluster) {
+    parts.push(paint(DIM, timeCluster));
   }
 
   if (ctxPct != null) {
     const col = threshColor(ctxPct);
-    parts.push(paint(DIM, 'ctx ') + paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
+    parts.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
   }
 
-  if (elapsed) {
-    parts.push(paint(DIM, elapsed));
-  }
-
-  const five = renderBar('5h', fiveHour);
+  const five = renderBar('5h', fiveHour, { liveCountdown: true });
   if (five) parts.push(five);
 
   const sevenPct = sevenDay?.used_percentage;
