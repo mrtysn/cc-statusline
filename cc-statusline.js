@@ -71,6 +71,19 @@ function fmtSessionStart(durationMs) {
   return `${days[d.getDay()]} ${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
 }
 
+// "Opus 4.8 (1M context)" -> "Opus 4.8 1M". Drops the parenthetical's "context"
+// noise while keeping the rest; if the convention changes, degrades to the
+// untouched display name rather than producing a wrong label.
+function shortenModel(name) {
+  if (!name) return null;
+  return (
+    name.replace(/\s*\(([^)]*)\)\s*$/, (_, inner) => {
+      const t = inner.replace(/\bcontext\b/i, '').replace(/\s+/g, ' ').trim();
+      return t ? ' ' + t : '';
+    }) || null
+  );
+}
+
 function git(cwd) {
   try {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] };
@@ -174,6 +187,7 @@ function main() {
   }
 
   const sessionId = input.session_id || '';
+  const model = shortenModel(input.model?.display_name || input.model?.id);
   const durationMs = input.cost?.total_duration_ms ?? null;
   const startedAt = fmtSessionStart(durationMs);
   const elapsed = fmtDuration(durationMs);
@@ -192,6 +206,10 @@ function main() {
 
   if (sessionId) {
     parts.push(paint(DIM, sessionId));
+  }
+
+  if (model) {
+    parts.push(paint(DIM, model));
   }
 
   const timeCluster = [startedAt, elapsed].filter(Boolean).join(' · ');
