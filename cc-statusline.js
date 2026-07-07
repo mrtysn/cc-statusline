@@ -23,15 +23,15 @@ function readStdin() {
   }
 }
 
-function bar(pct, width = 10) {
+function bar(pct, width = 5) {
   const clamped = Math.max(0, Math.min(100, pct));
   const filled = Math.round((clamped / 100) * width);
   return '▰'.repeat(filled) + '▱'.repeat(width - filled);
 }
 
 function threshColor(pct) {
-  if (pct >= 85) return RED;
-  if (pct >= 70) return YELLOW;
+  if (pct >= 92) return RED;
+  if (pct >= 80) return YELLOW;
   return DIM;
 }
 
@@ -65,10 +65,11 @@ function parseResetsAt(v) {
 function fmtSessionStart(durationMs) {
   if (durationMs == null || durationMs < 0) return null;
   const d = new Date(Date.now() - durationMs);
-  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${days[d.getDay()]} ${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
+  return `${mo}/${dd} ${hh}:${mm}`;
 }
 
 // "Opus 4.8 (1M context)" -> "Opus 4.8 1M". Drops the parenthetical's "context"
@@ -190,7 +191,6 @@ function main() {
   const model = shortenModel(input.model?.display_name || input.model?.id);
   const durationMs = input.cost?.total_duration_ms ?? null;
   const startedAt = fmtSessionStart(durationMs);
-  const elapsed = fmtDuration(durationMs);
   const ctxPct = input.context_window?.used_percentage ?? null;
   const cwd =
     input.cwd ||
@@ -212,9 +212,8 @@ function main() {
     parts.push(paint(DIM, model));
   }
 
-  const timeCluster = [startedAt, elapsed].filter(Boolean).join(' · ');
-  if (timeCluster) {
-    parts.push(paint(DIM, timeCluster));
+  if (startedAt) {
+    parts.push(paint(DIM, startedAt));
   }
 
   if (ctxPct != null) {
@@ -233,15 +232,14 @@ function main() {
 
   const g = git(cwd);
   if (g) {
-    let s = ` ${g.branch}`;
-    if (g.ahead) s += ` ⇡${g.ahead}`;
-    if (g.behind) s += ` ⇣${g.behind}`;
-    if (g.action) s += ` ${g.action}`;
-    if (g.conflicts) s += ` ~${g.conflicts}`;
-    if (g.staged) s += ` +${g.staged}`;
-    if (g.unstaged) s += ` !${g.unstaged}`;
-    if (g.untracked) s += ` ?${g.untracked}`;
-    parts.push(paint(DIM, s));
+    const dirty = g.staged || g.unstaged || g.untracked;
+    const bits = [];
+    if (g.ahead) bits.push(`⇡${g.ahead}`);
+    if (g.behind) bits.push(`⇣${g.behind}`);
+    if (g.action) bits.push(g.action);
+    if (g.conflicts) bits.push(`~${g.conflicts}`);
+    bits.push(`${dirty ? '*' : ''}${g.branch}`);
+    parts.push(paint(DIM, bits.join(' ')));
   }
 
   if (parts.length === 0) return;
