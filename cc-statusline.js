@@ -8,6 +8,7 @@ const { isAbsolute, join } = require('path');
 const ESC = '\x1b[';
 const RESET = ESC + '0m';
 const DIM = ESC + '2m';
+const BOLD = ESC + '1m';
 const RED = ESC + '31m';
 const YELLOW = ESC + '33m';
 
@@ -208,8 +209,13 @@ function main() {
     parts.push(paint(DIM, sessionId));
   }
 
+  // used_percentage stays null until the first API call, so it doubles as a
+  // "nothing typed yet" flag. Shout the model in that window — after the first
+  // turn you are committed and the reminder is just noise.
+  const untouched = ctxPct == null;
+
   if (model) {
-    parts.push(paint(DIM, model));
+    parts.push(paint(untouched ? BOLD + YELLOW : DIM, model));
   }
 
   if (startedAt) {
