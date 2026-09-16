@@ -129,17 +129,17 @@ function renderCache(cache) {
   if (!cache?.caching_observed) return null;
   const expiresMs = parseEpoch(cache.expires_at);
   const leftMs = expiresMs != null ? expiresMs - Date.now() : null;
-  if (cache.warm && leftMs == null) return paint(DIM, 'cache warm');
+  if (cache.warm && leftMs == null) return paint(DIM, 'cch warm');
   if (cache.warm && leftMs > 0) {
     // Colours by how much of the TTL has elapsed, on the same scale as the bars.
     const ttlMs = parseTtl(cache.ttl);
     const col = ttlMs ? threshColor(100 * (1 - leftMs / ttlMs)) : DIM;
     // Rounds up so a cache that is still warm never reads as 0m.
-    return paint(col, 'cache ' + fmtDuration(Math.ceil(leftMs / 60000) * 60000));
+    return paint(col, 'cch ' + fmtDuration(Math.ceil(leftMs / 60000) * 60000));
   }
   const rebuild = cache.recache_tokens_if_cold;
   const detail = rebuild ? ` · ${fmtTokens(rebuild)} to rebuild` : '';
-  return paint(YELLOW, 'cache cold' + detail);
+  return paint(YELLOW, 'cch cold' + detail);
 }
 
 function git(cwd) {
@@ -333,9 +333,12 @@ function main() {
   const bodyWidth = (row) => visibleWidth(row.left + row.joint + row.right);
   const width = Math.max(0, ...rows.map(bodyWidth));
   const lines = rows.map((row) => {
-    // The gap goes before the joint so the right group keeps its separator.
-    const pad = ' '.repeat(width - bodyWidth(row));
-    return open + row.left + pad + row.joint + row.right + close;
+    if (!row.joint) return open + row.left + ' '.repeat(width - bodyWidth(row)) + row.right + close;
+    // Centres the joint's arrow in the gap; an odd split puts the extra space on the right.
+    const spaces = width - bodyWidth(row) + 2;
+    const before = Math.floor(spaces / 2);
+    const arrow = paint(DIM, ' '.repeat(before) + '▸' + ' '.repeat(spaces - before));
+    return open + row.left + arrow + row.right + close;
   });
   if (lines.length) process.stdout.write(lines.join('\n'));
 }
