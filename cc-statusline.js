@@ -265,7 +265,7 @@ function main() {
   // "nothing typed yet" flag. Shout the model and effort in that window —
   // after the first turn you are committed and the reminder is just noise.
   const untouched = ctxPct == null;
-  const pick = untouched ? BOLD + YELLOW : DIM;
+  const pick = untouched ? BOLD + YELLOW : '';
 
   if (model) {
     usage.push(paint(pick, model));

@@ -24,7 +24,7 @@ The first row covers the model and usage; the second covers the session and wher
 | `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
 | `⇡1 *main` | Git branch, ahead (`⇡`) / behind (`⇣`), in-progress action (rebase/merge/…), conflicts (`~`), and `*` when there are staged, unstaged or untracked changes |
 
-Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model and effort are highlighted until the first prompt of a session.
+Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model, effort and the directory name are drawn at normal brightness and everything else is faint; model and effort are bold yellow until the first prompt of a session.
 
 ## Install
 
