@@ -41,6 +41,9 @@ const TOPIC_REFRESH_MS = 10 * 60000;
 const TOPIC_LOCK_STALE_MS = 2 * 60000;
 const TOPIC_KEEP_MS = 30 * 86400000;
 const TOPIC_MAX_CHARS = 40;
+// A changed topic is yellow for one refreshInterval from the first redraw that
+// shows it, so the next idle tick is the one that returns it to normal.
+const TOPIC_HIGHLIGHT_MS = 60000;
 const TRANSCRIPT_TAIL_BYTES = 512 * 1024;
 const TRANSCRIPT_EXCERPT_CHARS = 8000;
 
@@ -429,6 +432,7 @@ function topicPaths(sessionId) {
     manual: join(TOPIC_DIR, `${sessionId}.manual`),
     auto: join(TOPIC_DIR, `${sessionId}.json`),
     lock: join(TOPIC_DIR, `${sessionId}.lock`),
+    seen: join(TOPIC_DIR, `${sessionId}.seen`),
   };
 }
 
@@ -450,20 +454,38 @@ function readText(file) {
   }
 }
 
-// A manual topic wins; the auto one is dimmer so the two can be told apart.
-// Starts a background refresh of the auto topic when the transcript has moved on.
+// A manual topic wins over the auto one. Starts a background refresh of the
+// auto topic when the transcript has moved on.
 function renderTopic(sessionId, transcriptPath) {
   const paths = topicPaths(sessionId);
   if (!paths) return null;
-  const manual = cleanTopic(readText(paths.manual));
-  if (manual) return manual;
-  let auto = null;
+  let topic = cleanTopic(readText(paths.manual));
+  if (!topic) {
+    let auto = null;
+    try {
+      auto = JSON.parse(readText(paths.auto));
+    } catch {}
+    maybeRefreshTopic(paths, auto, transcriptPath, sessionId);
+    topic = cleanTopic(auto?.topic);
+  }
+  if (!topic) return null;
+  return paint(topicIsNew(paths, topic) ? YELLOW : '', topic);
+}
+
+// Remembers when this topic was first drawn; a different topic restarts the clock.
+function topicIsNew(paths, topic) {
+  let seen = null;
   try {
-    auto = JSON.parse(readText(paths.auto));
+    seen = JSON.parse(readText(paths.seen));
   } catch {}
-  maybeRefreshTopic(paths, auto, transcriptPath, sessionId);
-  const topic = cleanTopic(auto?.topic);
-  return topic ? paint(DIM, topic) : null;
+  if (seen?.topic !== topic) {
+    seen = { topic, shown_at: Date.now() };
+    try {
+      mkdirSync(TOPIC_DIR, { recursive: true });
+      writeFileSync(paths.seen, JSON.stringify(seen));
+    } catch {}
+  }
+  return Date.now() - seen.shown_at < TOPIC_HIGHLIGHT_MS;
 }
 
 function maybeRefreshTopic(paths, auto, transcriptPath, sessionId) {
@@ -595,9 +617,9 @@ function transcriptExcerpt(transcriptPath) {
     room -= cut.length;
   }
   if (!recent.length) return null;
-  // A finished assistant turn anywhere means Claude has replied at least once.
-  const endTurn = '"stop_reason":"end_turn"';
-  if (!head.text.includes(endTurn) && !tail.text.includes(endTurn)) return { replied: false };
+  // Only a short transcript can still be waiting for Claude's first reply, and
+  // then all of it has been read, so the marker is found if it exists.
+  if (!head.partial && !head.text.includes('"stop_reason":"end_turn"')) return { replied: false };
   const opening = first && !recent.includes(first) ? `Opening request:\n${first.slice(0, 1000)}\n\n` : '';
   return { replied: true, text: `${opening}Most recent exchanges:\n${recent.join('\n\n')}` };
 }

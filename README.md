@@ -22,12 +22,12 @@ The first row covers the model and usage; the second, when there is one, names w
 | `7d ▰▰▰▰▰ 91% ⟳2d` | 7-day rate limit with time until reset (shown only at ≥90%) |
 | `5.2d ▰▰▰▰▱ 85%` | Fable weekly quota, labelled with days until it resets (hours in the last day), only while the session runs a Fable model; `fbl` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
 | `cch 42m` | Minutes until the prompt cache expires, coloured by how much of its TTL (5m or 1h) has elapsed; `cch cold · 38k to rebuild` once it has, with the tokens the next prompt reprocesses |
-| `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic` at normal brightness, otherwise one derived from the transcript, faint (see [Session topic](#session-topic)) |
+| `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic`, otherwise one derived from the transcript; yellow for a minute after it changes (see [Session topic](#session-topic)) |
 | `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
 | `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
 | `⇡1 *main` | Git branch, ahead (`⇡`) / behind (`⇣`), in-progress action (rebase/merge/…), conflicts (`~`), and `*` when there are staged, unstaged or untracked changes |
 
-Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model, effort and the directory name are drawn at normal brightness and everything else is faint, with the arrows and diamonds a fixed grey one step darker (`rgb(66,69,80)`, chosen for a dark theme); model and effort are bold yellow until the first prompt of a session.
+Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model, effort, the topic and the directory name are drawn at normal brightness and everything else is faint, with the arrows and diamonds a fixed grey one step darker (`rgb(66,69,80)`, chosen for a dark theme); model and effort are bold yellow until the first prompt of a session.
 
 ## Fable quota
 
@@ -47,7 +47,7 @@ A refresh starts when the cache is older than five minutes, or after one minute 
 
 ## Session topic
 
-`/statusline-topic <text>` sets the topic for the current session; `/statusline-topic` with no text clears it. The command writes `topics/<session id>.manual` in the cache directory, using the `CLAUDE_CODE_SESSION_ID` that Claude Code gives its shell.
+`/statusline-topic <text>` sets the topic for the current session; `/statusline-topic` with no text clears it. Whenever the topic shown changes, whether set by hand or refreshed, it is yellow for 60 seconds from the first redraw that shows it — one `refreshInterval`, so the next idle tick returns it to normal. The first draw is remembered in `topics/<session id>.seen`. The command writes `topics/<session id>.manual` in the cache directory, using the `CLAUDE_CODE_SESSION_ID` that Claude Code gives its shell.
 
 Without a manual topic, the script names the session itself with a detached `claude -p --model haiku`, caching the reply in `topics/<session id>.json`. A redraw only compares timestamps and never waits for the call.
 
@@ -63,6 +63,8 @@ A call starts on a redraw when all of these hold:
 Focus is read on redraw, and a tab switch does not cause one, so a refresh can start up to one `refreshInterval` after you focus a tab; the new topic shows on the redraw after the call returns (a few seconds). Outside iTerm2 there is no focus check, and the 10-minute floor is the only limit.
 
 The call sends the opening prompt and the most recent exchanges, with tool calls and injected system text removed (at most about 8,000 characters). It replaces Claude Code's default system prompt with a one-line naming instruction and turns thinking off, which keeps it to roughly 1–3k input and 10 output tokens; with the defaults it is about 9k input and 700 output. The child skips all settings sources, so it runs none of your hooks or this status line, and it keeps no session of its own. Failures keep the previous topic, go to `error.log` as `topic: …`, and wait out the same floor. Topic files untouched for 30 days are removed.
+
+`scripts/simulate-topic.zsh <transcript.jsonl>` runs the refresh rules end to end against a copy of a transcript, faking iTerm2 focus, and reports each check. It makes two real Haiku calls.
 
 ## Install
 
