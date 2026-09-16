@@ -1,10 +1,34 @@
 #!/usr/bin/env node
 'use strict';
 
-const { execFileSync } = require('child_process');
-const { existsSync, readFileSync } = require('fs');
+const { execFileSync, spawn } = require('child_process');
+const {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} = require('fs');
 const { homedir } = require('os');
 const { basename, isAbsolute, join, resolve, sep } = require('path');
+
+// The Fable weekly quota is not in the statusline input; it comes from the
+// account usage endpoint, cached once for every session on the machine.
+const CACHE_DIR = process.env.CC_STATUSLINE_CACHE_DIR || join(homedir(), '.cache', 'cc-statusline');
+const USAGE_FILE = join(CACHE_DIR, 'usage.json');
+const LOCK_FILE = join(CACHE_DIR, 'refresh.lock');
+const ERROR_LOG = join(CACHE_DIR, 'error.log');
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const REFRESH_MS = 5 * 60000;
+// Floor for the early refresh when the 7-day figure moves mid-turn.
+const MIN_REFRESH_MS = 60000;
+const LOCK_STALE_MS = 30000;
+const LOG_MAX_BYTES = 256 * 1024;
 
 const ESC = '\x1b[';
 const RESET = ESC + '0m';
@@ -75,9 +99,11 @@ function fmtDuration(ms) {
   return `${Math.floor(hrs / 24)}d`;
 }
 
+// Days past the first 24 hours, so a weekly reset reads 5.2d rather than 124.8h.
 function fmtHoursRemaining(etaMs) {
   if (etaMs == null || etaMs <= 0) return null;
-  return `${(etaMs / 3600000).toFixed(1)}h`;
+  const hrs = etaMs / 3600000;
+  return hrs >= 24 ? `${(hrs / 24).toFixed(1)}d` : `${hrs.toFixed(1)}h`;
 }
 
 function fmtTokens(n) {
@@ -259,6 +285,140 @@ function renderBar(label, limit, opts = {}) {
   return paint(DIM, `${displayLabel} `) + paint(col, `${bar(pct)} ${Math.round(pct)}%`) + eta;
 }
 
+function readUsageCache() {
+  try {
+    return JSON.parse(readFileSync(USAGE_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function logError(message) {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    if (existsSync(ERROR_LOG) && statSync(ERROR_LOG).size > LOG_MAX_BYTES) writeFileSync(ERROR_LOG, '');
+    appendFileSync(ERROR_LOG, `${new Date().toISOString()} ${message}\n`);
+  } catch {}
+}
+
+// Takes the refresh lock, clearing one left behind by a refresh that died.
+function takeLock() {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    try {
+      if (Date.now() - statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) unlinkSync(LOCK_FILE);
+    } catch {}
+    closeSync(openSync(LOCK_FILE, 'wx'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Starts a detached refresh when the cache is old, or when the free 7-day
+// figure has moved since the last fetch. Never waits for it.
+function maybeRefreshUsage(cached, sevenPct) {
+  const age = Date.now() - (cached?.fetched_at ?? 0);
+  const moved = sevenPct != null && cached?.seven_day_seen != null && sevenPct !== cached.seven_day_seen;
+  if (age < REFRESH_MS && !(moved && age >= MIN_REFRESH_MS)) return;
+  if (!takeLock()) return;
+  try {
+    const args = [__filename, '--refresh-usage'];
+    if (sevenPct != null) args.push(String(sevenPct));
+    spawn(process.execPath, args, { detached: true, stdio: 'ignore' }).unref();
+  } catch (err) {
+    logError(`spawn: ${err.message}`);
+    try {
+      unlinkSync(LOCK_FILE);
+    } catch {}
+  }
+}
+
+function readOauthToken() {
+  const out = execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 3000,
+  });
+  const token = JSON.parse(out).claudeAiOauth?.accessToken;
+  if (!token) throw new Error('no claudeAiOauth.accessToken in keychain entry');
+  return token;
+}
+
+// Runs in the detached child. Keeps the last good reading on failure and
+// records the failure, so the statusline can mark the value stale. The token
+// is never renewed here: renewal rotates the refresh token under Claude Code.
+async function refreshUsage(sevenArg) {
+  const previous = readUsageCache();
+  const next = {
+    fetched_at: Date.now(),
+    seven_day_seen: sevenArg != null && sevenArg !== '' ? Number(sevenArg) : previous?.seven_day_seen ?? null,
+    fable: previous?.fable ?? null,
+    error: null,
+  };
+  try {
+    let token;
+    try {
+      token = readOauthToken();
+    } catch (err) {
+      throw new Error(`keychain: ${err.message}`);
+    }
+    let res;
+    try {
+      res = await fetch(USAGE_URL, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'anthropic-beta': 'oauth-2025-04-20',
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch (err) {
+      throw new Error(`network: ${err.cause?.code || err.message}`);
+    }
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      throw new Error('parse: response is not JSON');
+    }
+    if (!Array.isArray(body.limits)) throw new Error('parse: no limits[] in response');
+    const entry = body.limits.find(
+      (l) => l?.kind === 'weekly_scoped' && l.scope?.model?.display_name === 'Fable'
+    );
+    if (entry && typeof entry.percent !== 'number') throw new Error('parse: Fable entry has no numeric percent');
+    next.fable = entry
+      ? { percent: entry.percent, resets_at: entry.resets_at ?? null, is_active: entry.is_active === true }
+      : null;
+  } catch (err) {
+    next.error = err.message;
+    logError(err.message);
+  }
+  try {
+    const tmp = `${USAGE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(next));
+    renameSync(tmp, USAGE_FILE);
+  } catch (err) {
+    logError(`cache write: ${err.message}`);
+  }
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
+// The Fable weekly bar, skipped when the server reports that quota inactive. A red
+// "!" follows when the last refresh failed; details are in error.log.
+function renderFable(cached) {
+  if (!cached) return null;
+  const mark = cached.error ? ' ' + paint(RED, '!') : '';
+  const fable = cached.fable;
+  if (!fable) return mark ? paint(DIM, 'fbl') + mark : null;
+  if (!fable.is_active) return null;
+  const shown = renderBar('fbl', { used_percentage: fable.percent, resets_at: fable.resets_at }, { liveCountdown: true });
+  return shown ? shown + mark : null;
+}
+
 function main() {
   const raw = readStdin();
   let input = {};
@@ -322,6 +482,15 @@ function main() {
     if (seven) top.push(seven);
   }
 
+  // The Fable quota only matters while this session runs Fable; other models
+  // neither show it nor spend requests on it.
+  if (/fable/i.test(`${input.model?.id ?? ''} ${input.model?.display_name ?? ''}`)) {
+    const usage = readUsageCache();
+    maybeRefreshUsage(usage, sevenPct ?? null);
+    const fable = renderFable(usage);
+    if (fable) top.push(fable);
+  }
+
   const cache = renderCache(input.prompt_cache);
   if (cache) top.push(cache);
 
@@ -362,9 +531,13 @@ function main() {
   if (lines.length) process.stdout.write(lines.join('\n'));
 }
 
-try {
-  main();
-} catch (err) {
-  process.stderr.write(`cc-statusline: ${err.message}\n`);
-  process.exit(0);
+if (process.argv[2] === '--refresh-usage') {
+  refreshUsage(process.argv[3]).catch((err) => logError(`refresh: ${err.message}`));
+} else {
+  try {
+    main();
+  } catch (err) {
+    process.stderr.write(`cc-statusline: ${err.message}\n`);
+    process.exit(0);
+  }
 }
