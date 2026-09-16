@@ -17,6 +17,10 @@ function paint(color, s) {
   return color + s + RESET;
 }
 
+function visibleWidth(s) {
+  return [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
+}
+
 function readStdin() {
   try {
     return readFileSync(0, 'utf8');
@@ -257,9 +261,11 @@ function main() {
   const fiveHour = rateLimits.five_hour || null;
   const sevenDay = rateLimits.seven_day || null;
 
-  // Row 1: model and usage. Row 2: session and location.
-  const usage = [];
-  const where = [];
+  // Row 1: model and usage. Row 2: session and location. Each row keeps its
+  // left group at the start and pushes its right group out to the width of
+  // the wider row, so both rows close in the same column.
+  const top = { left: [], right: [] };
+  const bottom = { left: [], right: [] };
 
   // used_percentage stays null until the first API call, so it doubles as a
   // "nothing typed yet" flag. Shout the model and effort in that window —
@@ -268,39 +274,39 @@ function main() {
   const pick = untouched ? BOLD + YELLOW : '';
 
   if (model) {
-    usage.push(paint(pick, model));
+    top.left.push(paint(pick, model));
   }
 
   if (effort) {
-    usage.push(paint(pick, effort));
+    top.left.push(paint(pick, effort));
   }
 
   if (startedAt) {
-    usage.push(paint(DIM, startedAt));
+    top.right.push(paint(DIM, startedAt));
   }
 
   if (ctxPct != null) {
     const col = threshColor(ctxPct);
-    usage.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
+    top.right.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
   }
 
   const five = renderBar('5h', fiveHour, { liveCountdown: true });
-  if (five) usage.push(five);
+  if (five) top.right.push(five);
 
   const sevenPct = sevenDay?.used_percentage;
   if (sevenPct != null && sevenPct >= 90) {
     const seven = renderBar('7d', sevenDay);
-    if (seven) usage.push(seven);
+    if (seven) top.right.push(seven);
   }
 
   const cache = renderCache(input.prompt_cache);
-  if (cache) usage.push(cache);
+  if (cache) top.right.push(cache);
 
   if (sessionId) {
-    where.push(paint(DIM, sessionId));
+    bottom.left.push(paint(DIM, sessionId));
   }
 
-  where.push(renderLocation(cwd, projectDir));
+  bottom.right.push(renderLocation(cwd, projectDir));
 
   const g = git(cwd);
   if (g) {
@@ -311,16 +317,27 @@ function main() {
     if (g.action) bits.push(g.action);
     if (g.conflicts) bits.push(`~${g.conflicts}`);
     bits.push(`${dirty ? '*' : ''}${g.branch}`);
-    where.push(paint(DIM, bits.join(' ')));
+    bottom.right.push(paint(DIM, bits.join(' ')));
   }
 
   const divider = paint(DIM, ' ▸ ');
   const open = paint(DIM, '◆ ');
   const close = paint(DIM, ' ◆');
-  const rows = [usage, where]
-    .filter((parts) => parts.length)
-    .map((parts) => open + parts.join(divider) + close);
-  if (rows.length) process.stdout.write(rows.join('\n'));
+  const rows = [top, bottom]
+    .map(({ left, right }) => ({
+      left: left.join(divider),
+      joint: left.length && right.length ? divider : '',
+      right: right.join(divider),
+    }))
+    .filter((row) => row.left || row.right);
+  const bodyWidth = (row) => visibleWidth(row.left + row.joint + row.right);
+  const width = Math.max(0, ...rows.map(bodyWidth));
+  const lines = rows.map((row) => {
+    // The gap goes before the joint so the right group keeps its separator.
+    const pad = ' '.repeat(width - bodyWidth(row));
+    return open + row.left + pad + row.joint + row.right + close;
+  });
+  if (lines.length) process.stdout.write(lines.join('\n'));
 }
 
 try {
