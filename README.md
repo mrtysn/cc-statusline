@@ -3,22 +3,28 @@
 A minimalist [Claude Code](https://claude.com/claude-code) status line. Single Node.js file, no dependencies.
 
 ```
-◆ <session-id> ▸ Wed 4/15 13:44 ▸ ctx ▰▱▱▱▱▱▱▱▱▱ 7% ▸ 51m ▸ 5h ▰▱▱▱▱▱▱▱▱▱ 6% ▸  main !1 ◆
+◆ Opus 5 ▸ xhigh ▸ 09/16 16:22 ▸ ▱▱▱▱▱ 8% ▸ 0.8h ▰▰▰▰▱ 87% ▸ cache 42m ◆
+◆ 3f2a9c1e-7b4d-4e8a-9f60-2d1c5b8e7a43 ▸ ~/dev/my-app ▸ ⇡1 *main ◆
 ```
 
 ## What it shows
 
+The first row covers the model and usage; the second covers the session and where it is running.
+
 | Segment | Meaning |
 |---|---|
-| `session-id` | Current Claude Code session ID |
-| `Wed 4/15 13:44` | Session start time (weekday, date, clock) |
-| `ctx ▰▱▱▱▱▱▱▱▱▱ 7%` | Context window usage |
-| `51m` | Session elapsed time |
-| `5h ▰▱▱▱▱▱▱▱▱▱ 6%` | 5-hour rate limit usage |
-| `7d ▰▱▱▱▱▱▱▱▱▱ 6%` | 7-day rate limit (shown only at ≥90%) |
-| ` main !1 ⇡2 ?3` | Git branch + ahead/behind, staged (`+`), unstaged (`!`), untracked (`?`), conflicts (`~`), in-progress action (rebase/merge/…) |
+| `Opus 5` | Active model |
+| `xhigh` | Reasoning effort, when the model supports it |
+| `09/16 16:22` | Session start time |
+| `▱▱▱▱▱ 8%` | Context window usage |
+| `0.8h ▰▰▰▰▱ 87%` | 5-hour rate limit usage, labelled with hours until it resets |
+| `7d ▰▰▰▰▰ 91% ⟳2d` | 7-day rate limit with time until reset (shown only at ≥90%) |
+| `cache 42m` | Minutes until the prompt cache expires, coloured by how much of its TTL (5m or 1h) has elapsed; `cache cold · 38k to rebuild` once it has, with the tokens the next prompt reprocesses |
+| `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
+| `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
+| `⇡1 *main` | Git branch, ahead (`⇡`) / behind (`⇣`), in-progress action (rebase/merge/…), conflicts (`~`), and `*` when there are staged, unstaged or untracked changes |
 
-Bars dim under 70%, turn yellow at ≥70%, red at ≥85%. When any bar hits ≥90%, a `⟳` ETA to reset is appended.
+Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model and effort are highlighted until the first prompt of a session.
 
 ## Install
 
@@ -35,14 +41,19 @@ Then in `~/.claude/settings.json`:
 {
   "statusLine": {
     "type": "command",
-    "command": "/absolute/path/to/cc-statusline.js"
+    "command": "/absolute/path/to/cc-statusline.js",
+    "refreshInterval": 60
   }
 }
 ```
 
-Reloads automatically on save.
+`refreshInterval` keeps the rate-limit and cache countdowns current while a session is idle; without it they only update when Claude Code sends a new event. Edits to the script take effect on the next refresh.
 
 ## Requirements
 
-- Node.js (uses only `child_process`, `fs`, `path` — no npm install)
+- Node.js (uses only `child_process`, `fs`, `os`, `path` — no npm install)
 - `git` on `PATH` (optional; git segment is skipped when unavailable)
+
+## Preview
+
+`scripts/preview.zsh` pipes sample input through the script and prints every display state. Add `--color` to keep the ANSI colours.

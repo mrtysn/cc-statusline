@@ -3,7 +3,8 @@
 
 const { execFileSync } = require('child_process');
 const { existsSync, readFileSync } = require('fs');
-const { isAbsolute, join } = require('path');
+const { homedir } = require('os');
+const { basename, isAbsolute, join, resolve, sep } = require('path');
 
 const ESC = '\x1b[';
 const RESET = ESC + '0m';
@@ -51,9 +52,15 @@ function fmtHoursRemaining(etaMs) {
   return `${(etaMs / 3600000).toFixed(1)}h`;
 }
 
-function parseResetsAt(v) {
+function fmtTokens(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return String(n);
+}
+
+function parseEpoch(v) {
   if (v == null) return null;
-  // Claude Code pipes resets_at as unix epoch seconds; tolerate ISO strings too.
+  // Claude Code pipes timestamps as unix epoch seconds; tolerate ISO strings too.
   if (typeof v === 'number') return v * 1000;
   if (typeof v === 'string') {
     if (/^\d+$/.test(v)) return Number(v) * 1000;
@@ -61,6 +68,13 @@ function parseResetsAt(v) {
     return isNaN(t) ? null : t;
   }
   return null;
+}
+
+// "5m" / "1h" -> milliseconds.
+function parseTtl(v) {
+  const m = /^(\d+)([smh])$/.exec(v || '');
+  if (!m) return null;
+  return Number(m[1]) * { s: 1000, m: 60000, h: 3600000 }[m[2]];
 }
 
 function fmtSessionStart(durationMs) {
@@ -84,6 +98,44 @@ function shortenModel(name) {
       return t ? ' ' + t : '';
     }) || null
   );
+}
+
+function tildify(p) {
+  const home = homedir();
+  if (p === home) return '~';
+  return p.startsWith(home + sep) ? '~' + p.slice(home.length) : p;
+}
+
+// Dims the parent path so the directory name stands out.
+function renderPath(p) {
+  const shown = tildify(p);
+  const cut = shown.lastIndexOf(sep) + 1;
+  if (cut === 0 || cut === shown.length) return shown;
+  return paint(DIM, shown.slice(0, cut)) + shown.slice(cut);
+}
+
+// Names the launch directory first when the session has moved away from it.
+function renderLocation(cwd, projectDir) {
+  const here = renderPath(cwd);
+  if (!projectDir || resolve(projectDir) === resolve(cwd)) return here;
+  return paint(DIM, `${basename(projectDir)} → `) + here;
+}
+
+function renderCache(cache) {
+  if (!cache?.caching_observed) return null;
+  const expiresMs = parseEpoch(cache.expires_at);
+  const leftMs = expiresMs != null ? expiresMs - Date.now() : null;
+  if (cache.warm && leftMs == null) return paint(DIM, 'cache warm');
+  if (cache.warm && leftMs > 0) {
+    // Colours by how much of the TTL has elapsed, on the same scale as the bars.
+    const ttlMs = parseTtl(cache.ttl);
+    const col = ttlMs ? threshColor(100 * (1 - leftMs / ttlMs)) : DIM;
+    // Rounds up so a cache that is still warm never reads as 0m.
+    return paint(col, 'cache ' + fmtDuration(Math.ceil(leftMs / 60000) * 60000));
+  }
+  const rebuild = cache.recache_tokens_if_cold;
+  const detail = rebuild ? ` · ${fmtTokens(rebuild)} to rebuild` : '';
+  return paint(YELLOW, 'cache cold' + detail);
 }
 
 function git(cwd) {
@@ -165,7 +217,7 @@ function renderBar(label, limit, opts = {}) {
   const pct = limit?.used_percentage;
   if (pct == null) return null;
   const col = threshColor(pct);
-  const resetMs = parseResetsAt(limit.resets_at);
+  const resetMs = parseEpoch(limit.resets_at);
   const etaMs = resetMs != null ? resetMs - Date.now() : null;
   let displayLabel = label;
   if (opts.liveCountdown) {
@@ -190,51 +242,65 @@ function main() {
 
   const sessionId = input.session_id || '';
   const model = shortenModel(input.model?.display_name || input.model?.id);
+  const effort = input.effort?.level || null;
   const durationMs = input.cost?.total_duration_ms ?? null;
   const startedAt = fmtSessionStart(durationMs);
   const ctxPct = input.context_window?.used_percentage ?? null;
+  const projectDir = input.workspace?.project_dir || null;
   const cwd =
     input.cwd ||
     input.workspace?.current_dir ||
-    input.workspace?.project_dir ||
+    projectDir ||
     process.cwd();
 
   const rateLimits = input.rate_limits || {};
   const fiveHour = rateLimits.five_hour || null;
   const sevenDay = rateLimits.seven_day || null;
 
-  const parts = [];
-
-  if (sessionId) {
-    parts.push(paint(DIM, sessionId));
-  }
+  // Row 1: model and usage. Row 2: session and location.
+  const usage = [];
+  const where = [];
 
   // used_percentage stays null until the first API call, so it doubles as a
-  // "nothing typed yet" flag. Shout the model in that window — after the first
-  // turn you are committed and the reminder is just noise.
+  // "nothing typed yet" flag. Shout the model and effort in that window —
+  // after the first turn you are committed and the reminder is just noise.
   const untouched = ctxPct == null;
+  const pick = untouched ? BOLD + YELLOW : DIM;
 
   if (model) {
-    parts.push(paint(untouched ? BOLD + YELLOW : DIM, model));
+    usage.push(paint(pick, model));
+  }
+
+  if (effort) {
+    usage.push(paint(pick, effort));
   }
 
   if (startedAt) {
-    parts.push(paint(DIM, startedAt));
+    usage.push(paint(DIM, startedAt));
   }
 
   if (ctxPct != null) {
     const col = threshColor(ctxPct);
-    parts.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
+    usage.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
   }
 
   const five = renderBar('5h', fiveHour, { liveCountdown: true });
-  if (five) parts.push(five);
+  if (five) usage.push(five);
 
   const sevenPct = sevenDay?.used_percentage;
   if (sevenPct != null && sevenPct >= 90) {
     const seven = renderBar('7d', sevenDay);
-    if (seven) parts.push(seven);
+    if (seven) usage.push(seven);
   }
+
+  const cache = renderCache(input.prompt_cache);
+  if (cache) usage.push(cache);
+
+  if (sessionId) {
+    where.push(paint(DIM, sessionId));
+  }
+
+  where.push(renderLocation(cwd, projectDir));
 
   const g = git(cwd);
   if (g) {
@@ -245,14 +311,16 @@ function main() {
     if (g.action) bits.push(g.action);
     if (g.conflicts) bits.push(`~${g.conflicts}`);
     bits.push(`${dirty ? '*' : ''}${g.branch}`);
-    parts.push(paint(DIM, bits.join(' ')));
+    where.push(paint(DIM, bits.join(' ')));
   }
 
-  if (parts.length === 0) return;
-  const sep = paint(DIM, ' ▸ ');
+  const divider = paint(DIM, ' ▸ ');
   const open = paint(DIM, '◆ ');
   const close = paint(DIM, ' ◆');
-  process.stdout.write(open + parts.join(sep) + close);
+  const rows = [usage, where]
+    .filter((parts) => parts.length)
+    .map((parts) => open + parts.join(divider) + close);
+  if (rows.length) process.stdout.write(rows.join('\n'));
 }
 
 try {
