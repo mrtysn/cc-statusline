@@ -12,6 +12,8 @@ const DIM = ESC + '2m';
 const BOLD = ESC + '1m';
 const RED = ESC + '31m';
 const YELLOW = ESC + '33m';
+// Arrows and diamonds: a grey one step below faint, tuned for a dark blue-grey theme.
+const FRAME = ESC + '38;2;66;69;80m';
 
 function paint(color, s) {
   return color + s + RESET;
@@ -331,12 +333,12 @@ function main() {
   const lines = rows.map((parts) => {
     // Spreads the spare columns over every gap, the two inside the diamonds included.
     const gaps = spread(width - 2 - content(parts) - (parts.length - 1), 2 * parts.length);
-    let line = paint(DIM, '◆' + ' '.repeat(gaps[0]));
+    let line = paint(FRAME, '◆' + ' '.repeat(gaps[0]));
     parts.forEach((part, i) => {
-      if (i) line += paint(DIM, ' '.repeat(gaps[2 * i - 1]) + '▸' + ' '.repeat(gaps[2 * i]));
+      if (i) line += paint(FRAME, ' '.repeat(gaps[2 * i - 1]) + '▸' + ' '.repeat(gaps[2 * i]));
       line += part;
     });
-    return line + paint(DIM, ' '.repeat(gaps[gaps.length - 1]) + '◆');
+    return line + paint(FRAME, ' '.repeat(gaps[gaps.length - 1]) + '◆');
   });
   if (lines.length) process.stdout.write(lines.join('\n'));
 }
