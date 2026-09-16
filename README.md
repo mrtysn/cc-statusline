@@ -4,12 +4,12 @@ A minimalist [Claude Code](https://claude.com/claude-code) status line. Single N
 
 ```
 ◆ Opus 5 ▸ xhigh ▸ 09/16 16:22 ▸ ▱▱▱▱▱ 8% ▸ 0.8h ▰▰▰▰▱ 87% ▸ cch 42m ◆
-◆ 3f2a9c1e-7b4d-4e8a-9f60-2d1c5b8e7a43   ▸   ~/dev/my-app ▸ ⇡1 *main ◆
+◆ 3f2a9c1e-7b4d-4e8a-9f60-2d1c5b8e7a43  ▸  ~/dev/my-app ▸  ⇡1 *main  ◆
 ```
 
 ## What it shows
 
-The first row covers the model and usage; the second covers the session and where it is running. Each row keeps its first segments on the left (model and effort; session ID) and pushes the rest to the right, so both rows end in the same column; the separator arrow sits centred in the gap.
+The first row covers the model and usage; the second covers the session and where it is running. The narrower row is spread out with equal gaps around every segment, so both rows start and end in the same columns.
 
 | Segment | Meaning |
 |---|---|

@@ -21,6 +21,11 @@ function visibleWidth(s) {
   return [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
 }
 
+// Splits total into n integer parts that differ by at most one.
+function spread(total, n) {
+  return Array.from({ length: n }, (_, i) => Math.floor(((i + 1) * total) / n) - Math.floor((i * total) / n));
+}
+
 function readStdin() {
   try {
     return readFileSync(0, 'utf8');
@@ -261,11 +266,10 @@ function main() {
   const fiveHour = rateLimits.five_hour || null;
   const sevenDay = rateLimits.seven_day || null;
 
-  // Row 1: model and usage. Row 2: session and location. Each row keeps its
-  // left group at the start and pushes its right group out to the width of
-  // the wider row, so both rows close in the same column.
-  const top = { left: [], right: [] };
-  const bottom = { left: [], right: [] };
+  // Row 1: model and usage. Row 2: session and location. The narrower row is
+  // spread out so both rows span the same width.
+  const top = [];
+  const bottom = [];
 
   // used_percentage stays null until the first API call, so it doubles as a
   // "nothing typed yet" flag. Shout the model and effort in that window —
@@ -274,39 +278,39 @@ function main() {
   const pick = untouched ? BOLD + YELLOW : '';
 
   if (model) {
-    top.left.push(paint(pick, model));
+    top.push(paint(pick, model));
   }
 
   if (effort) {
-    top.left.push(paint(pick, effort));
+    top.push(paint(pick, effort));
   }
 
   if (startedAt) {
-    top.right.push(paint(DIM, startedAt));
+    top.push(paint(DIM, startedAt));
   }
 
   if (ctxPct != null) {
     const col = threshColor(ctxPct);
-    top.right.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
+    top.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
   }
 
   const five = renderBar('5h', fiveHour, { liveCountdown: true });
-  if (five) top.right.push(five);
+  if (five) top.push(five);
 
   const sevenPct = sevenDay?.used_percentage;
   if (sevenPct != null && sevenPct >= 90) {
     const seven = renderBar('7d', sevenDay);
-    if (seven) top.right.push(seven);
+    if (seven) top.push(seven);
   }
 
   const cache = renderCache(input.prompt_cache);
-  if (cache) top.right.push(cache);
+  if (cache) top.push(cache);
 
   if (sessionId) {
-    bottom.left.push(paint(DIM, sessionId));
+    bottom.push(paint(DIM, sessionId));
   }
 
-  bottom.right.push(renderLocation(cwd, projectDir));
+  bottom.push(renderLocation(cwd, projectDir));
 
   const g = git(cwd);
   if (g) {
@@ -317,28 +321,22 @@ function main() {
     if (g.action) bits.push(g.action);
     if (g.conflicts) bits.push(`~${g.conflicts}`);
     bits.push(`${dirty ? '*' : ''}${g.branch}`);
-    bottom.right.push(paint(DIM, bits.join(' ')));
+    bottom.push(paint(DIM, bits.join(' ')));
   }
 
-  const divider = paint(DIM, ' ▸ ');
-  const open = paint(DIM, '◆ ');
-  const close = paint(DIM, ' ◆');
-  const rows = [top, bottom]
-    .map(({ left, right }) => ({
-      left: left.join(divider),
-      joint: left.length && right.length ? divider : '',
-      right: right.join(divider),
-    }))
-    .filter((row) => row.left || row.right);
-  const bodyWidth = (row) => visibleWidth(row.left + row.joint + row.right);
-  const width = Math.max(0, ...rows.map(bodyWidth));
-  const lines = rows.map((row) => {
-    if (!row.joint) return open + row.left + ' '.repeat(width - bodyWidth(row)) + row.right + close;
-    // Centres the joint's arrow in the gap; an odd split puts the extra space on the right.
-    const spaces = width - bodyWidth(row) + 2;
-    const before = Math.floor(spaces / 2);
-    const arrow = paint(DIM, ' '.repeat(before) + '▸' + ' '.repeat(spaces - before));
-    return open + row.left + arrow + row.right + close;
+  const rows = [top, bottom].filter((parts) => parts.length);
+  const content = (parts) => parts.reduce((sum, part) => sum + visibleWidth(part), 0);
+  // Natural width: one space on each side of every arrow and inside each diamond.
+  const width = Math.max(0, ...rows.map((parts) => content(parts) + 3 * (parts.length - 1) + 4));
+  const lines = rows.map((parts) => {
+    // Spreads the spare columns over every gap, the two inside the diamonds included.
+    const gaps = spread(width - 2 - content(parts) - (parts.length - 1), 2 * parts.length);
+    let line = paint(DIM, '◆' + ' '.repeat(gaps[0]));
+    parts.forEach((part, i) => {
+      if (i) line += paint(DIM, ' '.repeat(gaps[2 * i - 1]) + '▸' + ' '.repeat(gaps[2 * i]));
+      line += part;
+    });
+    return line + paint(DIM, ' '.repeat(gaps[gaps.length - 1]) + '◆');
   });
   if (lines.length) process.stdout.write(lines.join('\n'));
 }
