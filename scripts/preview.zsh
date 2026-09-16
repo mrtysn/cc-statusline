@@ -58,3 +58,8 @@ usage null '"keychain: no claudeAiOauth.accessToken in keychain entry"'
 render "Fable refresh failed (no reading yet)" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
 usage "$(fable_at 85)" null
 render "Fable quota hidden on another model" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
+mkdir -p "$CC_STATUSLINE_CACHE_DIR/topics"
+print -r -- "{\"topic\":\"auth token refresh\",\"generated_at\":$((now * 1000)),\"error\":null}" > "$CC_STATUSLINE_CACHE_DIR/topics/$id.json"
+render "auto topic (faint)" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
+print -r -- "fixing the login redirect loop" > "$CC_STATUSLINE_CACHE_DIR/topics/$id.manual"
+render "manual topic" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
