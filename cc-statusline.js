@@ -14,6 +14,9 @@ const RED = ESC + '31m';
 const YELLOW = ESC + '33m';
 // Arrows and diamonds: a grey one step below faint, tuned for a dark blue-grey theme.
 const FRAME = ESC + '38;2;66;69;80m';
+// Claude Code indents the status line two columns; the space inside each
+// diamond is never narrower than that indent.
+const EDGE = 2;
 
 function paint(color, s) {
   return color + s + RESET;
@@ -26,6 +29,20 @@ function visibleWidth(s) {
 // Splits total into n integer parts that differ by at most one.
 function spread(total, n) {
   return Array.from({ length: n }, (_, i) => Math.floor(((i + 1) * total) / n) - Math.floor((i * total) / n));
+}
+
+// Hands out total columns across gaps, widening the narrowest first so the
+// gaps even out, and never going below each gap's minimum.
+function fillGaps(total, mins) {
+  let level = 0;
+  while (mins.reduce((sum, m) => sum + Math.max(m, level + 1), 0) <= total) level++;
+  const gaps = mins.map((m) => Math.max(m, level));
+  const lowest = gaps.flatMap((g, i) => (g === level ? [i] : []));
+  const extra = total - gaps.reduce((sum, g) => sum + g, 0);
+  spread(extra, lowest.length).forEach((add, j) => {
+    gaps[lowest[j]] += add;
+  });
+  return gaps;
 }
 
 function readStdin() {
@@ -328,11 +345,13 @@ function main() {
 
   const rows = [top, bottom].filter((parts) => parts.length);
   const content = (parts) => parts.reduce((sum, part) => sum + visibleWidth(part), 0);
-  // Natural width: one space on each side of every arrow and inside each diamond.
-  const width = Math.max(0, ...rows.map((parts) => content(parts) + 3 * (parts.length - 1) + 4));
+  // Minimum gaps: EDGE inside each diamond, one space on each side of every arrow.
+  const minGaps = (parts) => [EDGE, ...Array(2 * (parts.length - 1)).fill(1), EDGE];
+  const sum = (ns) => ns.reduce((total, n) => total + n, 0);
+  const width = Math.max(0, ...rows.map((parts) => 2 + content(parts) + (parts.length - 1) + sum(minGaps(parts))));
   const lines = rows.map((parts) => {
     // Spreads the spare columns over every gap, the two inside the diamonds included.
-    const gaps = spread(width - 2 - content(parts) - (parts.length - 1), 2 * parts.length);
+    const gaps = fillGaps(width - 2 - content(parts) - (parts.length - 1), minGaps(parts));
     let line = paint(FRAME, '◆' + ' '.repeat(gaps[0]));
     parts.forEach((part, i) => {
       if (i) line += paint(FRAME, ' '.repeat(gaps[2 * i - 1]) + '▸' + ' '.repeat(gaps[2 * i]));
