@@ -14,7 +14,7 @@ The first row covers the model and usage; the second, when there is one, names w
 
 | Segment | Meaning |
 |---|---|
-| `⣀⣤⣶⣿ ▃²` | Model tier as a slope of four braille steps, weakest to strongest: `⣀ ⣤ ⣶ ⣿` for Haiku, Sonnet, Opus and Fable, with the session's own lit and the other three in the frame grey; in a Fable session the lit step turns yellow or red with the Fable weekly quota, on the bars' thresholds (version and context size left out, since `/model` offers one version per tier; an unknown model shows its full name), then reasoning effort as a block height with its level in superscript, `▁¹ ▃² ▅³ ▇⁴ █⁵` for low, medium, high, xhigh and max, when the model supports it |
+| `⣀⣤⣶⣿ ▃²` | Model tier as a slope of four braille steps, weakest to strongest: `⣀ ⣤ ⣶ ⣿` for Haiku, Sonnet, Opus and Fable, with the session's own lit and the other three in the frame grey; in a Fable session the lit step turns yellow or red with the Fable weekly quota, on the bars' thresholds (version and context size left out, since `/model` offers one version per tier; an unknown model shows its full name), then reasoning effort as a block height with its level in superscript, `▁¹ ▃² ▅³ ▇⁴ █⁵` for low, medium, high, xhigh and max, the bar turning yellow or red with the context window, when the model supports it |
 | `09/16 16:22` | Session start time |
 | `╾──── 8%` | Context window usage |
 | `0.8h ━━━━╾ 87%` | 5-hour rate limit usage, labelled with hours until it resets |
@@ -26,7 +26,7 @@ The first row covers the model and usage; the second, when there is one, names w
 | `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
 | `⇡1 *main` | Git branch, ahead (`⇡`) / behind (`⇣`), in-progress action (rebase/merge/…), conflicts (`~`), and `*` when there are staged, unstaged or untracked changes |
 
-Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model, effort, the topic and the directory name are drawn at normal brightness and everything else is faint, with the arrows and diamonds a fixed grey one step darker (`rgb(66,69,80)`, chosen for a dark theme); model and effort are bold yellow until the first prompt of a session.
+Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model, effort, the topic and the directory name are drawn at normal brightness and everything else is faint, with the arrows and diamonds a fixed grey one step darker (`rgb(66,69,80)`, chosen for a dark theme); until the first prompt of a session, model and effort are spelled out in full and bold yellow (`Opus 4.8 1M xhigh`), so the choice is easy to check while it can still be changed.
 
 Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), so five cells show ten levels. When the first row would be wider than the terminal, every bar shrinks to three cells, and if that still does not fit, only the percentages remain. The width comes from the session's terminal: Claude Code runs the status line without one, so the script walks up its parent processes to the first with a tty (one `ps` per step) and reads that tty's size with `stty`, about 15 ms in all, on every redraw so a resize applies on the next one. `CC_STATUSLINE_COLUMNS` sets the width instead; with neither, bars stay full width.
 
