@@ -3,7 +3,7 @@
 A minimalist [Claude Code](https://claude.com/claude-code) status line. Single Node.js file, no dependencies.
 
 ```
-◆  Opus 5 ▸ xhigh ▸ 09/16 16:22 ▸ ╾──── 8% ▸ 0.8h ━━━━╾ 87% ▸ cch 42m  ◆
+◆  ⣀⣤⣶⣿ ▃² ▸ 09/16 16:22 ▸ ╾──── 8% ▸ 0.8h ━━━━╾ 87% ▸ 󰆼 42m  ◆
 ◆                          auth token refresh                          ◆
 ◆  3f2a9c1e-7b4d-4e8a-9f60-2d1c5b8e7a43  ▸  ~/dev/my-app  ▸  ⇡1 *main  ◆
 ```
@@ -14,14 +14,13 @@ The first row covers the model and usage; the second, when there is one, names w
 
 | Segment | Meaning |
 |---|---|
-| `Opus 5` | Active model |
-| `xhigh` | Reasoning effort, when the model supports it |
+| `⣀⣤⣶⣿ ▃²` | Model tier as a slope of four braille steps, weakest to strongest: `⣀ ⣤ ⣶ ⣿` for Haiku, Sonnet, Opus and Fable, with the session's own lit and the other three in the frame grey; in a Fable session the lit step turns yellow or red with the Fable weekly quota, on the bars' thresholds (version and context size left out, since `/model` offers one version per tier; an unknown model shows its full name), then reasoning effort as a block height with its level in superscript, `▁¹ ▃² ▅³ ▇⁴ █⁵` for low, medium, high, xhigh and max, when the model supports it |
 | `09/16 16:22` | Session start time |
 | `╾──── 8%` | Context window usage |
 | `0.8h ━━━━╾ 87%` | 5-hour rate limit usage, labelled with hours until it resets |
 | `2.6d ━━━━─ 75%` | 7-day rate limit, labelled with days until it resets (hours in the last day); shown only at ≥75%, `7d` when the reset time is unknown |
-| `5.2d ━━━━─ 85% fbl` | Fable weekly quota, labelled like the 7-day bar and tagged `fbl` so the two read apart; only while the session runs a Fable model; `fbl` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
-| `cch 42m` | Minutes until the prompt cache expires, coloured by how much of its TTL (5m or 1h) has elapsed; `cch cold · 38k to rebuild` once it has, with the tokens the next prompt reprocesses |
+| `5.2d ━━━━─ 85% 󰯺` | Fable weekly quota, labelled like the 7-day bar and tagged with the boxed Fable initial `󰯺` so the two read apart; only while the session runs a Fable model; `󰯺` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
+| `󰆼 42m` | Minutes until the prompt cache expires (`󰆼` is the Nerd Font database glyph), coloured by how much of its TTL (5m or 1h) has elapsed; `󰆼 cold · 38k to 󰑐` once it has, with the tokens the next prompt reprocesses to rebuild it |
 | `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic`, otherwise one derived from the transcript; yellow for a minute after it changes (see [Session topic](#session-topic)) |
 | `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
 | `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
@@ -43,7 +42,7 @@ One cache is shared by every session in `~/.cache/cc-statusline/` (override with
 | `refresh.lock` | Held while a refresh runs, so sessions never fetch in parallel |
 | `error.log` | One timestamped line per failed refresh: `keychain`, `network`, `http <status>`, or `parse` |
 
-A refresh starts when the cache is older than five minutes, or after one minute when the 7-day percentage in the status line input has moved since the last fetch. A failed refresh keeps the last good value and adds a red `!`; the next successful one clears it. The endpoint is undocumented: if its shape changes, the bar shows `fbl !` and `error.log` says `parse`.
+A refresh starts when the cache is older than five minutes, or after one minute when the 7-day percentage in the status line input has moved since the last fetch. A failed refresh keeps the last good value and adds a red `!`; the next successful one clears it. The endpoint is undocumented: if its shape changes, the bar shows `󰯺 !` and `error.log` says `parse`.
 
 `scripts/probe-usage.zsh` calls the endpoint once and prints every limit window, for checking what the account currently reports.
 
