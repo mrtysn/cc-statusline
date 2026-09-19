@@ -32,6 +32,16 @@ Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), 
 
 Four glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, the rebuild `󰑐`, the Fable tag `󰫳` and the weekly tag `󰇧`. Everything else is standard Unicode. Without a Nerd Font, set `CC_STATUSLINE_ICONS=0` to draw them as `cch`, `⟳`, `fbl` and `all` instead.
 
+## Agent Bar Hopping
+
+Every live session in one window: a macOS app in `src/main.swift`, built with `./bundle.sh` into `~/Applications/Agent Bar Hopping.app`.
+
+Each redraw writes that session's render arguments to `~/.cache/cc-statusline/live/<session-id>.json`. The app watches that directory and re-reads it when it changes, so the window repaints exactly when a status line does, with a 30-second tick to age the countdowns. Every cell stacks the segment the status line draws over the same value in words, both from `cc-statusline.js live`, which renders with this same `lib/render.js` — the window cannot disagree with the terminal. The account-wide quotas sit in a bar above the table, taken from whichever session redrew last, since they are the same for every session.
+
+A session is finished once its terminal has no process left, or once neither its status line nor its transcript has moved for 30 minutes; a busy session can go many minutes without a redraw. Finished sessions stay in the list, newest first, until there are more than 500. Clicking a row's directory brings its iTerm tab to the front, and clicking what it is doing copies the session id.
+
+`cc-statusline.js live [--columns N]` prints that whole snapshot as JSON and exits — the app's only subprocess besides one `ps`. No git calls, no network.
+
 ## Fable quota
 
 Claude Code does not pass per-model limits to the status line, so the Fable weekly figure comes from the account usage endpoint (`/api/oauth/usage`, the same one `/usage` reads). The script reads Claude Code's OAuth token from the macOS Keychain, never renews it, and makes the request in a detached background process so a redraw never waits on it. Sessions on other models neither show the bar nor make the request.

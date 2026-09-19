@@ -18,7 +18,7 @@ const {
 } = require('fs');
 const { homedir, tmpdir } = require('os');
 const { isAbsolute, join } = require('path');
-const { render, cleanTopic, isFable, TOPIC_MAX_CHARS } = require('./lib/render.js');
+const { render, summarize, segments, cleanTopic, isFable, TOPIC_MAX_CHARS } = require('./lib/render.js');
 
 // The Fable weekly quota is not in the statusline input; it comes from the
 // account usage endpoint, cached once for every session on the machine.
@@ -35,6 +35,15 @@ const LOG_MAX_BYTES = 256 * 1024;
 // Session topics: a manual one set by /statusline-topic, else one Haiku derives
 // from the transcript in the background.
 const TOPIC_DIR = join(CACHE_DIR, 'topics');
+// One file per session, rewritten on every redraw, for the live view to watch.
+const LIVE_DIR = join(CACHE_DIR, 'live');
+// A session is finished once neither its status line nor its transcript has
+// moved for this long. A busy session can go many minutes without a redraw —
+// Claude Code refreshes on events, not on a clock — so the transcript's mtime
+// is the real sign of life and the window is generous.
+const LIVE_STALE_MS = 30 * 60000;
+// Finished sessions kept for the app's history, newest first.
+const LIVE_HISTORY_MAX = 500;
 // In iTerm2 a refresh waits for the tab to be focused, so a short floor is
 // enough; elsewhere focus is unknown and the floor is the only limit.
 const TOPIC_FOCUSED_REFRESH_MS = 2 * 60000;
@@ -46,6 +55,12 @@ const TOPIC_KEEP_MS = 30 * 86400000;
 const TOPIC_HIGHLIGHT_MS = 60000;
 const TRANSCRIPT_TAIL_BYTES = 512 * 1024;
 const TRANSCRIPT_EXCERPT_CHARS = 8000;
+
+// `--flag value` from the command line, for the serve subcommand's options.
+function argValue(flag) {
+  const i = process.argv.indexOf(flag);
+  return i === -1 ? null : process.argv[i + 1];
+}
 
 function readStdin() {
   try {
@@ -368,11 +383,10 @@ function ownTty() {
 // Columns of the session's terminal, read on every redraw so a resize is
 // picked up on the next one. CC_STATUSLINE_COLUMNS overrides it; null when
 // neither is known, and the bars then stay full width.
-function terminalColumns() {
+function terminalColumns(tty) {
   const forced = Number(process.env.CC_STATUSLINE_COLUMNS);
   if (forced > 0) return forced;
   try {
-    const tty = ownTty();
     if (!tty) return null;
     // macOS's own stty reads another terminal with -f; GNU stty, often first on
     // PATH there, spells it -F.
@@ -550,6 +564,103 @@ function refreshTopic(sessionId, transcriptPath) {
   } catch {}
 }
 
+// The arguments of this redraw, so the live view can draw the same rows at its
+// own width. Written on every redraw, which is what paces the view; a failure
+// here never costs the status line itself.
+function writeSpool(args, tty) {
+  if (!args.input?.session_id) return;
+  try {
+    mkdirSync(LIVE_DIR, { recursive: true });
+    const file = join(LIVE_DIR, `${args.input.session_id.replace(/[^\w-]/g, '')}.json`);
+    writeFileSync(file, JSON.stringify({ updated_at: Date.now(), tty, args }));
+  } catch (err) {
+    logError(`spool: ${err.message}`);
+  }
+}
+
+// Every spooled session, drawn and tabulated, for the Agent Bar Hopping app:
+// `cc-statusline.js live [--columns N]` prints one JSON document and exits.
+// The terminals that still have a process on them. One ps for the whole
+// snapshot, so a closed tab is noticed at once rather than after the stale
+// window: its tty simply stops appearing.
+function ttysInUse() {
+  try {
+    const out = execFileSync('ps', ['-a', '-o', 'tty='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    });
+    return new Set(
+      out
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && line !== '??' && line !== '?')
+    );
+  } catch {
+    return null;
+  }
+}
+
+function liveSnapshot(columns) {
+  let names = [];
+  try {
+    names = readdirSync(LIVE_DIR).filter((n) => n.endsWith('.json'));
+  } catch {
+    return { live: [], history: [] };
+  }
+
+  const entries = [];
+  for (const name of names) {
+    const file = join(LIVE_DIR, name);
+    try {
+      const entry = JSON.parse(readFileSync(file, 'utf8'));
+      if (!entry?.args?.input) continue;
+      // The transcript grows while the session works, whether or not the status
+      // line is redrawn; one stat per session, no git and no network.
+      let activeAt = entry.updated_at;
+      const transcript = entry.args.input.transcript_path;
+      if (transcript) {
+        try {
+          activeAt = Math.max(activeAt, statSync(transcript).mtimeMs);
+        } catch {}
+      }
+      entries.push({
+        file,
+        updated_at: entry.updated_at,
+        active_at: activeAt,
+        tty: entry.tty || null,
+        rows: render({ ...entry.args, columns }).split('\n'),
+        summary: summarize(entry.args),
+        // The row's own segments, so a grid cell can show what the bar shows.
+        segments: segments({ input: entry.args.input, usage: entry.args.usage, width: 5 }),
+      });
+    } catch {
+      // A half-written file is picked up on the next read.
+    }
+  }
+
+  const now = Date.now();
+  const ttys = ttysInUse();
+  // A session whose terminal is gone has ended, however recently it drew.
+  const onLiveTty = (e) => !ttys || !e.tty || ttys.has(e.tty.replace(/^\/dev\//, ''));
+  const live = entries
+    .filter((e) => onLiveTty(e) && now - e.active_at < LIVE_STALE_MS)
+    .sort((a, b) => String(a.tty).localeCompare(String(b.tty)) || a.updated_at - b.updated_at);
+  const ended = entries
+    .filter((e) => !(onLiveTty(e) && now - e.active_at < LIVE_STALE_MS))
+    .sort((a, b) => b.active_at - a.active_at);
+
+  // The oldest finished sessions fall off the end of the history.
+  for (const stale of ended.slice(LIVE_HISTORY_MAX)) {
+    try {
+      unlinkSync(stale.file);
+    } catch {}
+  }
+
+  const strip = ({ file, ...rest }) => rest;
+  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).map(strip) };
+}
+
 function main() {
   const raw = readStdin();
   let input = {};
@@ -569,21 +680,30 @@ function main() {
     maybeRefreshUsage(usage, input.rate_limits?.seven_day?.used_percentage ?? null);
   }
 
-  const out = render({
+  const tty = ownTty();
+  const args = {
     input,
     cwd,
     usage,
     topic: renderTopic(input.session_id || '', input.transcript_path),
     git: git(cwd),
     home: homedir(),
-    columns: terminalColumns(),
+  };
+  writeSpool(args, tty);
+
+  const out = render({
+    ...args,
+    columns: terminalColumns(tty),
     // Text in place of the few Nerd Font glyphs, for terminals without one.
     icons: process.env.CC_STATUSLINE_ICONS !== '0',
   });
   if (out) process.stdout.write(out);
 }
 
-if (process.argv[2] === '--refresh-usage') {
+if (process.argv[2] === 'live') {
+  const columns = Number(argValue('--columns')) || 120;
+  process.stdout.write(JSON.stringify(liveSnapshot(columns)) + '\n');
+} else if (process.argv[2] === '--refresh-usage') {
   refreshUsage(process.argv[3]).catch((err) => logError(`refresh: ${err.message}`));
 } else if (process.argv[2] === '--refresh-topic') {
   refreshTopic(process.argv[3], process.argv[4]);
