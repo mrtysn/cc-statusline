@@ -264,13 +264,20 @@ func ago(_ epochMs: Double) -> String {
     return "\(s / 86400)d"
 }
 
+/// A whole number keeps no decimal: "2.0d" claims a precision that one decimal
+/// place in days — a 2.4 hour step — does not have.
+func trimmed(_ value: Double, _ unit: String) -> String {
+    let shown = String(format: "%.1f", value)
+    return (shown.hasSuffix(".0") ? String(shown.dropLast(2)) : shown) + unit
+}
+
 func until(_ epochMs: Double?) -> String {
     guard let ms = epochMs else { return "" }
     let s = Int(ms / 1000 - Date().timeIntervalSince1970)
     if s <= 0 { return "now" }
     if s < 3600 { return "\(s / 60)m" }
-    if s < 86400 { return String(format: "%.1fh", Double(s) / 3600) }
-    return String(format: "%.1fd", Double(s) / 86400)
+    if s < 86400 { return trimmed(Double(s) / 3600, "h") }
+    return trimmed(Double(s) / 86400, "d")
 }
 
 func share(_ percent: Double?) -> String {
@@ -371,14 +378,43 @@ func focusTerminal(tty: String) {
         "focus \(tty): exit \(task.terminationStatus) out=\(stdout.trimmingCharacters(in: .whitespacesAndNewlines)) "
             + "err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
 
-    // The script selects the tab, but a hotkey window hides again unless iTerm
-    // is the active app — and AppleScript's own `activate` makes iTerm open a
-    // fresh tab when the hotkey window is hidden. Activating the process
-    // directly does neither.
-    if let iterm = NSRunningApplication.runningApplications(withBundleIdentifier: "com.googlecode.iterm2").first {
-        iterm.activate(options: [.activateAllWindows])
-    } else {
-        log("focus \(tty): iTerm2 is not running")
+    // The script selects the tab, but a hotkey window hides again unless iTerm is
+    // the active app — and AppleScript's own `activate` makes iTerm open a fresh
+    // tab when that window is hidden. `open -a` on an app that is already running
+    // just brings it forward, and does so from inside a bundle where
+    // NSRunningApplication's lookup came back empty.
+    let bring = Process()
+    bring.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    bring.arguments = ["-a", "iTerm"]
+    do {
+        try bring.run()
+        bring.waitUntilExit()
+        if bring.terminationStatus != 0 { log("focus \(tty): open -a iTerm exited \(bring.terminationStatus)") }
+    } catch {
+        log("focus \(tty): open -a iTerm failed: \(error.localizedDescription)")
+    }
+}
+
+/// A drawn progress bar. The terminal's ASCII bar earns its place in a row of
+/// text; in a window a real bar reads faster and takes less room.
+final class BarView: NSView {
+    var fraction: Double = 0 { didSet { needsDisplay = true } }
+    var colour: NSColor = .white { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let height: CGFloat = 4
+        let track = NSRect(x: 0, y: (bounds.height - height) / 2, width: bounds.width, height: height)
+        let radius = height / 2
+        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.10).setFill()
+        NSBezierPath(roundedRect: track, xRadius: radius, yRadius: radius).fill()
+        let filled = max(0, min(1, fraction))
+        guard filled > 0 else { return }
+        let width = max(height, track.width * CGFloat(filled))
+        colour.setFill()
+        NSBezierPath(
+            roundedRect: NSRect(x: track.minX, y: track.minY, width: width, height: height),
+            xRadius: radius, yRadius: radius
+        ).fill()
     }
 }
 
@@ -405,11 +441,43 @@ final class ClickableCell: NSView {
     }
 }
 
+/// Draws its own selection band. AppKit's emphasised highlight rewrites the
+/// attributes of every label in the row, which undoes the fonts and colours the
+/// cells set for themselves.
+final class SessionRowView: NSTableRowView {
+    /// Set on the first finished row, to mark where the live sessions end.
+    var drawsBoundary = false
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        guard drawsBoundary else { return }
+        NSColor(srgbRed: 0.42, green: 0.44, blue: 0.51, alpha: 0.9).setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard selectionHighlightStyle != .none else { return }
+        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.06).setFill()
+        bounds.fill()
+    }
+
+    override var isSelected: Bool {
+        didSet { needsDisplay = true }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard isSelected else { return }
+        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.06).setFill()
+        bounds.fill()
+    }
+}
+
 // MARK: - Window
 
 final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
     private let statusLabel = NSTextField(labelWithString: "")
-    private let quotaBar = NSTextField(labelWithString: "")
+    private let quotaBar = NSStackView()
     private let gridScroll = NSScrollView()
     private let table = NSTableView()
 
@@ -417,6 +485,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var watcher: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
     private var paintedOnce = false
+    private var noteToken: UUID?
+    private var counts = ""
+    private let emptyLabel = NSTextField(labelWithString: "No session has drawn a status line yet.")
 
     init() {
         let window = NSWindow(
@@ -426,10 +497,21 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         window.title = "Agent Bar Hopping"
         window.titlebarAppearsTransparent = true
         window.backgroundColor = Palette.background
-        window.center()
-        window.setFrameAutosaveName("AgentBarHopping")
         super.init(window: window)
         build()
+        // The window is exactly as wide as its columns, the spacing between them
+        // and the scroller beside them — miss any of those and the table
+        // overflows by a hair and grows a horizontal scroll bar.
+        let scroller = NSScroller.scrollerWidth(
+            for: .regular, scrollerStyle: NSScroller.preferredScrollerStyle)
+        let fitted =
+            columns.reduce(0) { $0 + $1.width }
+            + table.intercellSpacing.width * CGFloat(columns.count)
+            + max(scroller, 16) + 2
+        window.contentMinSize = NSSize(width: 720, height: 280)
+        window.setContentSize(NSSize(width: fitted, height: 720))
+        window.center()
+        window.setFrameAutosaveName("AgentBarHopping")
         startWatching()
         reload()
     }
@@ -446,9 +528,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         // The account-wide quotas, once, above a table whose rows may run long.
+        quotaBar.orientation = .horizontal
+        quotaBar.alignment = .centerY
+        quotaBar.spacing = 32
         quotaBar.translatesAutoresizingMaskIntoConstraints = false
-        quotaBar.maximumNumberOfLines = 2
-        quotaBar.lineBreakMode = .byTruncatingTail
 
         buildColumns()
         table.dataSource = self
@@ -459,11 +542,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // Two lines in every cell: what the status line draws, and what it means.
         table.rowHeight = ceil(barFont.boundingRectForFont.height) + 16 + 12
         table.usesAlternatingRowBackgroundColors = false
-        // A selected row has AppKit rewrite the fonts and colours of the labels
-        // inside it. Nothing here needs a selected state, and the text stays
-        // selectable for copying a session id.
+        // AppKit's own highlight rewrites the fonts and colours of the labels
+        // inside a row, so the band is drawn by SessionRowView instead. Selection
+        // itself stays on: it is how the keyboard reaches a row.
         table.selectionHighlightStyle = .none
         table.allowsTypeSelect = false
+        table.allowsEmptySelection = true
         table.target = self
         table.doubleAction = nil
         // The default spacing plus per-cell padding is most of the row's width.
@@ -471,13 +555,18 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         table.columnAutoresizingStyle = .noColumnAutoresizing
         gridScroll.documentView = table
         gridScroll.hasVerticalScroller = true
-        gridScroll.hasHorizontalScroller = true
+        gridScroll.hasHorizontalScroller = false
         gridScroll.drawsBackground = false
         gridScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        emptyLabel.textColor = Palette.dim
+        emptyLabel.font = NSFont.systemFont(ofSize: 13)
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
 
         content.addSubview(statusLabel)
         content.addSubview(quotaBar)
         content.addSubview(gridScroll)
+        content.addSubview(emptyLabel)
 
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
@@ -489,6 +578,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             gridScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             gridScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             gridScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            emptyLabel.centerXAnchor.constraint(equalTo: gridScroll.centerXAnchor),
+            emptyLabel.topAnchor.constraint(equalTo: gridScroll.topAnchor, constant: 60),
         ])
 
     }
@@ -505,15 +596,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     // last column off the screen. The account-wide quotas are not here — they are
     // the same for every session, so they live in the bar above the table.
     private let columns: [Column] = [
-        Column(key: "topic", title: "Doing", width: 300),
+        Column(key: "age", title: "Last Seen", width: 84),
         Column(key: "cwd", title: "Directory", width: 164),
-        Column(key: "git", title: "Branch", width: 132),
-        Column(key: "model", title: "Model", width: 78),
-        Column(key: "effort", title: "Effort", width: 66),
-        Column(key: "started", title: "Started", width: 96),
+        Column(key: "topic", title: "Doing", width: 300),
+        Column(key: "model", title: "Model", width: 58),
+        Column(key: "effort", title: "Effort", width: 60),
         Column(key: "context", title: "Context", width: 100),
         Column(key: "cache", title: "Cache", width: 140),
-        Column(key: "age", title: "Last Seen", width: 84),
+        Column(key: "heat", title: "", width: 10),
+        Column(key: "started", title: "Launched at", width: 104),
+        Column(key: "git", title: "Branch", width: 132),
     ]
 
     private func buildColumns() {
@@ -522,9 +614,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             column.title = spec.title
             column.width = spec.width
             column.minWidth = 16
-            // The centred columns centre their header too, or the two disagree.
-            if spec.key == "model" || spec.key == "effort" {
-                column.headerCell.alignment = .center
+            // A header follows its cells, or the two disagree. Model and effort
+            // face each other across the gap, so the pair reads as one unit.
+            switch spec.key {
+            case "age": column.headerCell.alignment = .center
+            case "model": column.headerCell.alignment = .right
+            case "effort": column.headerCell.alignment = .left
+            default: break
             }
             // Each column sorts by what it means, not by the text it shows:
             // model by capability, effort by level, cache by time left.
@@ -538,6 +634,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// The width the whole row would be drawn at. The grid shows segments rather
     /// than rows, so this only decides how the unused `rows` come back.
     private func rowColumns() -> Int { 120 }
+
+    /// The table takes focus on launch: arrow keys should work without a click.
+    func focusTable() {
+        window?.makeFirstResponder(table)
+    }
 
     func reload() {
         let cols = rowColumns()
@@ -557,7 +658,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             log("first paint: \(snapshot.live.count) live, \(snapshot.history.count) finished")
         }
         rows = snapshot.live.map { ($0, false) } + snapshot.history.map { ($0, true) }
-        statusLabel.stringValue = "\(snapshot.live.count) live · \(snapshot.history.count) finished"
+        counts = "\(snapshot.live.count) live · \(snapshot.history.count) finished"
+        if noteToken == nil { statusLabel.stringValue = counts }
+        emptyLabel.isHidden = !rows.isEmpty
         drawQuotaBar(snapshot)
         sortRows()
         table.reloadData()
@@ -596,6 +699,43 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let view = SessionRowView()
+        // Live sessions always sort above finished ones; the line says where
+        // that boundary is without spending a row on a heading.
+        view.drawsBoundary = row < rows.count && rows[row].past && (row == 0 || !rows[row - 1].past)
+        return view
+    }
+
+    /// What ⌘C and ⌘↩ act on, and what a click selects.
+    private var selected: (session: Session, past: Bool)? {
+        let row = table.selectedRow
+        return row >= 0 && row < rows.count ? rows[row] : nil
+    }
+
+    @objc func copySelectedSessionId() {
+        guard let id = selected?.session.summary.session_id else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(id, forType: .string)
+        note("Copied \(id)")
+    }
+
+    @objc func showSelectedTerminal() {
+        guard let entry = selected, !entry.past, let tty = entry.session.tty else { return }
+        focusTerminal(tty: tty)
+    }
+
+    /// A line of feedback for an action that changes nothing on screen.
+    func note(_ message: String) {
+        statusLabel.stringValue = message
+        let token = UUID()
+        noteToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self = self, self.noteToken == token else { return }
+            self.statusLabel.stringValue = self.counts
+        }
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard let key = tableColumn?.identifier.rawValue, row < rows.count else { return nil }
         let (session, past) = rows[row]
@@ -632,12 +772,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             top = drawn(seg.started)
             bottom = s.started_at.map { "\(ago($0)) ago" } ?? ""
         case "context":
-            top = drawn(seg.context)
-            bottom = percent(s.context)
+            return progressCell(s.context, past: past)
+        case "heat":
+            // A stripe beside the cache, not a wash behind it: the colour is a
+            // scale to read along, and a tinted cell fights the text in it.
+            top = NSAttributedString(string: "")
+            bottom = ""
+            heat = cacheHeat(s.cache)
         case "cache":
             top = drawn(seg.cache)
             bottom = cacheWords(s.cache)
-            heat = cacheHeat(s.cache)
         case "age":
             top = mono("\(ago(session.active_at ?? session.updated_at)) ago", Palette.dim)
             bottom = ""
@@ -650,23 +794,42 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if !bottom.isEmpty {
             // The session id is meant to be copied into `claude --resume`, so it
             // is monospaced and never shortened.
+            // Numbers in a column should line up: tabular figures, and the
+            // session id monospaced because it is copied, not read.
             let font: NSFont =
                 key == "topic"
-                ? NSFont.monospacedSystemFont(ofSize: 10, weight: .regular) : NSFont.systemFont(ofSize: 11)
+                ? NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+                : NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
             stack.append(
                 NSAttributedString(
                     string: "\n" + bottom,
-                    attributes: [.font: font, .foregroundColor: past ? Palette.frame : Palette.dim]))
+                    attributes: [
+                        .font: font, .foregroundColor: past ? Palette.dim.withAlphaComponent(0.8) : Palette.dim,
+                    ]))
         }
 
-        // Model and effort are shapes, not sentences: they read better centred.
-        let centred = key == "model" || key == "effort"
-        if centred {
+        // Model and effort are shapes rather than sentences; the model ends at
+        // the gap and the effort starts there, so the pair reads together.
+        // The cache's second line ends where the stripe begins, so the two read
+        // as one edge; only that line moves, and per-line alignment is a
+        // paragraph style on its range.
+        if key == "cache", stack.length > top.length {
             let style = NSMutableParagraphStyle()
-            style.alignment = .center
+            style.alignment = .right
+            stack.addAttribute(
+                .paragraphStyle, value: style,
+                range: NSRange(location: top.length, length: stack.length - top.length))
+        }
+
+        let alignment: NSTextAlignment =
+            key == "age" ? .center : key == "model" ? .right : key == "effort" ? .left : .left
+        if alignment != .left {
+            let style = NSMutableParagraphStyle()
+            style.alignment = alignment
             stack.addAttribute(
                 .paragraphStyle, value: style, range: NSRange(location: 0, length: stack.length))
         }
+        let centred = key == "age" || key == "model"
 
         let field = NSTextField(labelWithString: "")
         field.attributedStringValue = stack
@@ -675,19 +838,33 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         field.isSelectable = false
         field.maximumNumberOfLines = 2
         field.lineBreakMode = .byTruncatingTail
-        field.alignment = centred ? .center : .left
+        field.alignment = alignment
         field.translatesAutoresizingMaskIntoConstraints = false
         let cell = ClickableCell()
-        if let heat = heat, !past {
-            cell.wantsLayer = true
-            cell.layer?.backgroundColor = heat.cgColor
+        if let heat = heat {
+            // Inset and rounded, so the stripe never touches the row divider
+            // above or below it.
+            let stripe = NSView()
+            stripe.wantsLayer = true
+            stripe.layer?.backgroundColor = (past ? heat.withAlphaComponent(0.4) : heat).cgColor
+            stripe.layer?.cornerRadius = 2
+            stripe.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(stripe)
+            NSLayoutConstraint.activate([
+                stripe.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                stripe.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+                stripe.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
+                stripe.bottomAnchor.constraint(equalTo: cell.bottomAnchor, constant: -5),
+            ])
         }
         if key == "topic", let id = s.session_id {
-            field.toolTip = "Click to copy the session id"
-            cell.onClick = { [weak cell] in
+            field.toolTip = [s.topic, id, "Click to copy the session id"].compactMap { $0 }.joined(
+                separator: "\n")
+            cell.onClick = { [weak self, weak cell] in
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(id, forType: .string)
                 cell?.flash()
+                self?.note("Copied \(id)")
             }
         } else if key == "cwd", let tty = session.tty, !past {
             // The directory cell names the terminal under it; clicking goes there.
@@ -696,50 +873,82 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         cell.addSubview(field)
         NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: centred ? 2 : 4),
-            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: centred ? -2 : -4),
+            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: key == "effort" ? 3 : 4),
+            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: key == "model" ? -3 : -4),
             field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
     }
 
-    /// The quotas every session shares, taken from the session that redrew last:
-    /// they are account-wide, so one reading serves the whole window.
+    /// The quotas every session shares. Each field keeps its place whether or not
+    /// the newest session reported it: the most recent session that did is the
+    /// source, and a reading old enough to doubt says how old it is.
     private func drawQuotaBar(_ snapshot: Snapshot) {
-        let newest = (snapshot.live + snapshot.history).max { $0.updated_at < $1.updated_at }
-        let fableSource = (snapshot.live + snapshot.history)
-            .filter { $0.segments.fable != nil }
-            .max { $0.updated_at < $1.updated_at }
-
-        let line = NSMutableAttributedString()
-        func part(_ title: String, _ ansi: String?, _ words: String) {
-            guard let ansi = ansi, !ansi.isEmpty else { return }
-            if line.length > 0 {
-                line.append(
-                    NSAttributedString(
-                        string: "      ", attributes: [.font: barFont, .foregroundColor: Palette.frame]))
-            }
-            line.append(
-                NSAttributedString(
-                    string: title + "  ",
-                    attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Palette.dim]))
-            line.append(attributed(ansi: ansi, font: barFont))
-            if !words.isEmpty {
-                line.append(
-                    NSAttributedString(
-                        string: "  " + words,
-                        attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim]))
-            }
+        let all = snapshot.live + snapshot.history
+        func newest(_ pick: (Session) -> Limit?) -> Session? {
+            all.filter { pick($0)?.percent != nil }.max { $0.updated_at < $1.updated_at }
         }
 
-        part("5-hour quota", newest?.segments.five_hour, limitWords(newest?.summary.five_hour))
-        part("7-day quota", newest?.segments.seven_day, limitWords(newest?.summary.seven_day))
-        part("Fable quota", fableSource?.segments.fable, limitWords(fableSource?.summary.fable))
-        quotaBar.attributedStringValue = line.length > 0
-            ? line
-            : NSAttributedString(
-                string: "no quota reading yet",
-                attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Palette.frame])
+        for view in quotaBar.arrangedSubviews { quotaBar.removeArrangedSubview(view); view.removeFromSuperview() }
+
+        let five = newest { $0.summary.five_hour }
+        let seven = newest { $0.summary.seven_day }
+        let fable = newest { $0.summary.fable }
+        quotaBar.addArrangedSubview(quotaItem("5-hour quota", five, five?.summary.five_hour))
+        quotaBar.addArrangedSubview(quotaItem("7-day quota", seven, seven?.summary.seven_day))
+        quotaBar.addArrangedSubview(quotaItem("Fable quota", fable, fable?.summary.fable))
+    }
+
+    /// One quota: its name, a drawn bar, the share, and when it comes back. The
+    /// colours are the status line's own thresholds.
+    private func quotaItem(_ title: String, _ source: Session?, _ limit: Limit?) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+
+        let name = NSTextField(labelWithString: title)
+        name.font = NSFont.systemFont(ofSize: 12)
+        name.textColor = Palette.dim
+        row.addArrangedSubview(name)
+
+        guard let limit = limit, let percent = limit.percent, let source = source else {
+            let none = NSTextField(labelWithString: "—")
+            none.font = barFont
+            none.textColor = Palette.frame
+            row.addArrangedSubview(none)
+            return row
+        }
+
+        let colour = Palette.threshold(percent)
+        let bar = BarView()
+        bar.fraction = percent / 100
+        bar.colour = colour
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        bar.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        row.addArrangedSubview(bar)
+
+        let share = NSTextField(labelWithString: "\(Int(percent.rounded()))%")
+        share.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        share.textColor = colour
+        row.addArrangedSubview(share)
+
+        // A reading only changes when a session redraws, so an old one is still
+        // the truth — as long as the bar says how old it is.
+        let age = Date().timeIntervalSince1970 - source.updated_at / 1000
+        var caption = limitWords(limit)
+        if age > 120 {
+            caption += caption.isEmpty ? "" : " · "
+            caption += "read \(ago(source.updated_at)) ago"
+        }
+        if !caption.isEmpty {
+            let note = NSTextField(labelWithString: caption)
+            note.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            note.textColor = age > 1800 ? Palette.yellow : Palette.dim
+            row.addArrangedSubview(note)
+        }
+        return row
     }
 
     // MARK: Sorting
@@ -766,7 +975,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             case "effort": return (effortRank(s.effort), s.effort ?? "")
             case "started": return (s.started_at ?? 0, "")
             case "context": return (s.context ?? -1, "")
-            case "cache": return (cacheLeft(s.cache), "")
+            // The stripe and the cache column show the same thing, so they sort
+            // the same way: by how much cache life is left, cold last.
+            case "cache", "heat": return (cacheLeft(s.cache), "")
             case "age": return (entry.session.active_at ?? entry.session.updated_at, "")
             default: return (0, "")
             }
@@ -810,6 +1021,36 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return max(0, expires / 1000 - Date().timeIntervalSince1970)
     }
 
+    /// "▓▓▓░░ 52%": the bar, then the number it stands for.
+    private func progressCell(_ percent: Double?, past: Bool) -> NSView {
+        let cell = ClickableCell()
+        let bar = BarView()
+        let value = percent ?? 0
+        bar.fraction = value / 100
+        let colour = Palette.threshold(percent)
+        bar.colour = past ? colour.withAlphaComponent(0.72) : colour
+        bar.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: percent == nil ? "—" : "\(Int(value.rounded()))%")
+        label.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        label.textColor = past ? colour.withAlphaComponent(0.72) : colour
+        label.alignment = .right
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        cell.addSubview(bar)
+        cell.addSubview(label)
+        NSLayoutConstraint.activate([
+            bar.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            bar.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 12),
+            bar.trailingAnchor.constraint(equalTo: label.leadingAnchor, constant: -8),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            label.widthAnchor.constraint(equalToConstant: 34),
+        ])
+        return cell
+    }
+
     private func mono(_ text: String, _ colour: NSColor) -> NSAttributedString {
         NSAttributedString(string: text, attributes: [.font: barFont, .foregroundColor: colour])
     }
@@ -825,38 +1066,34 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return attributed(ansi: ansi, font: barFont)
     }
 
-    /// Finished sessions keep their shapes but recede.
+    /// Finished sessions recede, but stay readable: at 45% the captions fell to
+    /// a 1.9:1 contrast ratio, well under the 4.5:1 a small label needs.
     private func faded(_ text: NSAttributedString) -> NSAttributedString {
         let out = NSMutableAttributedString(attributedString: text)
         out.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: out.length)) { value, range, _ in
             let colour = (value as? NSColor) ?? Palette.text
-            out.addAttribute(.foregroundColor, value: colour.withAlphaComponent(0.45), range: range)
+            out.addAttribute(.foregroundColor, value: colour.withAlphaComponent(0.72), range: range)
         }
         return out
     }
 
-    /// The cache's own temperature, read literally: a freshly written cache is
-    /// hot, it cools as its life is spent, and a cold one is blue — the colour
-    /// the status line already gives it.
+    /// The cache's own temperature: a freshly written cache is hot, it cools as
+    /// its life is spent, and a cold one is the coldest of all. The ramp is a
+    /// straight blend from a muted red to a muted blue — a hue sweep would pass
+    /// through green, which says nothing about heat.
     private func cacheHeat(_ cache: CacheState?) -> NSColor? {
-        guard let cache = cache else { return nil }
-        guard cache.warm else {
-            return NSColor(srgbRed: 0.38, green: 0.55, blue: 0.92, alpha: 0.30)
+        let hot = (r: 0.60, g: 0.28, b: 0.25)
+        let cold = (r: 0.24, g: 0.35, b: 0.56)
+        func blend(_ t: Double) -> NSColor {
+            NSColor(
+                srgbRed: CGFloat(hot.r + (cold.r - hot.r) * t),
+                green: CGFloat(hot.g + (cold.g - hot.g) * t),
+                blue: CGFloat(hot.b + (cold.b - hot.b) * t), alpha: 0.9)
         }
+        guard let cache = cache else { return nil }
+        guard cache.warm else { return blend(1) }
         guard let elapsed = cacheElapsed(cache) else { return nil }
-        let spent = min(1, max(0, elapsed / 100))
-        // 14° red-orange when fresh, through amber, to 205° blue at expiry.
-        let hue = (14 + 191 * pow(spent, 1.25)) / 360
-        // Hottest and coldest read strongest; the middle is quietest.
-        let strength = 0.12 + 0.16 * abs(spent - 0.5) * 2
-        return NSColor(hue: hue, saturation: 0.78, brightness: 0.95, alpha: strength)
-    }
-
-    /// The context window has no reset, and the bar above already carries the
-    /// share, so the line under it says how much room is left.
-    private func percent(_ value: Double?) -> String {
-        guard let v = value else { return "" }
-        return "\(Int((100 - v).rounded()))% free"
+        return blend(min(1, max(0, elapsed / 100)))
     }
 
     /// When the quota comes back. The share is already on the bar above it.
@@ -909,6 +1146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller = SessionsWindow()
         controller?.showWindow(nil)
         controller?.window?.makeKeyAndOrderFront(nil)
+        controller?.focusTable()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -933,9 +1171,20 @@ func buildMenu() {
     appItem.submenu = appMenu
     main.addItem(appItem)
 
+    let sessionItem = NSMenuItem()
+    let sessionMenu = NSMenu(title: "Session")
+    sessionMenu.addItem(
+        withTitle: "Copy Session ID", action: #selector(SessionsWindow.copySelectedSessionId),
+        keyEquivalent: "c")
+    let showItem = sessionMenu.addItem(
+        withTitle: "Show Terminal", action: #selector(SessionsWindow.showSelectedTerminal),
+        keyEquivalent: "\r")
+    showItem.keyEquivalentModifierMask = [.command]
+    sessionItem.submenu = sessionMenu
+    main.addItem(sessionItem)
+
     let editItem = NSMenuItem()
     let editMenu = NSMenu(title: "Edit")
-    editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
     editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
     editItem.submenu = editMenu
     main.addItem(editItem)
