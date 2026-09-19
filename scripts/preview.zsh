@@ -61,6 +61,9 @@ CC_STATUSLINE_COLUMNS=110 render "Narrow terminal: 3-cell bars" "$mode" "$fable,
 CC_STATUSLINE_COLUMNS=90 render "Narrower terminal: percentages only" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five,$(seven_at 78 224640)},$warm"
 usage "$(fable_at 85)" '"http 429"'
 render "Fable refresh failed (stale value)" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
+usage "$(fable_at 85)" null
+CC_STATUSLINE_ICONS=0 render "Text labels without a Nerd Font" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$(warm_for 200)"
+CC_STATUSLINE_ICONS=0 render "Text labels, cache cold" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$cold"
 usage null '"keychain: no claudeAiOauth.accessToken in keychain entry"'
 render "Fable refresh failed (no reading yet)" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
 usage "$(fable_at 85)" null

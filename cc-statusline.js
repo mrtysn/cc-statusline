@@ -577,6 +577,8 @@ function main() {
     git: git(cwd),
     home: homedir(),
     columns: terminalColumns(),
+    // Text in place of the few Nerd Font glyphs, for terminals without one.
+    icons: process.env.CC_STATUSLINE_ICONS !== '0',
   });
   if (out) process.stdout.write(out);
 }

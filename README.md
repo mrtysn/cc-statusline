@@ -20,7 +20,7 @@ The first row covers the model and usage; the second, when there is one, names w
 | `0.8h ━━━━╾87%` | 5-hour rate limit usage, labelled with hours until it resets |
 | `2.6d ━━━━─75%` | 7-day rate limit, labelled with days until it resets (hours in the last day); shown only at ≥75%, `7d` when the reset time is unknown |
 | `5.2d ━━━━─85% 󰯺` | Fable weekly quota, labelled like the 7-day bar and tagged with the boxed Fable initial `󰯺` so the two read apart; only while the session runs a Fable model; `󰯺` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
-| `󰆼⁴²ᵐ` | Minutes until the prompt cache expires, raised in superscript after the icon (`󰆼` is the Nerd Font database glyph), coloured by how much of its TTL (5m or 1h) has elapsed; `󰆼 38k 󰑐` in blue once it has, with the tokens the next prompt reprocesses to rebuild it |
+| `󰆼⁴²ᵐ` | Minutes until the prompt cache expires, raised in superscript after the icon (`󰆼` is the Nerd Font database glyph), coloured by how much of its TTL (5m or 1h) has elapsed; once that turns yellow or red the tokens a rebuild would reprocess join it (`󰆼⁴ᵐ 38k`), while there is still time to `/compact` or wrap up; `󰆼 38k 󰑐` in blue once it has expired |
 | `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic`, otherwise one derived from the transcript; yellow for a minute after it changes (see [Session topic](#session-topic)) |
 | `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
 | `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
@@ -29,6 +29,8 @@ The first row covers the model and usage; the second, when there is one, names w
 Bars and the cache countdown dim under 75%, turn yellow at ≥75% (where Claude Code starts its weekly-limit warning), red at ≥92%. Model, effort, the topic and the directory name are drawn at normal brightness and everything else is faint, with the arrows and diamonds a fixed grey one step darker (`rgb(66,69,80)`, chosen for a dark theme); until the first prompt of a session, model and effort are spelled out in full and bold yellow (`Opus 4.8 1M xhigh`), so the choice is easy to check while it can still be changed.
 
 Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), so five cells show ten levels. When the first row would be wider than the terminal, every bar shrinks to three cells, and if that still does not fit, only the percentages remain. The width comes from the session's terminal: Claude Code runs the status line without one, so the script walks up its parent processes to the first with a tty (one `ps` per step) and reads that tty's size with `stty`, about 15 ms in all, on every redraw so a resize applies on the next one. `CC_STATUSLINE_COLUMNS` sets the width instead; with neither, bars stay full width.
+
+Three glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, the rebuild `󰑐` and the Fable tag `󰯺`. Everything else is standard Unicode. Without a Nerd Font, set `CC_STATUSLINE_ICONS=0` to draw them as `cch`, `⟳` and `fbl` instead.
 
 ## Fable quota
 
