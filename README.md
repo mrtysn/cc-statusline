@@ -3,7 +3,7 @@
 A minimalist [Claude Code](https://claude.com/claude-code) status line. Single Node.js file, no dependencies.
 
 ```
-◆  ⣀⣤⣶⣿ ▃² ▸ 09/16 16:22 ▸ ╾────8% ▸ 0.8h ━━━━╾87% ▸ 󰆼⁴²ᵐ  ◆
+◆  ⣀⣤⣶⣿ ▃² ▸ 09/16 16:22 ▸ ╾────.08 ▸ 0.8ʰ ━━━━╾.87 ▸ 󰆼 42ᵐ  ◆
 ◆                          auth token refresh                          ◆
 ◆  3f2a9c1e-7b4d-4e8a-9f60-2d1c5b8e7a43  ▸  ~/dev/my-app  ▸  ⇡1 *main  ◆
 ```
@@ -16,11 +16,11 @@ The first row covers the model and usage; the second, when there is one, names w
 |---|---|
 | `⣀⣤⣶⣿ ▃²` | Model tier as a slope of four braille steps, weakest to strongest: `⣀ ⣤ ⣶ ⣿` for Haiku, Sonnet, Opus and Fable, with the session's own lit and the other three in the frame grey; in a Fable session the lit step turns yellow or red with the Fable weekly quota, on the bars' thresholds (version and context size left out, since `/model` offers one version per tier; an unknown model shows its full name), then reasoning effort as a block height with its level in superscript, `▁¹ ▃² ▅³ ▇⁴ █⁵` for low, medium, high, xhigh and max, the bar turning yellow or red with the context window, when the model supports it |
 | `09/16 16:22` | Session start time |
-| `╾────8%` | Context window usage |
-| `0.8h ━━━━╾87%` | 5-hour rate limit usage, labelled with hours until it resets |
-| `2.6d ━━━━─75%` | 7-day rate limit, labelled with days until it resets (hours in the last day); shown only at ≥75%, `7d` when the reset time is unknown |
-| `5.2d ━━━━─85% 󰯺` | Fable weekly quota, labelled like the 7-day bar and tagged with the boxed Fable initial `󰯺` so the two read apart; only while the session runs a Fable model; `󰯺` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
-| `󰆼⁴²ᵐ` | Minutes until the prompt cache expires, raised in superscript after the icon (`󰆼` is the Nerd Font database glyph), coloured by how much of its TTL (5m or 1h) has elapsed; once that turns yellow or red the tokens a rebuild would reprocess join it (`󰆼⁴ᵐ 38k`), while there is still time to `/compact` or wrap up; `󰆼 38k 󰑐` in blue once it has expired |
+| `╾────.08` | Context window usage |
+| `0.8ʰ ━━━━╾.87` | 5-hour rate limit usage, labelled with hours until it resets |
+| `2.6ᵈ ━━━━─.75 󰇧` | 7-day rate limit across all models, labelled with days until it resets (hours in the last day) and tagged with the earth `󰇧` so it reads apart from the Fable quota inside it; shown only at ≥75%, `7d` when the reset time is unknown |
+| `5.2ᵈ ━━━━─.85 󰯺` | Fable weekly quota, labelled like the 7-day bar and tagged with the boxed Fable initial `󰯺` so the two read apart; only while the session runs a Fable model; `󰯺` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
+| `󰆼 42ᵐ` | Minutes until the prompt cache expires, after the icon, with the unit raised (`󰆼` is the Nerd Font database glyph), coloured by how much of its TTL (5m or 1h) has elapsed; once that turns yellow or red the tokens a rebuild would reprocess join it (`󰆼 4ᵐ 38k`), while there is still time to `/compact` or wrap up; `󰆼 38k 󰑐` in blue once it has expired |
 | `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic`, otherwise one derived from the transcript; yellow for a minute after it changes (see [Session topic](#session-topic)) |
 | `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
 | `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
@@ -30,7 +30,7 @@ Bars and the cache countdown dim under 75%, turn yellow at ≥75% (where Claude 
 
 Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), so five cells show ten levels. When the first row would be wider than the terminal, every bar shrinks to three cells, and if that still does not fit, only the percentages remain. The width comes from the session's terminal: Claude Code runs the status line without one, so the script walks up its parent processes to the first with a tty (one `ps` per step) and reads that tty's size with `stty`, about 15 ms in all, on every redraw so a resize applies on the next one. `CC_STATUSLINE_COLUMNS` sets the width instead; with neither, bars stay full width.
 
-Three glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, the rebuild `󰑐` and the Fable tag `󰯺`. Everything else is standard Unicode. Without a Nerd Font, set `CC_STATUSLINE_ICONS=0` to draw them as `cch`, `⟳` and `fbl` instead.
+Four glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, the rebuild `󰑐`, the Fable tag `󰯺` and the weekly tag `󰇧`. Everything else is standard Unicode. Without a Nerd Font, set `CC_STATUSLINE_ICONS=0` to draw them as `cch`, `⟳`, `fbl` and `all` instead.
 
 ## Fable quota
 
