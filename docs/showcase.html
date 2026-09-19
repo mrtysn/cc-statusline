@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cc-statusline showcase</title>
+<!--
+  Every line on this page is drawn by ../lib/render.js, the same module the
+  status line runs, so nothing here can drift from the real output. Open the
+  file straight from disk; there is no build step and no network access.
+-->
+<style>
+  :root {
+    --bg: #f6f6f4;
+    --panel: #ffffff;
+    --ink: #1d1f24;
+    --muted: #6b6f7a;
+    --line: #dcdde1;
+    --accent: #3a5bd9;
+    --term-bg: #1f2130;
+    --term-fg: #c9ccd8;
+    --term-yellow: #e5b567;
+    --term-red: #f07178;
+    --term-border: #2c2f42;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14151b;
+      --panel: #1b1c24;
+      --ink: #e4e5ea;
+      --muted: #9095a3;
+      --line: #2d2f3a;
+      --accent: #8aa2ff;
+      --term-border: #34384d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1280px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 32px 0 10px; }
+  p.lede { margin: 0 0 20px; color: var(--muted); max-width: 70ch; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; }
+
+  .term {
+    background: var(--term-bg);
+    color: var(--term-fg);
+    border: 1px solid var(--term-border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, "DejaVu Sans Mono", monospace;
+    white-space: pre;
+    overflow-x: auto;
+    min-height: 2.5em;
+  }
+  .term .b { font-weight: 700; }
+  .term .d { opacity: 0.55; }
+  .term .y { color: var(--term-yellow); }
+  .term .r { color: var(--term-red); }
+  .term .empty { opacity: 0.4; font-style: italic; }
+  .meta { color: var(--muted); font-size: 12px; margin: 4px 2px 0; display: flex; gap: 12px; flex-wrap: wrap; }
+  .meta button { font-size: 12px; }
+
+  .live { position: sticky; top: 0; z-index: 2; background: var(--bg); padding: 8px 0 10px; border-bottom: 1px solid var(--line); }
+
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }
+  fieldset {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin: 0;
+    padding: 8px 12px 10px;
+    min-width: 0;
+  }
+  legend { font-weight: 600; padding: 0 4px; }
+  fieldset.off > :not(legend) { opacity: 0.45; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
+  .row > label:first-child { min-width: 78px; color: var(--muted); }
+  .row input[type=range] { flex: 1; min-width: 90px; accent-color: var(--accent); }
+  .row output { font-variant-numeric: tabular-nums; min-width: 4.5ch; text-align: right; }
+  input[type=text], input[type=number], select {
+    font: inherit;
+    color: inherit;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 2px 6px;
+    min-width: 0;
+  }
+  input[type=text] { flex: 1; }
+  input[type=number] { width: 5em; }
+  button {
+    font: inherit;
+    color: var(--ink);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 2px 10px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); cursor: pointer; }
+
+  .gallery { display: grid; gap: 14px; }
+  .card h3 { font-size: 13px; margin: 0 0 6px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .card h3 .tags { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .card h3 button { margin-left: auto; font-size: 12px; }
+  .sweep .term { padding: 8px 14px; }
+  details.json summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  details.json pre { font-size: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; overflow-x: auto; }
+  .error { color: #c33; }
+</style>
+</head>
+<body>
+<main>
+  <h1>cc-statusline showcase</h1>
+  <p class="lede">
+    Every line below is drawn by <code>lib/render.js</code>, the same code the status line runs.
+    The live panel covers every combination of inputs. The gallery holds the named states from
+    <code>scripts/preview.zsh</code>. The sweep steps one value across its range and holds everything else.
+    Durations count from the moment the page renders.
+  </p>
+
+  <div id="loadError" class="error" hidden>
+    Could not load <code>../lib/render.js</code>. Open this file from its place in the repository.
+  </div>
+
+  <section class="live">
+    <div id="liveOut" class="term"></div>
+    <div class="meta">
+      <span id="liveWidth"></span>
+      <button type="button" id="copyJson">Copy input JSON</button>
+      <button type="button" id="copyText">Copy plain text</button>
+      <button type="button" id="reset">Reset controls</button>
+    </div>
+  </section>
+
+  <form id="controls" class="controls" autocomplete="off"></form>
+
+  <details class="json">
+    <summary>Status line input and state fed to render()</summary>
+    <pre id="liveJson"></pre>
+  </details>
+
+  <h2>Sweep</h2>
+  <div class="toolbar">
+    <label>Step <select id="sweepKey"></select></label>
+    <label>Steps <input type="number" id="sweepSteps" min="2" max="41" value="11"></label>
+  </div>
+  <div id="sweepOut" class="term sweep"></div>
+
+  <h2>Gallery</h2>
+  <div class="toolbar" id="tagFilter"></div>
+  <div class="gallery" id="gallery"></div>
+</main>
+
+<script src="../lib/render.js"></script>
+<script>
+'use strict';
+(function () {
+  const R = window.CcStatuslineRender;
+  if (!R) {
+    document.getElementById('loadError').hidden = false;
+    return;
+  }
+
+  const HOME = '/Users/you';
+  const SESSION_ID = '3f2a9c1e-7b4d-4e8a-9f60-2d1c5b8e7a43';
+  const MODELS = [
+    ['claude-opus-5', 'Opus 5'],
+    ['claude-sonnet-5', 'Sonnet 5'],
+    ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
+    ['claude-fable-5-1', 'Fable 5.1'],
+    ['claude-opus-4-8[1m]', 'Opus 4.8 (1M context)'],
+  ];
+
+  // Everything the panel controls. Presets and the sweep are partial overrides of this.
+  const DEFAULTS = {
+    model: 'claude-opus-5',
+    effort: 'xhigh',
+    sessionIdOn: true,
+    durationOn: true,
+    durationH: 0.8,
+    prompted: true,
+    ctx: 8,
+    fiveOn: true,
+    fivePct: 87,
+    fiveResetKnown: true,
+    fiveH: 0.8,
+    sevenOn: true,
+    sevenPct: 40,
+    sevenResetKnown: true,
+    sevenD: 2.6,
+    fableState: 'active',
+    fablePct: 85,
+    fableResetKnown: true,
+    fableD: 2.0,
+    fableError: false,
+    cache: 'warm',
+    ttl: '1h',
+    cacheMin: 42,
+    rebuild: 38000,
+    topic: 'none',
+    topicText: 'auth token refresh',
+    cwd: HOME + '/dev/my-app',
+    moved: false,
+    gitOn: true,
+    branch: 'main',
+    detached: false,
+    dirty: true,
+    ahead: 0,
+    behind: 0,
+    action: '',
+    conflicts: 0,
+    columnsKnown: true,
+    columns: 160,
+  };
+
+  // Control definitions: [key, kind, label, extra]. Grouped into fieldsets;
+  // a group's first boolean, when marked `toggle`, greys out the rest.
+  const GROUPS = [
+    ['Terminal', 'columnsKnown', [
+      ['columnsKnown', 'bool', 'Width known', { hint: 'Unknown keeps full-width bars' }],
+      ['columns', 'range', 'Columns', { min: 40, max: 200, step: 1, unit: '' }],
+    ]],
+    ['Model', null, [
+      ['model', 'select', 'Model', { options: MODELS.map(([id, name]) => [id, name]) }],
+      ['effort', 'select', 'Effort', { options: [['', '(none)'], 'low', 'medium', 'high', 'xhigh', 'max'] }],
+      ['prompted', 'bool', 'First prompt sent', { hint: 'Before it, model and effort are bold yellow and context is hidden' }],
+    ]],
+    ['Session', null, [
+      ['sessionIdOn', 'bool', 'Session ID'],
+      ['durationOn', 'bool', 'Start time'],
+      ['durationH', 'range', 'Running for', { min: 0, max: 24, step: 0.1, unit: 'h' }],
+    ]],
+    ['Context', null, [
+      ['ctx', 'range', 'Used', { min: 0, max: 100, step: 1, unit: '%' }],
+    ]],
+    ['5-hour limit', 'fiveOn', [
+      ['fiveOn', 'bool', 'In input'],
+      ['fivePct', 'range', 'Used', { min: 0, max: 100, step: 1, unit: '%' }],
+      ['fiveResetKnown', 'bool', 'Reset time known'],
+      ['fiveH', 'range', 'Resets in', { min: 0.1, max: 5, step: 0.1, unit: 'h' }],
+    ]],
+    ['7-day limit', 'sevenOn', [
+      ['sevenOn', 'bool', 'In input', { hint: `Drawn only at ≥${R.SEVEN_DAY_SHOW_PCT}%` }],
+      ['sevenPct', 'range', 'Used', { min: 0, max: 100, step: 1, unit: '%' }],
+      ['sevenResetKnown', 'bool', 'Reset time known'],
+      ['sevenD', 'range', 'Resets in', { min: 0.05, max: 7, step: 0.05, unit: 'd' }],
+    ]],
+    ['Fable quota', null, [
+      ['fableState', 'select', 'Reading', { options: [['active', 'active'], ['inactive', 'inactive (hidden)'], ['none', 'none yet']], hint: 'Drawn only when the model is Fable' }],
+      ['fablePct', 'range', 'Used', { min: 0, max: 100, step: 1, unit: '%' }],
+      ['fableResetKnown', 'bool', 'Reset time known'],
+      ['fableD', 'range', 'Resets in', { min: 0.05, max: 7, step: 0.05, unit: 'd' }],
+      ['fableError', 'bool', 'Last refresh failed'],
+    ]],
+    ['Prompt cache', null, [
+      ['cache', 'select', 'State', { options: [['warm', 'warm'], ['warmUnknown', 'warm, no expiry'], ['cold', 'cold'], ['off', 'not observed']] }],
+      ['ttl', 'select', 'TTL', { options: ['5m', '1h'] }],
+      ['cacheMin', 'range', 'Expires in', { min: 0.1, max: 60, step: 0.1, unit: 'm' }],
+      ['rebuild', 'number', 'Rebuild tokens'],
+    ]],
+    ['Topic', null, [
+      ['topic', 'select', 'Topic', { options: [['none', 'none'], ['shown', 'shown'], ['new', 'just changed']] }],
+      ['topicText', 'text', 'Text', { hint: `Cut to ${R.TOPIC_MAX_CHARS} characters` }],
+    ]],
+    ['Location', null, [
+      ['cwd', 'text', 'Directory', { hint: `Home is ${HOME}` }],
+      ['moved', 'bool', 'Moved from launch dir', { hint: 'Launch directory is home' }],
+    ]],
+    ['Git', 'gitOn', [
+      ['gitOn', 'bool', 'In a repository'],
+      ['branch', 'text', 'Branch'],
+      ['detached', 'bool', 'Detached HEAD'],
+      ['dirty', 'bool', 'Uncommitted changes'],
+      ['ahead', 'number', 'Ahead'],
+      ['behind', 'number', 'Behind'],
+      ['action', 'select', 'In progress', { options: [['', '(none)'], 'rebase', 'merge', 'cherry-pick', 'revert', 'bisect'] }],
+      ['conflicts', 'number', 'Conflicts'],
+    ]],
+  ];
+
+  const SWEEPS = {
+    columns: ['Terminal columns', 60, 140],
+    ctx: ['Context used', 0, 100],
+    fivePct: ['5-hour used', 0, 100],
+    fiveH: ['5-hour resets in', 0.1, 5],
+    sevenPct: ['7-day used', 0, 100],
+    sevenD: ['7-day resets in', 0.05, 7],
+    fablePct: ['Fable used (switches model to Fable)', 0, 100],
+    fableD: ['Fable resets in (switches model to Fable)', 0.05, 7],
+    cacheMin: ['Cache expires in', 0.1, 60],
+    durationH: ['Session running for', 0, 24],
+  };
+
+  const FABLE = { model: 'claude-fable-5-1' };
+  // Mirrors scripts/preview.zsh, plus combinations it does not cover.
+  const PRESETS = [
+    ['Before first prompt', ['model'], { prompted: false, cache: 'off' }],
+    ['Cache warm', ['cache'], {}],
+    ['Cache running low (yellow)', ['cache'], { cacheMin: 10 }],
+    ['Cache nearly expired (red)', ['cache'], { cacheMin: 3.3 }],
+    ['Cache warm, 5-minute TTL', ['cache'], { ttl: '5m', cacheMin: 4 }],
+    ['Cache warm, expiry unknown', ['cache'], { cache: 'warmUnknown' }],
+    ['Cache cold', ['cache'], { cache: 'cold' }],
+    ['Context filling (yellow)', ['limits'], { ctx: 85 }],
+    ['Context nearly full (red)', ['limits'], { ctx: 96 }],
+    ['5-hour limit in its last hour', ['limits'], { fivePct: 94, fiveH: 0.3 }],
+    ['7-day limit shown from 75%', ['limits'], { sevenPct: 75, sevenD: 2.6 }],
+    ['7-day limit near exhaustion', ['limits'], { ctx: 85, sevenPct: 91, sevenD: 2 }],
+    ['7-day limit, last day', ['limits'], { sevenPct: 97, sevenD: 0.4 }],
+    ['Fable weekly quota (yellow)', ['fable'], { ...FABLE }],
+    ['Fable weekly quota near exhaustion', ['fable'], { ...FABLE, fablePct: 95 }],
+    ['Fable and 7-day quotas together', ['fable', 'limits'], { ...FABLE, fablePct: 95, sevenPct: 78, sevenD: 2.6 }],
+    ['Fable refresh failed (stale value)', ['fable'], { ...FABLE, fableError: true }],
+    ['Fable refresh failed (no reading yet)', ['fable'], { ...FABLE, fableState: 'none', fableError: true }],
+    ['Fable quota inactive', ['fable'], { ...FABLE, fableState: 'inactive' }],
+    ['Fable quota hidden on another model', ['fable'], {}],
+    ['Every limit high at once', ['fable', 'limits'], { ...FABLE, ctx: 88, fivePct: 93, sevenPct: 90, fablePct: 96, cacheMin: 5 }],
+    ['Auto topic', ['topic'], { topic: 'shown' }],
+    ['Topic just changed (yellow)', ['topic'], { topic: 'new', topicText: 'fixing the login redirect loop' }],
+    ['Topic cut to length', ['topic'], { topic: 'shown', topicText: 'a very long topic that keeps going well past the forty character limit' }],
+    ['Moved from launch directory', ['location'], { moved: true }],
+    ['Outside home', ['location'], { cwd: '/opt/project' }],
+    ['Not a repository', ['git'], { gitOn: false }],
+    ['Clean branch', ['git'], { dirty: false }],
+    ['Ahead and behind', ['git'], { ahead: 2, behind: 5 }],
+    ['Rebase with conflicts', ['git'], { action: 'rebase', conflicts: 3 }],
+    ['Detached HEAD', ['git'], { detached: true, dirty: false }],
+    ['Narrow terminal: 3-cell bars', ['width', 'fable'], { ...FABLE, sevenPct: 78, columns: 110 }],
+    ['Narrower terminal: percentages only', ['width', 'fable'], { ...FABLE, sevenPct: 78, columns: 90 }],
+    ['Width unknown: full bars', ['width', 'fable'], { ...FABLE, sevenPct: 78, columnsKnown: false }],
+    ['Minimal input', ['model'], {
+      sessionIdOn: false, durationOn: false, effort: '', fiveOn: false, sevenOn: false, cache: 'off', gitOn: false,
+    }],
+  ];
+
+  // ---- state -> render() arguments ----
+
+  function toArgs(s) {
+    const now = Date.now() / 1000;
+    const [id, name] = MODELS.find(([mid]) => mid === s.model) || MODELS[0];
+    const input = { model: { id, display_name: name } };
+    if (s.sessionIdOn) input.session_id = SESSION_ID;
+    if (s.effort) input.effort = { level: s.effort };
+    if (s.durationOn) input.cost = { total_duration_ms: Math.round(s.durationH * 3600000) };
+    input.context_window = { used_percentage: s.prompted ? s.ctx : null };
+    const limits = {};
+    if (s.fiveOn) limits.five_hour = { used_percentage: s.fivePct, resets_at: s.fiveResetKnown ? now + s.fiveH * 3600 : null };
+    if (s.sevenOn) limits.seven_day = { used_percentage: s.sevenPct, resets_at: s.sevenResetKnown ? now + s.sevenD * 86400 : null };
+    input.rate_limits = limits;
+    if (s.cache !== 'off') {
+      input.prompt_cache = {
+        warm: s.cache !== 'cold',
+        caching_observed: true,
+        ttl: s.ttl,
+        expires_at: s.cache === 'warm' ? now + s.cacheMin * 60 : null,
+        recache_tokens_if_cold: Number(s.rebuild) || 0,
+      };
+    }
+    const projectDir = s.moved ? HOME : s.cwd;
+    input.cwd = s.cwd;
+    input.workspace = { current_dir: s.cwd, project_dir: projectDir };
+
+    const fableResets = s.fableResetKnown ? new Date((now + s.fableD * 86400) * 1000).toISOString() : null;
+    const usage = {
+      fetched_at: now * 1000,
+      fable: s.fableState === 'none' ? null : { percent: s.fablePct, resets_at: fableResets, is_active: s.fableState === 'active' },
+      error: s.fableError ? 'http 429' : null,
+    };
+    const text = R.cleanTopic(s.topicText);
+    const topic = s.topic === 'none' || !text ? null : { text, isNew: s.topic === 'new' };
+    const git = s.gitOn
+      ? {
+          branch: s.detached ? '@3f2a9c1' : s.branch || 'main',
+          ahead: Number(s.ahead) || 0,
+          behind: Number(s.behind) || 0,
+          staged: 0,
+          unstaged: s.dirty ? 1 : 0,
+          untracked: 0,
+          conflicts: Number(s.conflicts) || 0,
+          action: s.action || null,
+        }
+      : null;
+    return { input, cwd: s.cwd || HOME, usage, topic, git, home: HOME, columns: s.columnsKnown ? s.columns : null };
+  }
+
+  // ---- ANSI -> HTML ----
+
+  function esc(s) {
+    return s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  }
+
+  function ansiToHtml(text) {
+    let out = '';
+    let st = { b: false, d: false, fg: null };
+    const re = /\x1b\[([0-9;]*)m/g;
+    let last = 0;
+    let m;
+    const flush = (chunk) => {
+      if (!chunk) return;
+      const cls = [st.b && 'b', st.d && 'd', st.fg === 'y' && 'y', st.fg === 'r' && 'r'].filter(Boolean).join(' ');
+      const style = st.fg && st.fg.startsWith('rgb') ? ` style="color:${st.fg}"` : '';
+      out += cls || style ? `<span${cls ? ` class="${cls}"` : ''}${style}>${esc(chunk)}</span>` : esc(chunk);
+    };
+    while ((m = re.exec(text))) {
+      flush(text.slice(last, m.index));
+      last = re.lastIndex;
+      const codes = m[1].split(';').map(Number);
+      for (let i = 0; i < codes.length; i++) {
+        const c = codes[i];
+        if (c === 0) st = { b: false, d: false, fg: null };
+        else if (c === 1) st.b = true;
+        else if (c === 2) st.d = true;
+        else if (c === 31) st.fg = 'r';
+        else if (c === 33) st.fg = 'y';
+        else if (c === 38 && codes[i + 1] === 2) {
+          st.fg = `rgb(${codes[i + 2]},${codes[i + 3]},${codes[i + 4]})`;
+          i += 4;
+        }
+      }
+    }
+    flush(text.slice(last));
+    return out;
+  }
+
+  function plain(text) {
+    return text.replace(/\x1b\[[0-9;]*m/g, '');
+  }
+
+  function draw(el, state) {
+    const out = R.render(toArgs(state));
+    el.innerHTML = out ? ansiToHtml(out) : '<span class="empty">(renders nothing)</span>';
+    return out;
+  }
+
+  function columns(out) {
+    return Math.max(0, ...plain(out).split('\n').map((l) => [...l].length));
+  }
+
+  // ---- controls ----
+
+  let state = { ...DEFAULTS };
+  const form = document.getElementById('controls');
+  const inputs = {};
+
+  function optionPairs(options) {
+    return options.map((o) => (Array.isArray(o) ? o : [o, o]));
+  }
+
+  function fmtValue(v, unit) {
+    return `${Number(v)}${unit || ''}`;
+  }
+
+  for (const [title, toggle, controls] of GROUPS) {
+    const fs = document.createElement('fieldset');
+    fs.dataset.toggle = toggle || '';
+    fs.innerHTML = `<legend>${esc(title)}</legend>`;
+    for (const [key, kind, label, extra = {}] of controls) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const idAttr = `c-${key}`;
+      let el;
+      if (kind === 'bool') {
+        row.innerHTML = `<label><input type="checkbox" id="${idAttr}"> ${esc(label)}</label>`;
+        el = row.querySelector('input');
+      } else {
+        row.innerHTML = `<label for="${idAttr}">${esc(label)}</label>`;
+        if (kind === 'select') {
+          el = document.createElement('select');
+          for (const [v, t] of optionPairs(extra.options)) el.add(new Option(t, v));
+        } else if (kind === 'range') {
+          el = document.createElement('input');
+          el.type = 'range';
+          Object.assign(el, { min: extra.min, max: extra.max, step: extra.step });
+        } else {
+          el = document.createElement('input');
+          el.type = kind === 'number' ? 'number' : 'text';
+          if (kind === 'number') el.min = 0;
+        }
+        el.id = idAttr;
+        row.appendChild(el);
+        if (kind === 'range') {
+          const o = document.createElement('output');
+          o.htmlFor = idAttr;
+          row.appendChild(o);
+          el._out = o;
+          el._unit = extra.unit;
+        }
+      }
+      if (extra.hint) row.title = extra.hint;
+      el.dataset.key = key;
+      el.dataset.kind = kind;
+      inputs[key] = el;
+      fs.appendChild(row);
+    }
+    form.appendChild(fs);
+  }
+
+  function readControl(el) {
+    const kind = el.dataset.kind;
+    if (kind === 'bool') return el.checked;
+    if (kind === 'range' || kind === 'number') return Number(el.value);
+    return el.value;
+  }
+
+  function syncControls() {
+    for (const [key, el] of Object.entries(inputs)) {
+      if (el.dataset.kind === 'bool') el.checked = !!state[key];
+      else el.value = state[key];
+      if (el._out) el._out.value = fmtValue(state[key], el._unit);
+    }
+    for (const fs of form.querySelectorAll('fieldset')) {
+      const t = fs.dataset.toggle;
+      fs.classList.toggle('off', !!t && !state[t]);
+    }
+  }
+
+  form.addEventListener('input', (e) => {
+    const el = e.target;
+    if (!el.dataset.key) return;
+    state[el.dataset.key] = readControl(el);
+    syncControls();
+    update();
+  });
+
+  // ---- live, sweep, gallery ----
+
+  const liveOut = document.getElementById('liveOut');
+  let lastOut = '';
+
+  function update() {
+    lastOut = draw(liveOut, state);
+    document.getElementById('liveWidth').textContent = `${columns(lastOut)} columns wide`;
+    document.getElementById('liveJson').textContent = JSON.stringify(toArgs(state), null, 2);
+    drawSweep();
+  }
+
+  const sweepKey = document.getElementById('sweepKey');
+  const sweepSteps = document.getElementById('sweepSteps');
+  for (const [key, [label]] of Object.entries(SWEEPS)) sweepKey.add(new Option(label, key));
+  sweepKey.value = 'sevenPct';
+
+  function drawSweep() {
+    const key = sweepKey.value;
+    const [, lo, hi] = SWEEPS[key];
+    const n = Math.max(2, Math.min(41, Number(sweepSteps.value) || 11));
+    const base = /^fable/.test(key) ? { ...state, ...FABLE } : state;
+    const lines = [];
+    for (let i = 0; i < n; i++) {
+      const raw = lo + ((hi - lo) * i) / (n - 1);
+      const v = Math.round(raw * 100) / 100;
+      const out = R.render(toArgs({ ...base, [key]: v }));
+      lines.push(ansiToHtml(out || '(renders nothing)'));
+    }
+    document.getElementById('sweepOut').innerHTML = lines.join('\n\n');
+  }
+  sweepKey.addEventListener('change', drawSweep);
+  sweepSteps.addEventListener('input', drawSweep);
+
+  const allTags = [...new Set(PRESETS.flatMap(([, tags]) => tags))].sort();
+  const shownTags = new Set(allTags);
+  const tagFilter = document.getElementById('tagFilter');
+  for (const tag of allTags) {
+    const label = document.createElement('label');
+    label.className = 'chip';
+    label.innerHTML = `<input type="checkbox" checked> ${esc(tag)}`;
+    label.querySelector('input').addEventListener('change', (e) => {
+      if (e.target.checked) shownTags.add(tag);
+      else shownTags.delete(tag);
+      drawGallery();
+    });
+    tagFilter.appendChild(label);
+  }
+
+  function drawGallery() {
+    const gallery = document.getElementById('gallery');
+    gallery.innerHTML = '';
+    for (const [title, tags, over] of PRESETS) {
+      if (!tags.some((t) => shownTags.has(t))) continue;
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `<h3>${esc(title)} <span class="tags">${tags.map(esc).join(' · ')}</span><button type="button">Load into panel</button></h3><div class="term"></div>`;
+      draw(card.querySelector('.term'), { ...DEFAULTS, ...over });
+      card.querySelector('button').addEventListener('click', () => {
+        state = { ...DEFAULTS, ...over };
+        syncControls();
+        update();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+      gallery.appendChild(card);
+    }
+  }
+
+  async function copy(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+  }
+  document.getElementById('copyJson').addEventListener('click', () => copy(JSON.stringify(toArgs(state).input)));
+  document.getElementById('copyText').addEventListener('click', () => copy(plain(lastOut)));
+  document.getElementById('reset').addEventListener('click', () => {
+    state = { ...DEFAULTS };
+    syncControls();
+    update();
+  });
+
+  syncControls();
+  update();
+  drawGallery();
+})();
+</script>
+</body>
+</html>

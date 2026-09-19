@@ -18,12 +18,15 @@ base="\"session_id\":\"$id\",\"model\":{\"id\":\"claude-opus-5\",\"display_name\
 here="\"cwd\":\"$repo\",\"workspace\":{\"current_dir\":\"$repo\",\"project_dir\":\"$repo\"}"
 moved="\"cwd\":\"$repo\",\"workspace\":{\"current_dir\":\"$repo\",\"project_dir\":\"$HOME\"}"
 five="\"five_hour\":{\"used_percentage\":87,\"resets_at\":$((now + 2880))}"
-seven="\"seven_day\":{\"used_percentage\":91,\"resets_at\":$((now + 172800))}"
+seven_at() { print -r -- "\"seven_day\":{\"used_percentage\":$1,\"resets_at\":$((now + $2))}" }
+seven=$(seven_at 91 172800)
 warm_for() { print -r -- "\"prompt_cache\":{\"warm\":true,\"caching_observed\":true,\"ttl\":\"1h\",\"expires_at\":$((now + $1)),\"recache_tokens_if_cold\":38000}" }
 warm=$(warm_for 2500)
 # A throwaway cache dir, always fresh, so previews never reach the usage endpoint.
 export CC_STATUSLINE_CACHE_DIR=$(mktemp -d)
 trap 'rm -rf -- "$CC_STATUSLINE_CACHE_DIR"' EXIT
+# A fixed width, so the output does not depend on the terminal running this.
+export CC_STATUSLINE_COLUMNS=200
 usage() { print -r -- "{\"fetched_at\":$((now * 1000)),\"seven_day_seen\":null,\"fable\":$1,\"error\":$2}" > "$CC_STATUSLINE_CACHE_DIR/usage.json" }
 fable="\"model\":{\"id\":\"claude-fable-5-1\",\"display_name\":\"Fable 5.1\"},\"effort\":{\"level\":\"xhigh\"},\"session_id\":\"$id\",\"cost\":{\"total_duration_ms\":2880000}"
 fable_at() { print -r -- "{\"percent\":$1,\"resets_at\":\"$(TZ=UTC strftime %Y-%m-%dT%H:%M:%SZ $((now + 172800)))\",\"is_active\":true}" }
@@ -47,11 +50,15 @@ render "cache running low (yellow)" "$mode" "$base,$here,\"context_window\":{\"u
 render "cache nearly expired (red)" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$(warm_for 200)"
 render "cache cold" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$cold"
 render "moved from launch directory" "$mode" "$base,$moved,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
+render "7-day limit shown from 75%" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five,$(seven_at 75 224640)},$warm"
 render "7-day limit near exhaustion" "$mode" "$base,$here,\"context_window\":{\"used_percentage\":85},\"rate_limits\":{$five,$seven},$warm"
 usage "$(fable_at 85)" null
 render "Fable weekly quota (yellow)" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
 usage "$(fable_at 95)" null
 render "Fable weekly quota near exhaustion" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
+render "Fable and 7-day quotas together" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five,$(seven_at 78 224640)},$warm"
+CC_STATUSLINE_COLUMNS=110 render "Narrow terminal: 3-cell bars" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five,$(seven_at 78 224640)},$warm"
+CC_STATUSLINE_COLUMNS=90 render "Narrower terminal: percentages only" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five,$(seven_at 78 224640)},$warm"
 usage "$(fable_at 85)" '"http 429"'
 render "Fable refresh failed (stale value)" "$mode" "$fable,$here,\"context_window\":{\"used_percentage\":8},\"rate_limits\":{$five},$warm"
 usage null '"keychain: no claudeAiOauth.accessToken in keychain entry"'

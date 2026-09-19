@@ -3,7 +3,7 @@
 A minimalist [Claude Code](https://claude.com/claude-code) status line. Single Node.js file, no dependencies.
 
 ```
-◆  Opus 5 ▸ xhigh ▸ 09/16 16:22 ▸ ▱▱▱▱▱ 8% ▸ 0.8h ▰▰▰▰▱ 87% ▸ cch 42m  ◆
+◆  Opus 5 ▸ xhigh ▸ 09/16 16:22 ▸ ╾──── 8% ▸ 0.8h ━━━━╾ 87% ▸ cch 42m  ◆
 ◆                          auth token refresh                          ◆
 ◆  3f2a9c1e-7b4d-4e8a-9f60-2d1c5b8e7a43  ▸  ~/dev/my-app  ▸  ⇡1 *main  ◆
 ```
@@ -17,10 +17,10 @@ The first row covers the model and usage; the second, when there is one, names w
 | `Opus 5` | Active model |
 | `xhigh` | Reasoning effort, when the model supports it |
 | `09/16 16:22` | Session start time |
-| `▱▱▱▱▱ 8%` | Context window usage |
-| `0.8h ▰▰▰▰▱ 87%` | 5-hour rate limit usage, labelled with hours until it resets |
-| `7d ▰▰▰▰▰ 91% ⟳2d` | 7-day rate limit with time until reset (shown only at ≥90%) |
-| `5.2d ▰▰▰▰▱ 85%` | Fable weekly quota, labelled with days until it resets (hours in the last day), only while the session runs a Fable model; `fbl` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
+| `╾──── 8%` | Context window usage |
+| `0.8h ━━━━╾ 87%` | 5-hour rate limit usage, labelled with hours until it resets |
+| `2.6d ━━━━─ 75%` | 7-day rate limit, labelled with days until it resets (hours in the last day); shown only at ≥75%, `7d` when the reset time is unknown |
+| `5.2d ━━━━─ 85% fbl` | Fable weekly quota, labelled like the 7-day bar and tagged `fbl` so the two read apart; only while the session runs a Fable model; `fbl` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
 | `cch 42m` | Minutes until the prompt cache expires, coloured by how much of its TTL (5m or 1h) has elapsed; `cch cold · 38k to rebuild` once it has, with the tokens the next prompt reprocesses |
 | `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic`, otherwise one derived from the transcript; yellow for a minute after it changes (see [Session topic](#session-topic)) |
 | `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
@@ -28,6 +28,8 @@ The first row covers the model and usage; the second, when there is one, names w
 | `⇡1 *main` | Git branch, ahead (`⇡`) / behind (`⇣`), in-progress action (rebase/merge/…), conflicts (`~`), and `*` when there are staged, unstaged or untracked changes |
 
 Bars and the cache countdown dim under 80%, turn yellow at ≥80%, red at ≥92%. Model, effort, the topic and the directory name are drawn at normal brightness and everything else is faint, with the arrows and diamonds a fixed grey one step darker (`rgb(66,69,80)`, chosen for a dark theme); model and effort are bold yellow until the first prompt of a session.
+
+Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), so five cells show ten levels. When the first row would be wider than the terminal, every bar shrinks to three cells, and if that still does not fit, only the percentages remain. The width comes from the session's terminal: Claude Code runs the status line without one, so the script walks up its parent processes to the first with a tty (one `ps` per step) and reads that tty's size with `stty`, about 15 ms in all, on every redraw so a resize applies on the next one. `CC_STATUSLINE_COLUMNS` sets the width instead; with neither, bars stay full width.
 
 ## Fable quota
 
@@ -106,3 +108,9 @@ ln -s ~/dev/cc-statusline/commands/statusline-topic.md ~/.claude/commands/status
 ## Preview
 
 `scripts/preview.zsh` pipes sample input through the script and prints every display state. Add `--color` to keep the ANSI colours.
+
+`docs/showcase.html` draws the status line in a browser from the same code. Open it straight from disk. It has a live panel with a control for every input, a sweep that steps one value across its range, and a gallery of named states with tag filters. Each state can be loaded into the panel.
+
+## Layout
+
+`lib/render.js` is the pure half: it turns the status line input, the usage cache, the topic and the git state into the rendered lines, with no I/O. `cc-statusline.js` gathers that state (stdin, Keychain, cache files, git, the background refreshes) and calls it. The showcase page loads `lib/render.js` directly, so a display change shows up there without a separate step.

@@ -17,7 +17,8 @@ const {
   writeFileSync,
 } = require('fs');
 const { homedir, tmpdir } = require('os');
-const { basename, isAbsolute, join, resolve, sep } = require('path');
+const { isAbsolute, join } = require('path');
+const { render, cleanTopic, isFable, TOPIC_MAX_CHARS } = require('./lib/render.js');
 
 // The Fable weekly quota is not in the statusline input; it comes from the
 // account usage endpoint, cached once for every session on the machine.
@@ -40,51 +41,11 @@ const TOPIC_FOCUSED_REFRESH_MS = 2 * 60000;
 const TOPIC_REFRESH_MS = 10 * 60000;
 const TOPIC_LOCK_STALE_MS = 2 * 60000;
 const TOPIC_KEEP_MS = 30 * 86400000;
-const TOPIC_MAX_CHARS = 40;
 // A changed topic is yellow for one refreshInterval from the first redraw that
 // shows it, so the next idle tick is the one that returns it to normal.
 const TOPIC_HIGHLIGHT_MS = 60000;
 const TRANSCRIPT_TAIL_BYTES = 512 * 1024;
 const TRANSCRIPT_EXCERPT_CHARS = 8000;
-
-const ESC = '\x1b[';
-const RESET = ESC + '0m';
-const DIM = ESC + '2m';
-const BOLD = ESC + '1m';
-const RED = ESC + '31m';
-const YELLOW = ESC + '33m';
-// Arrows and diamonds: a grey one step below faint, tuned for a dark blue-grey theme.
-const FRAME = ESC + '38;2;66;69;80m';
-// Claude Code indents the status line two columns; the space inside each
-// diamond is never narrower than that indent.
-const EDGE = 2;
-
-function paint(color, s) {
-  return color + s + RESET;
-}
-
-function visibleWidth(s) {
-  return [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
-}
-
-// Splits total into n integer parts that differ by at most one.
-function spread(total, n) {
-  return Array.from({ length: n }, (_, i) => Math.floor(((i + 1) * total) / n) - Math.floor((i * total) / n));
-}
-
-// Hands out total columns across gaps, widening the narrowest first so the
-// gaps even out, and never going below each gap's minimum.
-function fillGaps(total, mins) {
-  let level = 0;
-  while (mins.reduce((sum, m) => sum + Math.max(m, level + 1), 0) <= total) level++;
-  const gaps = mins.map((m) => Math.max(m, level));
-  const lowest = gaps.flatMap((g, i) => (g === level ? [i] : []));
-  const extra = total - gaps.reduce((sum, g) => sum + g, 0);
-  spread(extra, lowest.length).forEach((add, j) => {
-    gaps[lowest[j]] += add;
-  });
-  return gaps;
-}
 
 function readStdin() {
   try {
@@ -92,121 +53,6 @@ function readStdin() {
   } catch {
     return '';
   }
-}
-
-function bar(pct, width = 5) {
-  const clamped = Math.max(0, Math.min(100, pct));
-  const filled = Math.round((clamped / 100) * width);
-  return '▰'.repeat(filled) + '▱'.repeat(width - filled);
-}
-
-function threshColor(pct) {
-  if (pct >= 92) return RED;
-  if (pct >= 80) return YELLOW;
-  return DIM;
-}
-
-function fmtDuration(ms) {
-  if (ms == null || ms <= 0) return '';
-  const mins = Math.floor(ms / 60000);
-  if (mins < 60) return `${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  const rem = mins % 60;
-  if (hrs < 24) return rem ? `${hrs}h${rem}m` : `${hrs}h`;
-  return `${Math.floor(hrs / 24)}d`;
-}
-
-// Days past the first 24 hours, so a weekly reset reads 5.2d rather than 124.8h.
-function fmtHoursRemaining(etaMs) {
-  if (etaMs == null || etaMs <= 0) return null;
-  const hrs = etaMs / 3600000;
-  return hrs >= 24 ? `${(hrs / 24).toFixed(1)}d` : `${hrs.toFixed(1)}h`;
-}
-
-function fmtTokens(n) {
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
-  if (n >= 1000) return `${Math.round(n / 1000)}k`;
-  return String(n);
-}
-
-function parseEpoch(v) {
-  if (v == null) return null;
-  // Claude Code pipes timestamps as unix epoch seconds; tolerate ISO strings too.
-  if (typeof v === 'number') return v * 1000;
-  if (typeof v === 'string') {
-    if (/^\d+$/.test(v)) return Number(v) * 1000;
-    const t = new Date(v).getTime();
-    return isNaN(t) ? null : t;
-  }
-  return null;
-}
-
-// "5m" / "1h" -> milliseconds.
-function parseTtl(v) {
-  const m = /^(\d+)([smh])$/.exec(v || '');
-  if (!m) return null;
-  return Number(m[1]) * { s: 1000, m: 60000, h: 3600000 }[m[2]];
-}
-
-function fmtSessionStart(durationMs) {
-  if (durationMs == null || durationMs < 0) return null;
-  const d = new Date(Date.now() - durationMs);
-  const mo = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${mo}/${dd} ${hh}:${mm}`;
-}
-
-// "Opus 4.8 (1M context)" -> "Opus 4.8 1M". Drops the parenthetical's "context"
-// noise while keeping the rest; if the convention changes, degrades to the
-// untouched display name rather than producing a wrong label.
-function shortenModel(name) {
-  if (!name) return null;
-  return (
-    name.replace(/\s*\(([^)]*)\)\s*$/, (_, inner) => {
-      const t = inner.replace(/\bcontext\b/i, '').replace(/\s+/g, ' ').trim();
-      return t ? ' ' + t : '';
-    }) || null
-  );
-}
-
-function tildify(p) {
-  const home = homedir();
-  if (p === home) return '~';
-  return p.startsWith(home + sep) ? '~' + p.slice(home.length) : p;
-}
-
-// Dims the parent path so the directory name stands out.
-function renderPath(p) {
-  const shown = tildify(p);
-  const cut = shown.lastIndexOf(sep) + 1;
-  if (cut === 0 || cut === shown.length) return shown;
-  return paint(DIM, shown.slice(0, cut)) + shown.slice(cut);
-}
-
-// Names the launch directory first when the session has moved away from it.
-function renderLocation(cwd, projectDir) {
-  const here = renderPath(cwd);
-  if (!projectDir || resolve(projectDir) === resolve(cwd)) return here;
-  return paint(DIM, `${basename(projectDir)} → `) + here;
-}
-
-function renderCache(cache) {
-  if (!cache?.caching_observed) return null;
-  const expiresMs = parseEpoch(cache.expires_at);
-  const leftMs = expiresMs != null ? expiresMs - Date.now() : null;
-  if (cache.warm && leftMs == null) return paint(DIM, 'cch warm');
-  if (cache.warm && leftMs > 0) {
-    // Colours by how much of the TTL has elapsed, on the same scale as the bars.
-    const ttlMs = parseTtl(cache.ttl);
-    const col = ttlMs ? threshColor(100 * (1 - leftMs / ttlMs)) : DIM;
-    // Rounds up so a cache that is still warm never reads as 0m.
-    return paint(col, 'cch ' + fmtDuration(Math.ceil(leftMs / 60000) * 60000));
-  }
-  const rebuild = cache.recache_tokens_if_cold;
-  const detail = rebuild ? ` · ${fmtTokens(rebuild)} to rebuild` : '';
-  return paint(YELLOW, 'cch cold' + detail);
 }
 
 function git(cwd) {
@@ -282,24 +128,6 @@ function git(cwd) {
   } catch {
     return null;
   }
-}
-
-function renderBar(label, limit, opts = {}) {
-  const pct = limit?.used_percentage;
-  if (pct == null) return null;
-  const col = threshColor(pct);
-  const resetMs = parseEpoch(limit.resets_at);
-  const etaMs = resetMs != null ? resetMs - Date.now() : null;
-  let displayLabel = label;
-  if (opts.liveCountdown) {
-    const live = fmtHoursRemaining(etaMs);
-    if (live) displayLabel = live;
-  }
-  const eta =
-    !opts.liveCountdown && pct >= 90 && etaMs && etaMs > 0
-      ? ' ' + paint(DIM, '⟳' + fmtDuration(etaMs))
-      : '';
-  return paint(DIM, `${displayLabel} `) + paint(col, `${bar(pct)} ${Math.round(pct)}%`) + eta;
 }
 
 function readUsageCache() {
@@ -436,16 +264,6 @@ function topicPaths(sessionId) {
   };
 }
 
-function cleanTopic(s) {
-  const one = String(s || '')
-    .replace(/[\x00-\x1f\x7f]/g, ' ')
-    .replace(/^["'`*#\s]+|["'`*.\s]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const chars = [...one];
-  return chars.length > TOPIC_MAX_CHARS ? chars.slice(0, TOPIC_MAX_CHARS - 1).join('').trimEnd() + '…' : one;
-}
-
 function readText(file) {
   try {
     return readFileSync(file, 'utf8');
@@ -454,7 +272,7 @@ function readText(file) {
   }
 }
 
-// A manual topic wins over the auto one. Starts a background refresh of the
+// A manual topic wins over the auto one. Returns { text, isNew }. Starts a background refresh of the
 // auto topic when the transcript has moved on.
 function renderTopic(sessionId, transcriptPath) {
   const paths = topicPaths(sessionId);
@@ -469,7 +287,7 @@ function renderTopic(sessionId, transcriptPath) {
     topic = cleanTopic(auto?.topic);
   }
   if (!topic) return null;
-  return paint(topicIsNew(paths, topic) ? YELLOW : '', topic);
+  return { text: topic, isNew: topicIsNew(paths, topic) };
 }
 
 // Remembers when this topic was first drawn; a different topic restarts the clock.
@@ -527,25 +345,47 @@ function maybeRefreshTopic(paths, auto, transcriptPath, sessionId) {
 }
 
 // The terminal of the Claude Code session this status line belongs to: the
-// first ancestor process that has one.
+// first ancestor process that has one. Claude Code runs the status line without
+// a controlling terminal, so /dev/tty is not available. One ps per ancestor
+// (~3 ms each) rather than listing every process (~200 ms).
 function ownTty() {
-  const out = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,tty='], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-    timeout: 2000,
-  });
-  const procs = new Map();
-  for (const line of out.split('\n')) {
-    const [pid, ppid, tty] = line.trim().split(/\s+/);
-    if (pid) procs.set(pid, { ppid, tty });
-  }
   let pid = String(process.pid);
-  for (let depth = 0; depth < 10 && procs.has(pid); depth++) {
-    const { ppid, tty } = procs.get(pid);
-    if (tty && tty !== '??') return tty.startsWith('/dev/') ? tty : `/dev/${tty}`;
+  for (let depth = 0; depth < 10; depth++) {
+    const [ppid, tty] = execFileSync('ps', ['-o', 'ppid=,tty=', '-p', pid], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    })
+      .trim()
+      .split(/\s+/);
+    if (tty && tty !== '??' && tty !== '?') return tty.startsWith('/dev/') ? tty : `/dev/${tty}`;
+    if (!ppid || ppid === '0' || ppid === '1') return null;
     pid = ppid;
   }
   return null;
+}
+
+// Columns of the session's terminal, read on every redraw so a resize is
+// picked up on the next one. CC_STATUSLINE_COLUMNS overrides it; null when
+// neither is known, and the bars then stay full width.
+function terminalColumns() {
+  const forced = Number(process.env.CC_STATUSLINE_COLUMNS);
+  if (forced > 0) return forced;
+  try {
+    const tty = ownTty();
+    if (!tty) return null;
+    // macOS's own stty reads another terminal with -f; GNU stty, often first on
+    // PATH there, spells it -F.
+    const [cmd, flag] = process.platform === 'darwin' ? ['/bin/stty', '-f'] : ['stty', '-F'];
+    const cols = Number(
+      execFileSync(cmd, [flag, tty, 'size'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 })
+        .trim()
+        .split(/\s+/)[1]
+    );
+    return cols > 0 ? cols : null;
+  } catch {
+    return null;
+  }
 }
 
 // True only when iTerm2 is the frontmost app and its focused pane is this session.
@@ -710,18 +550,6 @@ function refreshTopic(sessionId, transcriptPath) {
   } catch {}
 }
 
-// The Fable weekly bar, skipped when the server reports that quota inactive. A red
-// "!" follows when the last refresh failed; details are in error.log.
-function renderFable(cached) {
-  if (!cached) return null;
-  const mark = cached.error ? ' ' + paint(RED, '!') : '';
-  const fable = cached.fable;
-  if (!fable) return mark ? paint(DIM, 'fbl') + mark : null;
-  if (!fable.is_active) return null;
-  const shown = renderBar('fbl', { used_percentage: fable.percent, resets_at: fable.resets_at }, { liveCountdown: true });
-  return shown ? shown + mark : null;
-}
-
 function main() {
   const raw = readStdin();
   let input = {};
@@ -731,112 +559,26 @@ function main() {
     } catch {}
   }
 
-  const sessionId = input.session_id || '';
-  const model = shortenModel(input.model?.display_name || input.model?.id);
-  const effort = input.effort?.level || null;
-  const durationMs = input.cost?.total_duration_ms ?? null;
-  const startedAt = fmtSessionStart(durationMs);
-  const ctxPct = input.context_window?.used_percentage ?? null;
-  const projectDir = input.workspace?.project_dir || null;
-  const cwd =
-    input.cwd ||
-    input.workspace?.current_dir ||
-    projectDir ||
-    process.cwd();
-
-  const rateLimits = input.rate_limits || {};
-  const fiveHour = rateLimits.five_hour || null;
-  const sevenDay = rateLimits.seven_day || null;
-
-  // Row 1: model and usage. Row 2: session topic. Row 3: session and location.
-  // Narrower rows are spread out so every row spans the same width.
-  const top = [];
-  const bottom = [];
-
-  // used_percentage stays null until the first API call, so it doubles as a
-  // "nothing typed yet" flag. Shout the model and effort in that window —
-  // after the first turn you are committed and the reminder is just noise.
-  const untouched = ctxPct == null;
-  const pick = untouched ? BOLD + YELLOW : '';
-
-  if (model) {
-    top.push(paint(pick, model));
-  }
-
-  if (effort) {
-    top.push(paint(pick, effort));
-  }
-
-  if (startedAt) {
-    top.push(paint(DIM, startedAt));
-  }
-
-  if (ctxPct != null) {
-    const col = threshColor(ctxPct);
-    top.push(paint(col, `${bar(ctxPct)} ${Math.round(ctxPct)}%`));
-  }
-
-  const five = renderBar('5h', fiveHour, { liveCountdown: true });
-  if (five) top.push(five);
-
-  const sevenPct = sevenDay?.used_percentage;
-  if (sevenPct != null && sevenPct >= 90) {
-    const seven = renderBar('7d', sevenDay);
-    if (seven) top.push(seven);
-  }
+  const cwd = input.cwd || input.workspace?.current_dir || input.workspace?.project_dir || process.cwd();
 
   // The Fable quota only matters while this session runs Fable; other models
   // neither show it nor spend requests on it.
-  if (/fable/i.test(`${input.model?.id ?? ''} ${input.model?.display_name ?? ''}`)) {
-    const usage = readUsageCache();
-    maybeRefreshUsage(usage, sevenPct ?? null);
-    const fable = renderFable(usage);
-    if (fable) top.push(fable);
+  let usage = null;
+  if (isFable(input)) {
+    usage = readUsageCache();
+    maybeRefreshUsage(usage, input.rate_limits?.seven_day?.used_percentage ?? null);
   }
 
-  const cache = renderCache(input.prompt_cache);
-  if (cache) top.push(cache);
-
-  if (sessionId) {
-    bottom.push(paint(DIM, sessionId));
-  }
-
-  // The topic gets a row of its own, between usage and location.
-  const middle = [];
-  const topic = renderTopic(sessionId, input.transcript_path);
-  if (topic) middle.push(topic);
-
-  bottom.push(renderLocation(cwd, projectDir));
-
-  const g = git(cwd);
-  if (g) {
-    const dirty = g.staged || g.unstaged || g.untracked;
-    const bits = [];
-    if (g.ahead) bits.push(`⇡${g.ahead}`);
-    if (g.behind) bits.push(`⇣${g.behind}`);
-    if (g.action) bits.push(g.action);
-    if (g.conflicts) bits.push(`~${g.conflicts}`);
-    bits.push(`${dirty ? '*' : ''}${g.branch}`);
-    bottom.push(paint(DIM, bits.join(' ')));
-  }
-
-  const rows = [top, middle, bottom].filter((parts) => parts.length);
-  const content = (parts) => parts.reduce((sum, part) => sum + visibleWidth(part), 0);
-  // Minimum gaps: EDGE inside each diamond, one space on each side of every arrow.
-  const minGaps = (parts) => [EDGE, ...Array(2 * (parts.length - 1)).fill(1), EDGE];
-  const sum = (ns) => ns.reduce((total, n) => total + n, 0);
-  const width = Math.max(0, ...rows.map((parts) => 2 + content(parts) + (parts.length - 1) + sum(minGaps(parts))));
-  const lines = rows.map((parts) => {
-    // Spreads the spare columns over every gap, the two inside the diamonds included.
-    const gaps = fillGaps(width - 2 - content(parts) - (parts.length - 1), minGaps(parts));
-    let line = paint(FRAME, '◆' + ' '.repeat(gaps[0]));
-    parts.forEach((part, i) => {
-      if (i) line += paint(FRAME, ' '.repeat(gaps[2 * i - 1]) + '▸' + ' '.repeat(gaps[2 * i]));
-      line += part;
-    });
-    return line + paint(FRAME, ' '.repeat(gaps[gaps.length - 1]) + '◆');
+  const out = render({
+    input,
+    cwd,
+    usage,
+    topic: renderTopic(input.session_id || '', input.transcript_path),
+    git: git(cwd),
+    home: homedir(),
+    columns: terminalColumns(),
   });
-  if (lines.length) process.stdout.write(lines.join('\n'));
+  if (out) process.stdout.write(out);
 }
 
 if (process.argv[2] === '--refresh-usage') {
