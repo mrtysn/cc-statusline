@@ -447,12 +447,16 @@ final class ClickableCell: NSView {
 final class SessionRowView: NSTableRowView {
     /// Set on the first finished row, to mark where the live sessions end.
     var drawsBoundary = false
+    /// Extra height on that row, so the line sits in clear space.
+    static let boundaryPadding: CGFloat = 26
 
     override func drawBackground(in dirtyRect: NSRect) {
         super.drawBackground(in: dirtyRect)
         guard drawsBoundary else { return }
         NSColor(srgbRed: 0.42, green: 0.44, blue: 0.51, alpha: 0.9).setFill()
-        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+        // Centred in the padding: half the gap above the line, half below it,
+        // before this row's own text.
+        NSRect(x: 0, y: (Self.boundaryPadding / 2).rounded(), width: bounds.width, height: 1).fill()
     }
 
     override func drawSelection(in dirtyRect: NSRect) {
@@ -596,12 +600,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     // last column off the screen. The account-wide quotas are not here — they are
     // the same for every session, so they live in the bar above the table.
     private let columns: [Column] = [
-        Column(key: "age", title: "Last Seen", width: 84),
+        Column(key: "age", title: "Last Seen", width: 74),
         Column(key: "cwd", title: "Directory", width: 164),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "model", title: "Model", width: 58),
         Column(key: "effort", title: "Effort", width: 60),
-        Column(key: "context", title: "Context", width: 100),
+        Column(key: "context", title: "Context", width: 82),
         Column(key: "cache", title: "Cache", width: 140),
         Column(key: "heat", title: "", width: 10),
         Column(key: "started", title: "Launched at", width: 104),
@@ -617,8 +621,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // A header follows its cells, or the two disagree. Model and effort
             // face each other across the gap, so the pair reads as one unit.
             switch spec.key {
-            case "age": column.headerCell.alignment = .center
-            case "model": column.headerCell.alignment = .right
+            case "context": column.headerCell.alignment = .center
+            case "age": column.headerCell.alignment = .right
+            case "model", "cache": column.headerCell.alignment = .right
             case "effort": column.headerCell.alignment = .left
             default: break
             }
@@ -699,11 +704,20 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        tableView.rowHeight + (isBoundary(row) ? SessionRowView.boundaryPadding : 0)
+    }
+
+    /// The first finished row: the live sessions end above it.
+    private func isBoundary(_ row: Int) -> Bool {
+        row < rows.count && rows[row].past && (row == 0 || !rows[row - 1].past)
+    }
+
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let view = SessionRowView()
         // Live sessions always sort above finished ones; the line says where
         // that boundary is without spending a row on a heading.
-        view.drawsBoundary = row < rows.count && rows[row].past && (row == 0 || !rows[row - 1].past)
+        view.drawsBoundary = isBoundary(row)
         return view
     }
 
@@ -739,6 +753,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard let key = tableColumn?.identifier.rawValue, row < rows.count else { return nil }
         let (session, past) = rows[row]
+        // The boundary row is taller; its content sits below the line, not
+        // centred across it.
+        let drop = isBoundary(row) ? SessionRowView.boundaryPadding / 2 : 0
         let s = session.summary
         let seg = session.segments
 
@@ -750,8 +767,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         var heat: NSColor? = nil
         switch key {
         case "topic":
-            // The dot carries the live/ended state; a column of its own was a sliver.
-            let dot = mono(past ? "○  " : "●  ", past ? Palette.frame : Palette.yellow)
+            // The dot leads the topic: the two together say what the session is
+            // doing and how alive it is.
+            let dot = mono(past ? "○  " : "●  ", dotColour(session, past: past))
             let title = NSMutableAttributedString(attributedString: dot)
             title.append(prose(s.topic ?? "—", (s.topic_is_new ?? false) ? Palette.yellow : Palette.text))
             top = title
@@ -772,7 +790,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             top = drawn(seg.started)
             bottom = s.started_at.map { "\(ago($0)) ago" } ?? ""
         case "context":
-            return progressCell(s.context, past: past)
+            return progressCell(s.context, past: past, drop: drop)
         case "heat":
             // A stripe beside the cache, not a wash behind it: the colour is a
             // scale to read along, and a tinted cell fights the text in it.
@@ -780,8 +798,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             bottom = ""
             heat = cacheHeat(s.cache)
         case "cache":
-            top = drawn(seg.cache)
-            bottom = cacheWords(s.cache)
+            // The words say everything the glyph line did, and the stripe beside
+            // the column already carries the colour.
+            top = NSAttributedString(
+                string: cacheWords(s.cache),
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
+                    .foregroundColor: Palette.text,
+                ])
+            bottom = ""
         case "age":
             top = mono("\(ago(session.active_at ?? session.updated_at)) ago", Palette.dim)
             bottom = ""
@@ -810,27 +835,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         // Model and effort are shapes rather than sentences; the model ends at
         // the gap and the effort starts there, so the pair reads together.
-        // The cache's second line ends where the stripe begins, so the two read
-        // as one edge; only that line moves, and per-line alignment is a
-        // paragraph style on its range.
-        if key == "cache", stack.length > top.length {
-            let style = NSMutableParagraphStyle()
-            style.alignment = .right
-            stack.addAttribute(
-                .paragraphStyle, value: style,
-                range: NSRange(location: top.length, length: stack.length - top.length))
-        }
-
         let alignment: NSTextAlignment =
-            key == "age" ? .center : key == "model" ? .right : key == "effort" ? .left : .left
+            (key == "model" || key == "cache" || key == "age") ? .right : .left
         if alignment != .left {
             let style = NSMutableParagraphStyle()
             style.alignment = alignment
             stack.addAttribute(
                 .paragraphStyle, value: style, range: NSRange(location: 0, length: stack.length))
         }
-        let centred = key == "age" || key == "model"
-
         let field = NSTextField(labelWithString: "")
         field.attributedStringValue = stack
         // Selectable text steals the click and re-styles itself when focused, so
@@ -853,7 +865,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             NSLayoutConstraint.activate([
                 stripe.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
                 stripe.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
-                stripe.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
+                stripe.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5 + drop * 2),
                 stripe.bottomAnchor.constraint(equalTo: cell.bottomAnchor, constant: -5),
             ])
         }
@@ -875,7 +887,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         NSLayoutConstraint.activate([
             field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: key == "effort" ? 3 : 4),
             field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: key == "model" ? -3 : -4),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
         ])
         return cell
     }
@@ -885,15 +897,29 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// source, and a reading old enough to doubt says how old it is.
     private func drawQuotaBar(_ snapshot: Snapshot) {
         let all = snapshot.live + snapshot.history
-        func newest(_ pick: (Session) -> Limit?) -> Session? {
-            all.filter { pick($0)?.percent != nil }.max { $0.updated_at < $1.updated_at }
+
+        /// A quota only climbs until it resets, so the highest reading is the
+        /// current truth however old it is — except near the reset itself, where
+        /// a high reading is about to become wrong and the newest one is safer.
+        func source(_ pick: (Session) -> Limit?) -> Session? {
+            let now = Date().timeIntervalSince1970
+            let reported = all.filter { pick($0)?.percent != nil }
+            let settled = reported.filter { session in
+                guard let resets = pick(session)?.resets_at else { return true }
+                return resets / 1000 - now > 300
+            }
+            let pool = settled.isEmpty ? reported : settled
+            return pool.max {
+                let (a, b) = (pick($0)?.percent ?? 0, pick($1)?.percent ?? 0)
+                return a == b ? $0.updated_at < $1.updated_at : a < b
+            }
         }
 
         for view in quotaBar.arrangedSubviews { quotaBar.removeArrangedSubview(view); view.removeFromSuperview() }
 
-        let five = newest { $0.summary.five_hour }
-        let seven = newest { $0.summary.seven_day }
-        let fable = newest { $0.summary.fable }
+        let five = source { $0.summary.five_hour }
+        let seven = source { $0.summary.seven_day }
+        let fable = source { $0.summary.fable }
         quotaBar.addArrangedSubview(quotaItem("5-hour quota", five, five?.summary.five_hour))
         quotaBar.addArrangedSubview(quotaItem("7-day quota", seven, seven?.summary.seven_day))
         quotaBar.addArrangedSubview(quotaItem("Fable quota", fable, fable?.summary.fable))
@@ -1022,7 +1048,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     /// "▓▓▓░░ 52%": the bar, then the number it stands for.
-    private func progressCell(_ percent: Double?, past: Bool) -> NSView {
+    private func progressCell(_ percent: Double?, past: Bool, drop: CGFloat) -> NSView {
         let cell = ClickableCell()
         let bar = BarView()
         let value = percent ?? 0
@@ -1040,15 +1066,29 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         cell.addSubview(bar)
         cell.addSubview(label)
         NSLayoutConstraint.activate([
-            bar.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
-            bar.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            bar.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            bar.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
             bar.heightAnchor.constraint(equalToConstant: 12),
-            bar.trailingAnchor.constraint(equalTo: label.leadingAnchor, constant: -8),
-            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
-            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            label.widthAnchor.constraint(equalToConstant: 34),
+            bar.trailingAnchor.constraint(equalTo: label.leadingAnchor, constant: -6),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            label.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            label.widthAnchor.constraint(equalToConstant: 32),
         ])
         return cell
+    }
+
+    /// The dot fades with the time since the session last did anything, in
+    /// brackets rather than a gradient, so two rows are either the same or
+    /// plainly different: under a minute, five, fifteen, then older.
+    private func dotColour(_ session: Session, past: Bool) -> NSColor {
+        guard !past else { return Palette.frame }
+        let age = Date().timeIntervalSince1970 - (session.active_at ?? session.updated_at) / 1000
+        switch age {
+        case ..<60: return Palette.yellow
+        case ..<300: return Palette.yellow.withAlphaComponent(0.7)
+        case ..<900: return Palette.yellow.withAlphaComponent(0.45)
+        default: return Palette.yellow.withAlphaComponent(0.28)
+        }
     }
 
     private func mono(_ text: String, _ colour: NSColor) -> NSAttributedString {
@@ -1091,7 +1131,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 blue: CGFloat(hot.b + (cold.b - hot.b) * t), alpha: 0.9)
         }
         guard let cache = cache else { return nil }
-        guard cache.warm else { return blend(1) }
+        let expired = (cache.expires_at ?? .greatestFiniteMagnitude) / 1000 <= Date().timeIntervalSince1970
+        guard cache.warm, !expired else { return blend(1) }
         guard let elapsed = cacheElapsed(cache) else { return nil }
         return blend(min(1, max(0, elapsed / 100)))
     }
@@ -1103,14 +1144,19 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return left.isEmpty ? "" : "resets in \(left)"
     }
 
+    /// The stripe beside the column says warm or cold; the words say what that
+    /// costs — time left, or the tokens a rebuild would reprocess.
     private func cacheWords(_ cache: CacheState?) -> String {
         guard let cache = cache else { return "" }
-        guard cache.warm else {
-            guard let rebuild = cache.rebuild else { return "cold" }
-            return "cold · \(tokens(rebuild)) to rebuild"
+        // A cache still flagged warm whose expiry has passed is cold: the flag is
+        // from the last redraw, the clock is now.
+        let expired = (cache.expires_at ?? .greatestFiniteMagnitude) / 1000 <= Date().timeIntervalSince1970
+        guard cache.warm, !expired else {
+            guard let rebuild = cache.rebuild else { return "expired" }
+            return "\(tokens(rebuild)) to rebuild"
         }
         guard let expires = cache.expires_at else { return "warm" }
-        return "warm · \(until(expires)) left"
+        return "\(until(expires)) left"
     }
 
     /// The branch symbols spelled out: what ⇡1 ~ * actually stand for.
