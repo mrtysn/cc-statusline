@@ -19,7 +19,7 @@ The first row covers the model and usage; the second, when there is one, names w
 | `╾────.08` | Context window usage |
 | `0.8ʰ ━━━━╾.87` | 5-hour rate limit usage, labelled with hours until it resets |
 | `2.6ᵈ ━━━━─.75 󰇧` | 7-day rate limit across all models, labelled with days until it resets (hours in the last day) and tagged with the earth `󰇧` so it reads apart from the Fable quota inside it; shown only at ≥75%, `7d` when the reset time is unknown |
-| `5.2ᵈ ━━━━─.85 󰯺` | Fable weekly quota, labelled like the 7-day bar and tagged with the boxed Fable initial `󰯺` so the two read apart; only while the session runs a Fable model; `󰯺` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
+| `5.2ᵈ ━━━━─.85 󰫳` | Fable weekly quota, labelled like the 7-day bar and tagged with the boxed Fable initial `󰫳` so the two read apart; only while the session runs a Fable model; `󰫳` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
 | `󰆼 42ᵐ` | Minutes until the prompt cache expires, after the icon, with the unit raised (`󰆼` is the Nerd Font database glyph), coloured by how much of its TTL (5m or 1h) has elapsed; once that turns yellow or red the tokens a rebuild would reprocess join it (`󰆼 4ᵐ 38k`), while there is still time to `/compact` or wrap up; `󰆼 38k 󰑐` in blue once it has expired |
 | `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic`, otherwise one derived from the transcript; yellow for a minute after it changes (see [Session topic](#session-topic)) |
 | `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
@@ -30,7 +30,7 @@ Bars and the cache countdown dim under 75%, turn yellow at ≥75% (where Claude 
 
 Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), so five cells show ten levels. When the first row would be wider than the terminal, every bar shrinks to three cells, and if that still does not fit, only the percentages remain. The width comes from the session's terminal: Claude Code runs the status line without one, so the script walks up its parent processes to the first with a tty (one `ps` per step) and reads that tty's size with `stty`, about 15 ms in all, on every redraw so a resize applies on the next one. `CC_STATUSLINE_COLUMNS` sets the width instead; with neither, bars stay full width.
 
-Four glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, the rebuild `󰑐`, the Fable tag `󰯺` and the weekly tag `󰇧`. Everything else is standard Unicode. Without a Nerd Font, set `CC_STATUSLINE_ICONS=0` to draw them as `cch`, `⟳`, `fbl` and `all` instead.
+Four glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, the rebuild `󰑐`, the Fable tag `󰫳` and the weekly tag `󰇧`. Everything else is standard Unicode. Without a Nerd Font, set `CC_STATUSLINE_ICONS=0` to draw them as `cch`, `⟳`, `fbl` and `all` instead.
 
 ## Fable quota
 
@@ -44,7 +44,7 @@ One cache is shared by every session in `~/.cache/cc-statusline/` (override with
 | `refresh.lock` | Held while a refresh runs, so sessions never fetch in parallel |
 | `error.log` | One timestamped line per failed refresh: `keychain`, `network`, `http <status>`, or `parse` |
 
-A refresh starts when the cache is older than five minutes, or after one minute when the 7-day percentage in the status line input has moved since the last fetch. A failed refresh keeps the last good value and adds a red `!`; the next successful one clears it. The endpoint is undocumented: if its shape changes, the bar shows `󰯺 !` and `error.log` says `parse`.
+A refresh starts when the cache is older than five minutes, or after one minute when the 7-day percentage in the status line input has moved since the last fetch. A failed refresh keeps the last good value and adds a red `!`; the next successful one clears it. The endpoint is undocumented: if its shape changes, the bar shows `󰫳 !` and `error.log` says `parse`.
 
 `scripts/probe-usage.zsh` calls the endpoint once and prints every limit window, for checking what the account currently reports.
 
