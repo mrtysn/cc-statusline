@@ -420,7 +420,9 @@ final class BarView: NSView {
 
 /// A cell that acts on a click and says so with the cursor.
 final class ClickableCell: NSView {
-    var onClick: (() -> Void)?
+    var onClick: (() -> Void)? {
+        didSet { setAccessibilityRole(onClick == nil ? .group : .button) }
+    }
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount >= 1, let onClick = onClick { onClick() } else { super.mouseDown(with: event) }
@@ -432,7 +434,10 @@ final class ClickableCell: NSView {
     }
 
     /// A short highlight, so a copy that changes nothing on screen is still felt.
+    /// The written confirmation in the header is the static cue, so skipping the
+    /// flash under reduced motion loses nothing.
     func flash() {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         wantsLayer = true
         layer?.backgroundColor = NSColor(srgbRed: 0.898, green: 0.753, blue: 0.482, alpha: 0.22).cgColor
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -459,21 +464,20 @@ final class SessionRowView: NSTableRowView {
         NSRect(x: 0, y: (Self.boundaryPadding / 2).rounded(), width: bounds.width, height: 1).fill()
     }
 
-    override func drawSelection(in dirtyRect: NSRect) {
-        guard selectionHighlightStyle != .none else { return }
-        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.06).setFill()
-        bounds.fill()
-    }
-
     override var isSelected: Bool {
         didSet { needsDisplay = true }
     }
 
+    /// The keyboard's place in the table. A 6% wash measured 1.17:1 against the
+    /// background, which is no indicator at all; the bar on the leading edge
+    /// carries the contrast and the wash carries the row.
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard isSelected else { return }
-        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.06).setFill()
+        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.10).setFill()
         bounds.fill()
+        Palette.text.withAlphaComponent(0.8).setFill()
+        NSRect(x: 0, y: 0, width: 3, height: bounds.height).fill()
     }
 }
 
@@ -557,6 +561,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // The default spacing plus per-cell padding is most of the row's width.
         table.intercellSpacing = NSSize(width: 4, height: 0)
         table.columnAutoresizingStyle = .noColumnAutoresizing
+        table.setAccessibilityLabel("Sessions")
         gridScroll.documentView = table
         gridScroll.hasVerticalScroller = true
         gridScroll.hasHorizontalScroller = false
@@ -869,6 +874,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 stripe.bottomAnchor.constraint(equalTo: cell.bottomAnchor, constant: -5),
             ])
         }
+        // VoiceOver reads the cell, not the two lines inside it, so each one
+        // says what it holds and what clicking it does.
+        cell.setAccessibilityLabel(accessibilityText(key: key, session: session, past: past))
         if key == "topic", let id = s.session_id {
             field.toolTip = [s.topic, id, "Click to copy the session id"].compactMap { $0 }.joined(
                 separator: "\n")
@@ -941,7 +949,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         guard let limit = limit, let percent = limit.percent, let source = source else {
             let none = NSTextField(labelWithString: "—")
             none.font = barFont
-            none.textColor = Palette.frame
+            none.textColor = Palette.dim
             row.addArrangedSubview(none)
             return row
         }
@@ -1050,6 +1058,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// "▓▓▓░░ 52%": the bar, then the number it stands for.
     private func progressCell(_ percent: Double?, past: Bool, drop: CGFloat) -> NSView {
         let cell = ClickableCell()
+        cell.setAccessibilityLabel(
+            "Context window \(percent.map { "\(Int($0.rounded())) percent used" } ?? "unknown")")
         let bar = BarView()
         let value = percent ?? 0
         bar.fraction = value / 100
@@ -1081,13 +1091,40 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// brackets rather than a gradient, so two rows are either the same or
     /// plainly different: under a minute, five, fifteen, then older.
     private func dotColour(_ session: Session, past: Bool) -> NSColor {
-        guard !past else { return Palette.frame }
+        // The faintest step still measures 3.4:1 against the background: below
+        // that the dot stops being visible rather than becoming subtle. The
+        // hollow ring, not the colour, is what says "ended".
+        guard !past else { return Palette.dim }
         let age = Date().timeIntervalSince1970 - (session.active_at ?? session.updated_at) / 1000
         switch age {
         case ..<60: return Palette.yellow
-        case ..<300: return Palette.yellow.withAlphaComponent(0.7)
-        case ..<900: return Palette.yellow.withAlphaComponent(0.45)
-        default: return Palette.yellow.withAlphaComponent(0.28)
+        case ..<300: return Palette.yellow.withAlphaComponent(0.8)
+        case ..<900: return Palette.yellow.withAlphaComponent(0.65)
+        default: return Palette.yellow.withAlphaComponent(0.5)
+        }
+    }
+
+    /// What a cell is, in words: the column it belongs to and the value in it.
+    private func accessibilityText(key: String, session: Session, past: Bool) -> String {
+        let s = session.summary
+        let age = "\(ago(session.active_at ?? session.updated_at)) ago"
+        switch key {
+        case "topic":
+            return "\(past ? "Finished" : "Live") session, \(s.topic ?? "no topic"). Click to copy its id."
+        case "cwd":
+            return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? ""). "
+                + "Click to show that terminal."
+        case "git": return "Branch \(gitText(s.git)), \(gitWords(s.git))"
+        case "model": return "Model \(s.model ?? "unknown")"
+        case "effort": return "Effort \(s.effort ?? "unknown")"
+        case "started":
+            return "Launched \(s.started_at.map { "\(ago($0)) ago" } ?? "at an unknown time")"
+        case "context":
+            return "Context window \(s.context.map { "\(Int($0.rounded())) percent used" } ?? "unknown")"
+        case "cache": return "Prompt cache, \(cacheWords(s.cache))"
+        case "heat": return ""
+        case "age": return "Last seen \(age)"
+        default: return ""
         }
     }
 
@@ -1102,7 +1139,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// A segment exactly as the status line draws it, escapes and all.
     private func drawn(_ ansi: String?) -> NSAttributedString {
-        guard let ansi = ansi, !ansi.isEmpty else { return mono("—", Palette.frame) }
+        guard let ansi = ansi, !ansi.isEmpty else { return mono("—", Palette.dim) }
         return attributed(ansi: ansi, font: barFont)
     }
 
