@@ -637,6 +637,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             column.sortDescriptorPrototype = NSSortDescriptor(key: spec.key, ascending: true)
             table.addTableColumn(column)
         }
+        // Launch order, earliest at the top, until a header is clicked.
+        table.sortDescriptors = [NSSortDescriptor(key: "started", ascending: true)]
     }
 
     // MARK: Loading
@@ -821,6 +823,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
 
         let stack = NSMutableAttributedString(attributedString: past ? faded(top) : top)
+        // Before the first prompt the status line shouts the model and effort in
+        // yellow so the choice can still be checked; the captions join in.
+        let pending = s.context == nil && !past && (key == "model" || key == "effort")
         if !bottom.isEmpty {
             // The session id is meant to be copied into `claude --resume`, so it
             // is monospaced and never shortened.
@@ -834,7 +839,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 NSAttributedString(
                     string: "\n" + bottom,
                     attributes: [
-                        .font: font, .foregroundColor: past ? Palette.dim.withAlphaComponent(0.8) : Palette.dim,
+                        .font: font,
+                        .foregroundColor: pending
+                            ? Palette.yellow : past ? Palette.dim.withAlphaComponent(0.8) : Palette.dim,
                     ]))
         }
 
