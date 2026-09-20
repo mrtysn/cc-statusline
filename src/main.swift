@@ -280,6 +280,14 @@ func until(_ epochMs: Double?) -> String {
     return trimmed(Double(s) / 86400, "d")
 }
 
+/// The moment itself, in the Launched-at column's form: "09/22 14:30".
+func clock(_ epochMs: Double) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "MM/dd HH:mm"
+    return f.string(from: Date(timeIntervalSince1970: epochMs / 1000))
+}
+
 func share(_ percent: Double?) -> String {
     guard let p = percent else { return "—" }
     let r = Int(p.rounded())
@@ -1183,7 +1191,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// When the quota comes back. The share is already on the bar above it.
     private func limitWords(_ limit: Limit?) -> String {
-        guard let limit = limit, limit.percent != nil else { return "" }
+        guard let limit = limit, let percent = limit.percent else { return "" }
+        if percent >= 95, let at = limit.resets_at, at / 1000 > Date().timeIntervalSince1970 {
+            return "resets \(clock(at))"
+        }
         let left = until(limit.resets_at)
         return left.isEmpty ? "" : "resets in \(left)"
     }
