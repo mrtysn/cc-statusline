@@ -1590,6 +1590,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let soundSwitch = NSButton(title: "", target: nil, action: nil)
     private let volumeSlider = NSSlider(value: 0.35, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let packMenu = NSPopUpButton()
+    private let volumeLabel = NSTextField(labelWithString: "")
     /// The events that can sound, in the order the checkboxes show them.
     private static let soundEvents: [(key: String, title: String)] = [
         ("task.complete", "done"), ("task.error", "error"), ("input.required", "needs you"),
@@ -1739,12 +1740,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         Column(key: "cwd", title: "Directory", width: 164),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "state", title: "State", width: 176),
+        // Beside the state: what a session is doing and how long its cache has
+        // are read together.
+        Column(key: "cache", title: "Cache", width: 140),
+        Column(key: "heat", title: "", width: 10),
         Column(key: "model", title: "Model", width: 74),
         Column(key: "effort", title: "Effort", width: 60),
         Column(key: "context", title: "Context", width: 82),
         Column(key: "sound", title: "Sound", width: 46),
-        Column(key: "cache", title: "Cache", width: 140),
-        Column(key: "heat", title: "", width: 10),
         Column(key: "tokens", title: "Tokens", width: 88),
         Column(key: "memory", title: "Memory", width: 72),
         Column(key: "cpu", title: "CPU", width: 60),
@@ -1805,6 +1808,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         volumeSlider.isContinuous = false
         volumeSlider.widthAnchor.constraint(equalToConstant: 80).isActive = true
         volumeSlider.setAccessibilityLabel("Volume")
+        // The share, as the quota bars carry theirs; muted reads 0%, because
+        // that is what comes out.
+        volumeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        volumeLabel.alignment = .right
+        volumeLabel.translatesAutoresizingMaskIntoConstraints = false
+        volumeLabel.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        drawVolume()
         packMenu.controlSize = .small
         packMenu.isBordered = false
         packMenu.font = NSFont.systemFont(ofSize: 11)
@@ -1816,7 +1826,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // row; the gap before it takes up the difference.
         let gap = NSView()
         gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let top = NSStackView(views: [soundSwitch, volumeSlider, gap, packMenu])
+        let top = NSStackView(views: [soundSwitch, volumeSlider, volumeLabel, gap, packMenu])
         top.spacing = 8
         top.distribution = .fill
 
@@ -1855,6 +1865,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         top.widthAnchor.constraint(equalTo: boxes.widthAnchor).isActive = true
     }
 
+    private func drawVolume() {
+        let settings = events.current
+        let percent = settings.enabled ? Int((settings.volume * 100).rounded()) : 0
+        volumeLabel.stringValue = "\(percent)%"
+        volumeLabel.textColor = percent == 0 ? Palette.dim : Palette.text
+        volumeLabel.setAccessibilityLabel("Volume \(percent) percent")
+    }
+
     private func drawSoundSwitch() {
         let on = events.current.enabled
         soundSwitch.attributedTitle = NSAttributedString(
@@ -1875,11 +1893,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     @objc private func soundSwitched() {
         events.update { $0.enabled.toggle() }
         drawSoundSwitch()
+        drawVolume()
         refreshTable()
     }
 
     @objc private func volumeChanged() {
         events.update { $0.volume = volumeSlider.floatValue }
+        drawVolume()
+        // Dragged to nothing is muted: the switch says so too.
+        if volumeSlider.floatValue == 0, events.current.enabled {
+            events.update { $0.enabled = false }
+            drawSoundSwitch()
+            drawVolume()
+            refreshTable()
+        } else if volumeSlider.floatValue > 0, !events.current.enabled {
+            events.update { $0.enabled = true }
+            drawSoundSwitch()
+            drawVolume()
+            refreshTable()
+        }
         events.preview()
     }
 
