@@ -962,6 +962,17 @@ final class PackStore {
         }
     }
 
+    /// Deletes an installed pack's directory.
+    func remove(_ name: String) -> String? {
+        guard Self.safe(name), !name.contains("/") else { return "unsafe pack name" }
+        do {
+            try fm.removeItem(at: packsDir.appendingPathComponent(name))
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     private static func safe(_ name: String) -> Bool {
         name.range(of: "^[A-Za-z0-9._?!() /-]+$", options: .regularExpression) != nil
             && !name.contains("..") && !name.hasPrefix("/")
@@ -989,16 +1000,26 @@ final class PackStore {
 final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private let store: PackStore
     private let onInstalled: (String) -> Void
+    /// The pack in use, so it is never deleted underneath the app.
+    private let onCurrentPack: () -> String
+    /// Called after a removal, so the picker drops it.
+    private let onRemoved: () -> Void
     private let table = NSTableView()
     private let search = NSSearchField()
     private let status = NSTextField(labelWithString: "")
     private let installButton = NSButton(title: "Install", target: nil, action: nil)
+    private let removeButton = NSButton(title: "Remove", target: nil, action: nil)
     private var shown: [RegistryPack] = []
     private var busy = false
 
-    init(store: PackStore, onInstalled: @escaping (String) -> Void) {
+    init(
+        store: PackStore, current: @escaping () -> String, onInstalled: @escaping (String) -> Void,
+        onRemoved: @escaping () -> Void
+    ) {
         self.store = store
+        self.onCurrentPack = current
         self.onInstalled = onInstalled
+        self.onRemoved = onRemoved
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 620, height: 460),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -1039,9 +1060,12 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         installButton.target = self
         installButton.action = #selector(installSelected)
         installButton.keyEquivalent = "\r"
+        removeButton.target = self
+        removeButton.action = #selector(removeSelected)
+        table.rowHeight = 22
         status.textColor = .secondaryLabelColor
         status.lineBreakMode = .byTruncatingTail
-        for view in [search, scroll, status, installButton] as [NSView] {
+        for view in [search, scroll, status, installButton, removeButton] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -1055,9 +1079,11 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
             scroll.bottomAnchor.constraint(equalTo: installButton.topAnchor, constant: -8),
             installButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             installButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            removeButton.trailingAnchor.constraint(equalTo: installButton.leadingAnchor, constant: -8),
+            removeButton.centerYAnchor.constraint(equalTo: installButton.centerYAnchor),
             status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
             status.centerYAnchor.constraint(equalTo: installButton.centerYAnchor),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: installButton.leadingAnchor, constant: -12),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: removeButton.leadingAnchor, constant: -12),
         ])
     }
 
@@ -1071,7 +1097,17 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
                     .contains { $0.lowercased().contains(term) }
         }
         table.reloadData()
+        updateButtons()
         if !busy { status.stringValue = "\(shown.count) of \(store.packs.count) packs · \(store.installed.count) installed" }
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) { updateButtons() }
+
+    private func updateButtons() {
+        let row = table.selectedRow
+        let pack = row >= 0 && row < shown.count ? shown[row] : nil
+        installButton.isEnabled = !busy && pack != nil
+        removeButton.isEnabled = !busy && pack.map { store.installed.contains($0.name) } == true
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
@@ -1091,7 +1127,43 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         let field = NSTextField(labelWithString: text)
         field.lineBreakMode = .byTruncatingTail
         field.toolTip = key == "name" ? [pack.name, pack.description].compactMap { $0 }.joined(separator: "\n") : nil
-        return field
+        field.translatesAutoresizingMaskIntoConstraints = false
+        // In a cell of its own the text sits at the top of a taller row; centred
+        // in a holder it sits on the row's middle line.
+        let cell = NSView()
+        cell.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+            field.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -2),
+            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    @objc private func removeSelected() {
+        let row = table.selectedRow
+        guard !busy, row >= 0, row < shown.count else { return }
+        let pack = shown[row]
+        guard store.installed.contains(pack.name) else { return }
+        // Deleting files: asked first, and never the pack now in use.
+        if pack.name == onCurrentPack() {
+            status.stringValue = "\(pack.name) is in use — choose another pack first"
+            return
+        }
+        let ask = NSAlert()
+        ask.messageText = "Remove the \(pack.display_name ?? pack.name) pack?"
+        ask.informativeText = "Its sounds are deleted from disk. You can install it again from here."
+        ask.addButton(withTitle: "Remove")
+        ask.addButton(withTitle: "Cancel")
+        guard ask.runModal() == .alertFirstButtonReturn else { return }
+        if let error = store.remove(pack.name) {
+            status.stringValue = "\(pack.name) not removed: \(error)"
+        } else {
+            status.stringValue = "\(pack.name) removed"
+            table.reloadData()
+            updateButtons()
+            onRemoved()
+        }
     }
 
     @objc private func installSelected() {
@@ -1122,7 +1194,10 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
 
 func bytes(_ n: UInt64) -> String {
     let mb = Double(n) / 1_048_576
-    return mb >= 1024 ? String(format: "%.1f GB", mb / 1024) : "\(Int(mb.rounded())) MB"
+    if mb >= 1024 { return String(format: "%.1f GB", mb / 1024) }
+    // Under a megabyte, "0 MB" says nothing; a pack of 440 KB is not nothing.
+    if mb < 1 { return "\(Int((Double(n) / 1024).rounded())) KB" }
+    return "\(Int(mb.rounded())) MB"
 }
 
 /// CPU time as the grid spells durations: 45s, 12m, 2.5h.
@@ -1822,14 +1897,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if pack == Self.morePacks {
             packMenu.selectItem(withTitle: events.current.pack)
             if packBrowser == nil {
-                packBrowser = PackBrowser(store: packStore) { [weak self] name in
-                    guard let self = self else { return }
-                    self.events.update { $0.pack = name }
-                    self.events.reloadPack()
-                    self.fillPackMenu()
-                    self.updatePreviewButtons()
-                    self.events.preview()
-                }
+                packBrowser = PackBrowser(
+                    store: packStore, current: { [weak self] in self?.events.current.pack ?? "" },
+                    onInstalled: { [weak self] name in
+                        guard let self = self else { return }
+                        self.events.update { $0.pack = name }
+                        self.events.reloadPack()
+                        self.fillPackMenu()
+                        self.updatePreviewButtons()
+                        self.events.preview()
+                    },
+                    onRemoved: { [weak self] in self?.fillPackMenu() })
             }
             packBrowser?.showWindow(nil)
             packBrowser?.window?.center()
