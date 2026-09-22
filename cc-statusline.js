@@ -17,7 +17,7 @@ const {
   writeFileSync,
 } = require('fs');
 const { homedir, tmpdir } = require('os');
-const { isAbsolute, join } = require('path');
+const { dirname, isAbsolute, join } = require('path');
 const { render, summarize, segments, cleanTopic, isFable, TOPIC_MAX_CHARS } = require('./lib/render.js');
 
 // The Fable weekly quota is not in the statusline input; it comes from the
@@ -37,10 +37,12 @@ const LOG_MAX_BYTES = 256 * 1024;
 const TOPIC_DIR = join(CACHE_DIR, 'topics');
 // One file per session, rewritten on every redraw, for the live view to watch.
 const LIVE_DIR = join(CACHE_DIR, 'live');
-// A session is finished once neither its status line nor its transcript has
-// moved for this long. A busy session can go many minutes without a redraw —
-// Claude Code refreshes on events, not on a clock — so the transcript's mtime
-// is the real sign of life and the window is generous.
+// Running totals read from each session's transcript, for the live view.
+const SCAN_DIR = join(CACHE_DIR, 'scan');
+// A session is finished once its Claude Code process is gone. A spool from
+// before pids were recorded has only its redraws to go on: Claude Code redraws
+// every refreshInterval while the process lives, so one that has not redrawn for
+// this long has ended.
 const LIVE_STALE_MS = 30 * 60000;
 // Finished sessions kept for the app's history, newest first.
 const LIVE_HISTORY_MAX = 500;
@@ -68,6 +70,54 @@ function readStdin() {
   } catch {
     return '';
   }
+}
+
+// The repository's git directory, found on disk rather than with a second git
+// process: the nearest .git up from cwd, following the `gitdir:` pointer that a
+// worktree or submodule keeps in a .git file.
+function findGitDir(cwd) {
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    const dotGit = join(dir, '.git');
+    try {
+      if (statSync(dotGit).isDirectory()) return dotGit;
+      const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'))?.[1].trim();
+      return pointer ? (isAbsolute(pointer) ? pointer : join(dir, pointer)) : null;
+    } catch {}
+    if (dirname(dir) === dir) return null;
+  }
+}
+
+// The last redraw's git state, when nothing can have moved it. Claude Code
+// redraws every open session each refreshInterval, and a git status per tick in
+// a session nobody touches is wasted. The index and HEAD change with staging,
+// commits and checkouts, and a new message is when Claude edits files. An edit
+// made outside Claude in an idle session shows on its next message: the mark is
+// there to say whether the session left uncommitted work, which is Claude's.
+function gitStamp(cwd) {
+  const dir = findGitDir(cwd);
+  if (!dir) return null;
+  const mtime = (name) => {
+    try {
+      return statSync(join(dir, name)).mtimeMs;
+    } catch {
+      return null;
+    }
+  };
+  return { cwd, index: mtime('index'), head: mtime('HEAD') };
+}
+
+function cachedGit(cwd, previous, lastAt) {
+  const stamp = gitStamp(cwd);
+  const before = previous?.git_stamp;
+  const same =
+    stamp &&
+    before &&
+    before.cwd === stamp.cwd &&
+    before.index === stamp.index &&
+    before.head === stamp.head &&
+    previous.last_message_at === lastAt;
+  if (same) return { info: previous.args?.git ?? null, stamp: before };
+  return { info: git(cwd), stamp };
 }
 
 function git(cwd) {
@@ -121,8 +171,8 @@ function git(cwd) {
     if (!info.branch) return null;
 
     try {
-      const gitDir = execFileSync('git', ['-C', cwd, 'rev-parse', '--git-dir'], opts).trim();
-      const absGitDir = isAbsolute(gitDir) ? gitDir : join(cwd, gitDir);
+      const absGitDir = findGitDir(cwd);
+      if (!absGitDir) throw null;
       const actionMap = [
         ['rebase-merge', 'rebase'],
         ['rebase-apply', 'rebase'],
@@ -289,7 +339,7 @@ function readText(file) {
 
 // A manual topic wins over the auto one. Returns { text, isNew }. Starts a background refresh of the
 // auto topic when the transcript has moved on.
-function renderTopic(sessionId, transcriptPath) {
+function renderTopic(sessionId, transcriptPath, tty, lastAt) {
   const paths = topicPaths(sessionId);
   if (!paths) return null;
   let topic = cleanTopic(readText(paths.manual));
@@ -298,7 +348,7 @@ function renderTopic(sessionId, transcriptPath) {
     try {
       auto = JSON.parse(readText(paths.auto));
     } catch {}
-    maybeRefreshTopic(paths, auto, transcriptPath, sessionId);
+    maybeRefreshTopic(paths, auto, lastAt, sessionId, tty, transcriptPath);
     topic = cleanTopic(auto?.topic);
   }
   if (!topic) return null;
@@ -321,22 +371,48 @@ function topicIsNew(paths, topic) {
   return Date.now() - seen.shown_at < TOPIC_HIGHLIGHT_MS;
 }
 
-function maybeRefreshTopic(paths, auto, transcriptPath, sessionId) {
-  if (!transcriptPath) return;
-  let mtime;
+// When the session last had a prompt or a reply, from the end of its
+// transcript. The file's mtime says nothing: Claude Code appends bookkeeping
+// entries to a session nobody has touched in days, and the status line itself
+// redraws every refreshInterval. A tool result counts, since it means Claude is
+// at work; injected meta entries do not.
+const LAST_MESSAGE_TAIL_BYTES = 64 * 1024;
+function lastMessageAt(transcriptPath) {
+  if (!transcriptPath) return null;
   try {
-    mtime = statSync(transcriptPath).mtimeMs;
-  } catch {
-    return;
-  }
+    for (const bytes of [LAST_MESSAGE_TAIL_BYTES, TRANSCRIPT_TAIL_BYTES]) {
+      const slice = readSlice(transcriptPath, true, bytes);
+      const lines = slice.text.split('\n');
+      if (slice.partial) lines.shift();
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i].includes('"type":"user"') && !lines[i].includes('"type":"assistant"')) continue;
+        let entry;
+        try {
+          entry = JSON.parse(lines[i]);
+        } catch {
+          continue;
+        }
+        if ((entry.type === 'user' || entry.type === 'assistant') && !entry.isMeta) {
+          return Date.parse(entry.timestamp) || null;
+        }
+      }
+      if (!slice.partial) return null;
+    }
+  } catch {}
+  return null;
+}
+
+function maybeRefreshTopic(paths, auto, lastAt, sessionId, tty, transcriptPath) {
+  if (!transcriptPath || !lastAt) return;
   const generated = auto?.generated_at ?? 0;
-  if (mtime <= generated) return;
+  // Nothing was said since the last topic: no call, and no focus check either.
+  if (lastAt <= generated) return;
   const iterm = process.env.TERM_PROGRAM === 'iTerm.app';
   // Until the first topic exists, every change to the transcript is worth a
   // look; later refreshes, and retries after a failure, wait out the floor.
   const floor = iterm ? TOPIC_FOCUSED_REFRESH_MS : TOPIC_REFRESH_MS;
   if (auto && !auto.awaiting_reply && Date.now() - generated < floor) return;
-  if (iterm && !itermTabFocused()) return;
+  if (iterm && !itermTabFocused(tty)) return;
   try {
     mkdirSync(TOPIC_DIR, { recursive: true });
     try {
@@ -359,25 +435,36 @@ function maybeRefreshTopic(paths, auto, transcriptPath, sessionId) {
   }
 }
 
-// The terminal of the Claude Code session this status line belongs to: the
-// first ancestor process that has one. Claude Code runs the status line without
-// a controlling terminal, so /dev/tty is not available. One ps per ancestor
-// (~3 ms each) rather than listing every process (~200 ms).
-function ownTty() {
+// The terminal of the Claude Code session this status line belongs to, and the
+// process that holds it: the first ancestor with a terminal. Claude Code runs
+// the status line without a controlling terminal, so /dev/tty is not available.
+// One ps per ancestor (~5 ms each) rather than listing every process (~200 ms,
+// nearly all of it system time), and none at all when the last redraw already
+// found that process and it is still this one's parent — a process never
+// changes terminal.
+function ownTerminal(previous) {
+  if (previous?.tty && previous.pid === process.ppid) return { tty: previous.tty, pid: previous.pid };
   let pid = String(process.pid);
   for (let depth = 0; depth < 10; depth++) {
-    const [ppid, tty] = execFileSync('ps', ['-o', 'ppid=,tty=', '-p', pid], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
-    })
-      .trim()
-      .split(/\s+/);
-    if (tty && tty !== '??' && tty !== '?') return tty.startsWith('/dev/') ? tty : `/dev/${tty}`;
-    if (!ppid || ppid === '0' || ppid === '1') return null;
+    let line;
+    try {
+      line = execFileSync('ps', ['-o', 'ppid=,tty=', '-p', pid], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2000,
+      });
+    } catch {
+      // Without ps (a sandbox, a timeout) the line still draws, at full width.
+      return { tty: null, pid: null };
+    }
+    const [ppid, tty] = line.trim().split(/\s+/);
+    if (tty && tty !== '??' && tty !== '?') {
+      return { tty: tty.startsWith('/dev/') ? tty : `/dev/${tty}`, pid: Number(pid) };
+    }
+    if (!ppid || ppid === '0' || ppid === '1') return { tty: null, pid: null };
     pid = ppid;
   }
-  return null;
+  return { tty: null, pid: null };
 }
 
 // Columns of the session's terminal, read on every redraw so a resize is
@@ -403,19 +490,33 @@ function terminalColumns(tty) {
 }
 
 // True only when iTerm2 is the frontmost app and its focused pane is this session.
-function itermTabFocused() {
+// Asking iTerm2 costs an osascript (~160 ms) and an Apple Event; every session's
+// redraw wants the same answer, so one reading is shared through FOCUS_FILE for
+// FOCUS_SHARE_MS. A tab switch is noticed that much later at most, on top of the
+// refreshInterval it already waits for.
+const FOCUS_FILE = join(CACHE_DIR, 'focus.json');
+const FOCUS_SHARE_MS = 10000;
+function itermTabFocused(tty) {
+  if (!tty) return false;
   try {
-    const tty = ownTty();
-    if (!tty) return false;
-    const focused = execFileSync(
-      'osascript',
-      ['-e', 'tell application "iTerm2" to if frontmost then tty of current session of current window'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }
-    ).trim();
-    return focused === tty;
-  } catch {
-    return false;
-  }
+    const shared = JSON.parse(readFileSync(FOCUS_FILE, 'utf8'));
+    if (Date.now() - shared.at < FOCUS_SHARE_MS) return shared.tty === tty;
+  } catch {}
+  let focused = null;
+  try {
+    focused =
+      execFileSync(
+        'osascript',
+        ['-e', 'tell application "iTerm2" to if frontmost then tty of current session of current window'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }
+      ).trim() || null;
+  } catch {}
+  try {
+    const tmp = `${FOCUS_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ tty: focused, at: Date.now() }));
+    renameSync(tmp, FOCUS_FILE);
+  } catch {}
+  return focused === tty;
 }
 
 function readSlice(file, fromEnd, bytes) {
@@ -567,39 +668,219 @@ function refreshTopic(sessionId, transcriptPath) {
 // The arguments of this redraw, so the live view can draw the same rows at its
 // own width. Written on every redraw, which is what paces the view; a failure
 // here never costs the status line itself.
-function writeSpool(args, tty) {
-  if (!args.input?.session_id) return;
+function spoolFile(sessionId) {
+  return sessionId ? join(LIVE_DIR, `${sessionId.replace(/[^\w-]/g, '')}.json`) : null;
+}
+
+// `pid` is the Claude Code process that owns the terminal: the app reads its
+// memory and CPU, and a dead pid ends the session at once. `redraw` is the CPU
+// this redraw cost node, startup included; git and stty, its only children, are
+// not in it. No wall time: node's clocks start after ~60 ms of process launch.
+function writeSpool(args, terminal, lastAt, gitStampNow) {
+  const file = spoolFile(args.input?.session_id);
+  if (!file) return;
+  const cpu = process.cpuUsage();
+  const redraw = { cpu_ms: Math.round((cpu.user + cpu.system) / 1000) };
   try {
     mkdirSync(LIVE_DIR, { recursive: true });
-    const file = join(LIVE_DIR, `${args.input.session_id.replace(/[^\w-]/g, '')}.json`);
-    writeFileSync(file, JSON.stringify({ updated_at: Date.now(), tty, args }));
+    const tmp = `${file}.${process.pid}.tmp`;
+    const entry = {
+      updated_at: Date.now(),
+      last_message_at: lastAt,
+      git_stamp: gitStampNow,
+      tty: terminal.tty,
+      pid: terminal.pid,
+      redraw,
+      args,
+    };
+    writeFileSync(tmp, JSON.stringify(entry));
+    renameSync(tmp, file);
   } catch (err) {
     logError(`spool: ${err.message}`);
   }
 }
 
-// Every spooled session, drawn and tabulated, for the Agent Bar Hopping app:
-// `cc-statusline.js live [--columns N]` prints one JSON document and exits.
-// The terminals that still have a process on them. One ps for the whole
-// snapshot, so a closed tab is noticed at once rather than after the stale
-// window: its tty simply stops appearing.
-function ttysInUse() {
-  try {
-    const out = execFileSync('ps', ['-a', '-o', 'tty='], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
-    });
-    return new Set(
-      out
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line && line !== '??' && line !== '?')
-    );
-  } catch {
-    return null;
+// What a session's transcript says it is doing, kept up to date by reading only
+// what was appended since the last snapshot: the first read of a session walks
+// the whole file once, every later one a few kilobytes. The running totals live
+// in SCAN_DIR, one small file per session.
+//
+// state is one of:
+//   idle         Claude finished its reply and waits for a prompt
+//   asking       a question or a plan is waiting on the user
+//   tool         a tool is running — or waiting on a permission prompt, which
+//                the transcript does not record until it is answered
+//   thinking     a prompt or a tool result is in, and the reply has not started
+//   interrupted  the user stopped the turn
+// Subagents' own traffic is not in the session's transcript, so their tokens
+// are not in the totals; the count is of Agent calls the session made.
+const SCAN_VERSION = 2;
+const ASKING_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
+const AGENT_TOOLS = new Set(['Agent', 'Task']);
+
+function freshScan(path) {
+  return {
+    version: SCAN_VERSION,
+    path,
+    offset: 0,
+    tokens: { input: 0, cache_write: 0, cache_read: 0, output: 0 },
+    counted: null,
+    last: null,
+    mode: null,
+    agents: { total: 0, running: [] },
+  };
+}
+
+function textOf(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((b) => (b?.type === 'text' ? b.text : '')).join('\n');
+}
+
+// A background task reports its end in a notification that Claude Code queues
+// for the next turn, recorded as a queue operation.
+function settleAgents(scan, text) {
+  for (const m of text.matchAll(/<task-id>(\w+)<\/task-id>[\s\S]*?<status>(\w+)<\/status>/g)) {
+    if (m[2] !== 'running') scan.agents.running = scan.agents.running.filter((id) => id !== m[1]);
   }
 }
+
+function scanEntry(scan, entry) {
+  if (entry.type === 'permission-mode' && entry.permissionMode) {
+    scan.mode = entry.permissionMode;
+    return;
+  }
+  if (entry.type === 'queue-operation' && entry.operation === 'enqueue' && typeof entry.content === 'string') {
+    settleAgents(scan, entry.content);
+    return;
+  }
+  const at = Date.parse(entry.timestamp) || null;
+  const message = entry.message;
+  if (entry.type === 'assistant' && message) {
+    // One line per content block, each repeating its message's usage.
+    const u = message.usage;
+    if (u && message.id && message.id !== scan.counted) {
+      scan.counted = message.id;
+      scan.tokens.input += u.input_tokens || 0;
+      scan.tokens.cache_write += u.cache_creation_input_tokens || 0;
+      scan.tokens.cache_read += u.cache_read_input_tokens || 0;
+      scan.tokens.output += u.output_tokens || 0;
+    }
+    const call = Array.isArray(message.content) ? message.content.filter((b) => b?.type === 'tool_use').pop() : null;
+    if (call && AGENT_TOOLS.has(call.name)) scan.agents.total++;
+    scan.last = { role: 'assistant', stop: message.stop_reason ?? null, tool: call ? { id: call.id, name: call.name } : null, at };
+    return;
+  }
+  if (entry.type !== 'user' || !message) return;
+  const content = message.content;
+  const results = Array.isArray(content) ? content.filter((b) => b?.type === 'tool_result') : [];
+  for (const r of results) {
+    // A background agent answers at once and reports back later by notification.
+    const launched = /agentId: (\w+)/.exec(textOf(r.content));
+    if (launched && /Async agent launched/.test(textOf(r.content))) scan.agents.running.push(launched[1]);
+  }
+  const text = textOf(content);
+  if (entry.isMeta) return;
+  const kind = results.length ? 'result' : /^\[Request interrupted by user/.test(text.trim()) ? 'interrupted' : 'prompt';
+  scan.last = { role: 'user', kind, at };
+}
+
+function scanState(scan) {
+  const last = scan.last;
+  if (!last) return null;
+  if (last.role === 'user') return last.kind === 'interrupted' ? 'interrupted' : 'thinking';
+  if (last.stop === 'tool_use') return ASKING_TOOLS.has(last.tool?.name) ? 'asking' : 'tool';
+  if (last.stop == null) return 'interrupted';
+  return 'idle';
+}
+
+function scanPath(sessionId) {
+  return join(SCAN_DIR, `${sessionId.replace(/[^\w-]/g, '')}.json`);
+}
+
+// `fresh` false reads only the saved totals: a finished session's transcript is
+// not opened again.
+function transcriptScan(sessionId, transcriptPath, fresh) {
+  if (!sessionId || !transcriptPath) return null;
+  const file = scanPath(sessionId);
+  let scan = null;
+  try {
+    scan = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {}
+  if (scan?.version !== SCAN_VERSION || scan.path !== transcriptPath) scan = freshScan(transcriptPath);
+  if (fresh) {
+    try {
+      const size = statSync(transcriptPath).size;
+      // A transcript only grows; a shorter one was rewritten, so start over.
+      if (size < scan.offset) scan = freshScan(transcriptPath);
+      if (size > scan.offset) {
+        const fd = openSync(transcriptPath, 'r');
+        let chunk;
+        try {
+          chunk = Buffer.alloc(size - scan.offset);
+          readSync(fd, chunk, 0, chunk.length, scan.offset);
+        } finally {
+          closeSync(fd);
+        }
+        // Only whole lines: a line still being written is read next time.
+        const end = chunk.lastIndexOf(0x0a) + 1;
+        for (const line of chunk.subarray(0, end).toString('utf8').split('\n')) {
+          if (!line) continue;
+          try {
+            scanEntry(scan, JSON.parse(line));
+          } catch {}
+        }
+        if (end > 0) {
+          scan.offset += end;
+          mkdirSync(SCAN_DIR, { recursive: true });
+          const tmp = `${file}.${process.pid}.tmp`;
+          writeFileSync(tmp, JSON.stringify(scan));
+          renameSync(tmp, file);
+        }
+      }
+    } catch (err) {
+      // A new session has no transcript until its first prompt.
+      if (err.code !== 'ENOENT') logError(`scan ${sessionId}: ${err.message}`);
+    }
+  }
+  if (!scan.offset) return null;
+  const t = scan.tokens;
+  return {
+    state: scanState(scan),
+    state_at: scan.last?.at ?? null,
+    tool: scanState(scan) === 'tool' || scanState(scan) === 'asking' ? scan.last.tool?.name ?? null : null,
+    mode: scan.mode,
+    tokens: { ...t, total: t.input + t.cache_write + t.cache_read + t.output },
+    agents: { total: scan.agents.total, running: scan.agents.running.length },
+  };
+}
+
+// Background agents still running while the prompt is the user's, for the ✻ on
+// the topic row. The same incremental scan the live view keeps: only what the
+// transcript gained since the last reading is parsed.
+function waitingAgents(sessionId, transcriptPath) {
+  const scan = transcriptScan(sessionId, transcriptPath, true);
+  return scan?.state === 'idle' ? scan.agents.running : 0;
+}
+
+// Whether the session's Claude Code process still runs, so a closed tab ends its
+// session at once rather than after the stale window. A signal-0 kill is a
+// syscall: listing processes with ps to learn the same cost ~0.4 s of system
+// time per snapshot. A pid can be reused once its process is gone, so the app,
+// which can read a process's terminal natively, also checks that it is still on
+// the same tty. A spool written before pids were recorded is judged on its age.
+function processAlive(pid) {
+  if (!pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+// Every spooled session, drawn and tabulated, for the Agent Bar Hopping app:
+// `cc-statusline.js live [--columns N]` prints one JSON document and exits.
 
 function liveSnapshot(columns) {
   let names = [];
@@ -615,24 +896,22 @@ function liveSnapshot(columns) {
     try {
       const entry = JSON.parse(readFileSync(file, 'utf8'));
       if (!entry?.args?.input) continue;
-      // The transcript grows while the session works, whether or not the status
-      // line is redrawn; one stat per session, no git and no network.
-      let activeAt = entry.updated_at;
+      // The last prompt or reply, as the last redraw found it. A redraw is no
+      // sign of activity: Claude Code redraws every open session on a timer.
       const transcript = entry.args.input.transcript_path;
-      if (transcript) {
-        try {
-          activeAt = Math.max(activeAt, statSync(transcript).mtimeMs);
-        } catch {}
-      }
       entries.push({
         file,
         updated_at: entry.updated_at,
-        active_at: activeAt,
+        active_at: entry.last_message_at ?? entry.updated_at,
         tty: entry.tty || null,
+        pid: entry.pid || null,
+        redraw: entry.redraw || null,
+        transcript_path: transcript || null,
         rows: render({ ...entry.args, columns }).split('\n'),
-        summary: summarize(entry.args),
+        // The duration in a spool was read at its redraw, not now.
+        summary: summarize({ ...entry.args, now: entry.updated_at }),
         // The row's own segments, so a grid cell can show what the bar shows.
-        segments: segments({ input: entry.args.input, usage: entry.args.usage, width: 5 }),
+        segments: segments({ input: entry.args.input, usage: entry.args.usage, width: 5, now: entry.updated_at }),
       });
     } catch {
       // A half-written file is picked up on the next read.
@@ -640,25 +919,49 @@ function liveSnapshot(columns) {
   }
 
   const now = Date.now();
-  const ttys = ttysInUse();
-  // A session whose terminal is gone has ended, however recently it drew.
-  const onLiveTty = (e) => !ttys || !e.tty || ttys.has(e.tty.replace(/^\/dev\//, ''));
+  // A session whose process is gone has ended, however recently it drew. One
+  // process can outlive a session — /clear and /resume start another in it —
+  // so of the sessions sharing a pid only the latest to redraw is still open.
+  const newestByPid = new Map();
+  for (const e of entries) {
+    if (e.pid && !(newestByPid.get(e.pid)?.updated_at >= e.updated_at)) newestByPid.set(e.pid, e);
+  }
+  const isLive = (e) =>
+    e.pid ? newestByPid.get(e.pid) === e && processAlive(e.pid) : now - e.updated_at < LIVE_STALE_MS;
   const live = entries
-    .filter((e) => onLiveTty(e) && now - e.active_at < LIVE_STALE_MS)
+    .filter(isLive)
     .sort((a, b) => String(a.tty).localeCompare(String(b.tty)) || a.updated_at - b.updated_at);
-  const ended = entries
-    .filter((e) => !(onLiveTty(e) && now - e.active_at < LIVE_STALE_MS))
-    .sort((a, b) => b.active_at - a.active_at);
+  const ended = entries.filter((e) => !isLive(e)).sort((a, b) => b.active_at - a.active_at);
+
+  // Live sessions read what their transcripts gained; finished ones keep the
+  // totals they ended with.
+  for (const [list, fresh] of [[live, true], [ended.slice(0, LIVE_HISTORY_MAX), false]]) {
+    for (const e of list) e.transcript = transcriptScan(e.summary.session_id, e.transcript_path, fresh);
+  }
 
   // The oldest finished sessions fall off the end of the history.
   for (const stale of ended.slice(LIVE_HISTORY_MAX)) {
     try {
       unlinkSync(stale.file);
     } catch {}
+    try {
+      if (stale.summary.session_id) unlinkSync(scanPath(stale.summary.session_id));
+    } catch {}
   }
 
-  const strip = ({ file, ...rest }) => rest;
-  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).map(strip) };
+  const strip = ({ file, transcript_path, ...rest }) => rest;
+  // The Fable quota for the whole account, straight from the shared cache: a
+  // session only reports it while it runs Fable, but the window shows it always.
+  // Past its reset the reading is spent, and the quota is back to 0. Shown
+  // whatever the server's is_active says, as claude.ai's usage page does.
+  let fable = null;
+  const cached = readUsageCache();
+  if (cached?.fable && typeof cached.fable.percent === 'number') {
+    const resets = Date.parse(cached.fable.resets_at) || null;
+    const over = resets != null && resets <= now;
+    fable = { percent: over ? 0 : cached.fable.percent, resets_at: over ? null : resets, read_at: cached.fetched_at ?? null };
+  }
+  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).map(strip), fable };
 }
 
 function main() {
@@ -680,29 +983,45 @@ function main() {
     maybeRefreshUsage(usage, input.rate_limits?.seven_day?.used_percentage ?? null);
   }
 
-  const tty = ownTty();
+  let previous = null;
+  try {
+    previous = JSON.parse(readFileSync(spoolFile(input.session_id), 'utf8'));
+  } catch {}
+  const terminal = ownTerminal(previous);
+  const lastAt = lastMessageAt(input.transcript_path);
+  const repo = cachedGit(cwd, previous, lastAt);
   const args = {
     input,
     cwd,
     usage,
-    topic: renderTopic(input.session_id || '', input.transcript_path),
-    git: git(cwd),
+    topic: renderTopic(input.session_id || '', input.transcript_path, terminal.tty, lastAt),
+    waiting: waitingAgents(input.session_id, input.transcript_path),
+    git: repo.info,
     home: homedir(),
   };
-  writeSpool(args, tty);
 
   const out = render({
     ...args,
-    columns: terminalColumns(tty),
+    columns: terminalColumns(terminal.tty),
     // Text in place of the few Nerd Font glyphs, for terminals without one.
     icons: process.env.CC_STATUSLINE_ICONS !== '0',
   });
   if (out) process.stdout.write(out);
+  // After the line is out, so the terminal never waits on it.
+  writeSpool(args, terminal, lastAt, repo.stamp);
 }
 
 if (process.argv[2] === 'live') {
   const columns = Number(argValue('--columns')) || 120;
   process.stdout.write(JSON.stringify(liveSnapshot(columns)) + '\n');
+} else if (process.argv[2] === 'refresh-usage') {
+  // For the app, once at launch: the Fable quota only moves while Fable runs,
+  // and a Fable session keeps the cache fresh itself. Skipped while the cache
+  // is younger than REFRESH_MS — a failed attempt stamps it too — so launching
+  // the app again and again makes no more requests than one session would, and
+  // while another refresh holds the lock.
+  const age = Date.now() - (readUsageCache()?.fetched_at ?? 0);
+  if (age >= REFRESH_MS && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
 } else if (process.argv[2] === '--refresh-usage') {
   refreshUsage(process.argv[3]).catch((err) => logError(`refresh: ${err.message}`));
 } else if (process.argv[2] === '--refresh-topic') {

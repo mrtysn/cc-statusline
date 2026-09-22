@@ -21,6 +21,7 @@ The first row covers the model and usage; the second, when there is one, names w
 | `2.6ᵈ ━━━━─.75 󰇧` | 7-day rate limit across all models, labelled with days until it resets (hours in the last day) and tagged with the earth `󰇧` so it reads apart from the Fable quota inside it; shown only at ≥75%, `7d` when the reset time is unknown |
 | `5.2ᵈ ━━━━─.85 󰫳` | Fable weekly quota, labelled like the 7-day bar and tagged with the boxed Fable initial `󰫳` so the two read apart; only while the session runs a Fable model; `󰫳` when the reset time is unknown; `!` in red after a failed refresh (see [Fable quota](#fable-quota)) |
 | `󰆼 42ᵐ` | Minutes until the prompt cache expires, after the icon, with the unit raised (`󰆼` is the Nerd Font database glyph), coloured by how much of its TTL (5m or 1h) has elapsed; once that turns yellow or red the tokens a rebuild would reprocess join it (`󰆼 4ᵐ 38k`), while there is still time to `/compact` or wrap up; `󰆼 38k 󰑐` in blue once it has expired |
+| `✻` | After the topic, in Claude's orange: your turn, but a background agent is still running and the session will carry on when it reports back with how many (`✻1`, `✻2`); read from the transcript by the same incremental scan the app uses |
 | `auth token refresh` | Session topic, on its own row: the one set with `/statusline-topic`, otherwise one derived from the transcript; yellow for a minute after it changes (see [Session topic](#session-topic)) |
 | `3f2a9c1e-…` | Session ID, usable with `claude --resume` |
 | `~/dev/my-app` | Current directory with its name emphasised; prefixed with the launch directory (`my-app → …`) when the session has moved away from it |
@@ -28,7 +29,7 @@ The first row covers the model and usage; the second, when there is one, names w
 
 Bars and the cache countdown dim under 75%, turn yellow at ≥75% (where Claude Code starts its weekly-limit warning), red at ≥92%. Model, effort, the topic and the directory name are drawn at normal brightness and everything else is faint, with the arrows and diamonds a fixed grey one step darker (`rgb(66,69,80)`, chosen for a dark theme); until the first prompt of a session, model and effort are spelled out in full and bold yellow (`Opus 4.8 1M xhigh`), so the choice is easy to check while it can still be changed.
 
-Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), so five cells show ten levels. When the first row would be wider than the terminal, every bar shrinks to three cells, and if that still does not fit, only the percentages remain. The width comes from the session's terminal: Claude Code runs the status line without one, so the script walks up its parent processes to the first with a tty (one `ps` per step) and reads that tty's size with `stty`, about 15 ms in all, on every redraw so a resize applies on the next one. `CC_STATUSLINE_COLUMNS` sets the width instead; with neither, bars stay full width.
+Bars are thin rules drawn in half-cell steps (`╾` is heavy on its left half), so five cells show ten levels. When the first row would be wider than the terminal, every bar shrinks to three cells, and if that still does not fit, only the percentages remain. The width comes from the session's terminal: Claude Code runs the status line without one, so the script walks up its parent processes to the first with a tty (one `ps` per step) on a session's first redraw, and after that reuses what it found while that process is still its parent. It reads that tty's size with `stty` on every redraw, so a resize applies on the next one. `CC_STATUSLINE_COLUMNS` sets the width instead; with neither, bars stay full width.
 
 Four glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, the rebuild `󰑐`, the Fable tag `󰫳` and the weekly tag `󰇧`. Everything else is standard Unicode. Without a Nerd Font, set `CC_STATUSLINE_ICONS=0` to draw them as `cch`, `⟳`, `fbl` and `all` instead.
 
@@ -36,15 +37,45 @@ Four glyphs need a [Nerd Font](https://www.nerdfonts.com/): the cache `󰆼`, th
 
 Every live session in one window: a macOS app in `src/main.swift`, built with `./bundle.sh` into `~/Applications/Agent Bar Hopping.app`.
 
-Each redraw writes that session's render arguments to `~/.cache/cc-statusline/live/<session-id>.json`. The app watches that directory and re-reads it when it changes, so the window repaints exactly when a status line does, with a 30-second tick to age the countdowns. Every cell stacks the segment the status line draws over the same value in words, both from `cc-statusline.js live`, which renders with this same `lib/render.js` — the window cannot disagree with the terminal. The account-wide quotas sit in a bar above the table, taken from whichever session redrew last, since they are the same for every session.
+Each redraw writes that session's render arguments to `~/.cache/cc-statusline/live/<session-id>.json`. The app watches that directory and re-reads it when it changes, so the window repaints exactly when a status line does, with a 30-second tick to age the countdowns. Every cell stacks the segment the status line draws over the same value in words, both from `cc-statusline.js live`, which renders with this same `lib/render.js` — the window cannot disagree with the terminal. The account-wide quotas sit in a bar above the table, taken from whichever session redrew last, since they are the same for every session. Above each quota's bar a faint line says where in its window it is (`hour 3 of 5`, `day 1 of 7`: one more than the whole hours or days gone). Under each quota a dimmed pace row shows how much of its window has gone (the 7-day bar moves 14.3% a day, the 5-hour bar 20% an hour) on the same scale as the reading above it, and where spending at the current rate would end by the reset (`on pace for 116%`, yellow from 85% and red from 100%). Level bars are an even pace; a reading ahead of its ghost runs out early. Both bars carry a tick every hour of the 5-hour window and every day of the weekly ones. On the pace bar the tick that ends the current hour or day is white: the share a steady pace would have used by then, to hold the reading above against. No projection is drawn in the first 2% of a window, where one prompt would read as a runaway rate.
 
-A session is finished once its terminal has no process left, or once neither its status line nor its transcript has moved for 30 minutes; a busy session can go many minutes without a redraw. Finished sessions stay in the list, newest first, until there are more than 500. Clicking a row's directory brings its iTerm tab to the front, and clicking what it is doing copies the session id.
+Each redraw also records the Claude Code process that owns the terminal, and when the session last had a prompt or a reply, read from the end of its transcript. Last Seen and the dot's fading follow that time, not the redraw: Claude Code redraws every open session each `refreshInterval`, and appends bookkeeping entries to transcripts nobody has touched, so neither the redraw nor the file's mtime means anything happened. The same time decides whether a topic needs refreshing. A session is finished once its process is gone; of several sessions in one process (after `/clear` or `/resume`), only the latest to redraw is open. A spool from before pids were recorded is finished after 30 minutes without a redraw. The script checks the process with a signal-0 `kill`, and the app checks that the process still owns the same terminal, so a reused pid cannot keep a closed session alive. Finished sessions stay in the list, newest first, until there are more than 500. Double-clicking a live row's Last Seen, Directory, Doing, State or Cache cell brings its iTerm tab to the front, as does a single click on its directory; clicking its Last Seen cell, which shows the start of the session id, copies the whole id. The table opens sorted by the caches about to go cold, soonest first, cold last and ties by Last Seen; the Cache header cycles through that order, time left rising, and falling. The first row is the tool's own cost, named `cc-statusline`: the status line redraws and the app together as a share of one core over the last five minutes, split in the CPU cell's tooltip, and the app's memory.
 
-`cc-statusline.js live [--columns N]` prints that whole snapshot as JSON and exits — the app's only subprocess besides one `ps`. No git calls, no network.
+Five columns come from outside the status line input:
+
+| Column | Top line | Under it | Source |
+|---|---|---|---|
+| State | `your turn`, `question`, `plan`, `approve?`, a running tool with its time (`Bash 3m`), `working`, or `stopped`, then the permission mode (`· auto`) | `waiting on 1 agent` while background subagents are still out: your turn and a pending agent are both true at once | The session's transcript, and the event hook for `approve?` |
+| Sound | `default` (follows the Sounds switch at the top right), `on` or `muted`; a click cycles them | — | The app's `sounds.json` |
+| Tokens | Tokens the session has sent and received, subagents excluded | Lines added and removed, as Claude Code counts them (files written from the shell included) | The transcript; the lines from the status line input |
+| Memory | Memory of the Claude Code process and every process under it, compressed pages included | How many processes are under it | The kernel, read by the app (`proc_pid_rusage`) |
+| CPU | CPU now as a share of one core, for the same processes | The CPU time the Claude Code process has used since it started | The kernel, as above |
+
+A running tool can also be a permission prompt: the transcript records neither until it is answered. The transcripts are read incrementally: the first snapshot of a session reads its whole file once, and every later one only what was appended, with the running totals in `~/.cache/cc-statusline/scan/`. The Doing cell carries Claude Code's own name for the session under the topic; the Cache cell, its hit rate and misses; the Launched at cell, the session's Claude Code version when it is older than the latest release, with only the parts that differ in yellow (`2.1.270` against `2.1.271` marks `270`; against `2.2.0`, `1.270`). The latest release shows in the first row; the app reads it from npm's registry (`@anthropic-ai/claude-code/latest`) at most every six hours, caches it in `claude-latest.json`, and waits an hour after a failed request. Until it has one, the newest version any session runs stands in.
+
+The header states what the tool itself costs as a share of one core over the last five minutes: the status line redraws in every session (each records node's own CPU; git and stty are not in it) and the app with the snapshots it runs.
+
+`cc-statusline.js live [--columns N]` prints that whole snapshot as JSON and exits — the app's only subprocess. No `ps`, no git calls, no network.
+
+## Session events and sounds
+
+The status line only runs when Claude Code redraws, so it never hears about events. `hooks/event.zsh` does: registered as an async hook, it writes each event's JSON to `~/.cache/cc-statusline/events/` (about 15 ms, and Claude Code does not wait for it), and the app reads and deletes each file. Register it with `scripts/install-event-hook.zsh` (`--remove` takes it out again); it edits `settings.json` in your Claude config directory and keeps the previous version as `settings.json.bak`.
+
+From those events the app plays a sound per kind, from an [openpeon](https://github.com/PeonPing/peon-ping) sound pack in `~/Library/Application Support/Agent Bar Hopping/packs/<name>/`:
+
+| Event | Sound category |
+|---|---|
+| `Stop`, unless the reply took under `silent_window_seconds` | `task.complete` |
+| `StopFailure`, or `PostToolUseFailure` from Bash | `task.error` |
+| `PermissionRequest`, `PreToolUse` for AskUserQuestion or ExitPlanMode, an MCP question | `input.required` |
+| `PreCompact` | `resource.limit` |
+| `annoyed_threshold` prompts to one session within `annoyed_window_seconds` | `user.spam` |
+
+The switch, volume, pack and one checkbox per category sit at the top right of the window, and the Sound column overrides the switch for one session; all of it is kept in `sounds.json` beside the packs, which the app writes with defaults on first launch. Picking a pack or a volume plays a sample. Packs load as peon-ping loads them: a file named without a directory is in `sounds/`, nothing may point outside the pack, `manifest.json` stands in for `openpeon.json`, and a malformed entry is skipped rather than the whole pack. `.ogg` files are skipped, since macOS cannot play them. Completions in several sessions within five seconds chime once, and each category avoids repeating its last sound. The [registry](https://peonping.github.io/registry/index.json) lists every published pack; one is installed by copying its directory into `packs/`. A `PermissionRequest` also turns the session's State to `approve?` in yellow, until a process starts under the session (an approved command) or the transcript moves on. Events more than a minute old when read, from while the app was closed, are dropped.
 
 ## Fable quota
 
-Claude Code does not pass per-model limits to the status line, so the Fable weekly figure comes from the account usage endpoint (`/api/oauth/usage`, the same one `/usage` reads). The script reads Claude Code's OAuth token from the macOS Keychain, never renews it, and makes the request in a detached background process so a redraw never waits on it. Sessions on other models neither show the bar nor make the request.
+Claude Code does not pass per-model limits to the status line, so the Fable weekly figure comes from the account usage endpoint (`/api/oauth/usage`, the same one `/usage` reads). The script reads Claude Code's OAuth token from the macOS Keychain, never renews it, and makes the request in a detached background process so a redraw never waits on it. Sessions on other models neither show the bar nor make the request. Agent Bar Hopping shows the Fable quota whatever the sessions run: it fetches once at launch (`cc-statusline.js refresh-usage`), unless the cache is under five minutes old, and after that relies on Fable sessions, which refresh the same cache while they run; the quota only moves then. A reading past its reset shows as 0%. It is shown whether or not the server marks it `is_active`, as claude.ai's usage page shows it.
 
 One cache is shared by every session in `~/.cache/cc-statusline/` (override with `CC_STATUSLINE_CACHE_DIR`):
 
@@ -68,7 +99,7 @@ A call starts on a redraw when all of these hold:
 
 | Condition | Why |
 |---|---|
-| The transcript changed since the last attempt | An idle session never makes a call |
+| A prompt or reply is newer than the last attempt | An idle session never makes a call, nor asks iTerm2 about focus. The transcript file's mtime is not the test: Claude Code writes bookkeeping entries to idle sessions |
 | Claude has finished at least one reply | A topic named from the opening prompt alone is usually wrong; until then the check is repeated without a call |
 | At least 2 minutes since the last topic in iTerm2, 10 minutes elsewhere | The first topic skips this |
 | In iTerm2: iTerm2 is the frontmost app and this session's pane is the focused one | Only the visible status line needs a fresh topic, so background tabs cost nothing |
@@ -119,6 +150,8 @@ ln -s ~/dev/cc-statusline/commands/statusline-topic.md ~/.claude/commands/status
 ## Preview
 
 `scripts/preview.zsh` pipes sample input through the script and prints every display state. Add `--color` to keep the ANSI colours.
+
+`scripts/capture-statusline.py` runs a real Claude Code session in a pty at a given `--columns` width and shows how Claude Code itself draws the status line — wrapping, truncation, repaint — rather than what the script emits.
 
 `docs/showcase.html` draws the status line in a browser from the same code. Open it straight from disk. It has a live panel with a control for every input, a sweep that steps one value across its range, and a gallery of named states with tag filters. Each state can be loaded into the panel.
 

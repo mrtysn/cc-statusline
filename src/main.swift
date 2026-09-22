@@ -66,6 +66,43 @@ struct CacheState: Decodable {
     let expires_at: Double?
     let ttl: String?
     let rebuild: Double?
+    let hit_ratio: Double?
+    let requests: Double?
+    let misses: Double?
+    let last_miss_at: Double?
+    let last_miss_causes: [String]?
+}
+
+struct LineCount: Decodable {
+    let added: Double
+    let removed: Double
+}
+
+struct Tokens: Decodable {
+    let input: Double
+    let cache_write: Double
+    let cache_read: Double
+    let output: Double
+    let total: Double
+}
+
+struct Agents: Decodable {
+    let total: Int
+    let running: Int
+}
+
+/// What the transcript says the session is doing; see transcriptScan in the script.
+struct TranscriptState: Decodable {
+    let state: String?
+    let state_at: Double?
+    let tool: String?
+    let mode: String?
+    let tokens: Tokens?
+    let agents: Agents?
+}
+
+struct RedrawCost: Decodable {
+    let cpu_ms: Double?
 }
 
 struct GitState: Decodable {
@@ -94,6 +131,10 @@ struct Summary: Decodable {
     let topic_is_new: Bool?
     let cwd: String?
     let git: GitState?
+    let lines: LineCount?
+    let session_name: String?
+    let version: String?
+    let fast_mode: Bool?
 }
 
 /// The drawn segments of a session's first row, each with its escapes intact.
@@ -114,14 +155,27 @@ struct Session: Decodable {
     /// session can go minutes without redrawing.
     let active_at: Double?
     let tty: String?
+    /// The Claude Code process that owns the terminal.
+    let pid: Int32?
+    /// What the latest status line redraw cost.
+    let redraw: RedrawCost?
+    let transcript: TranscriptState?
     let rows: [String]
     let summary: Summary
     let segments: Segments
 }
 
+/// The account's Fable quota, read from the shared usage cache.
+struct FableQuota: Decodable {
+    let percent: Double?
+    let resets_at: Double?
+    let read_at: Double?
+}
+
 struct Snapshot: Decodable {
     let live: [Session]
     let history: [Session]
+    let fable: FableQuota?
 }
 
 // MARK: - Reading the spool
@@ -135,19 +189,7 @@ func readSnapshot(columns: Int) -> Snapshot? {
         return nil
     }
 
-    let task = Process()
-    task.executableURL = script
-    task.arguments = ["live", "--columns", String(columns)]
-    // Launched from Finder the app inherits launchd's bare PATH, which has no
-    // node: the script's `env node` line then fails with 127. Put the usual
-    // shims back, as the other local apps' launchers do.
-    var env = ProcessInfo.processInfo.environment
-    let shims = [
-        "\(home.path)/.local/bin", "\(home.path)/.asdf/shims", "/opt/homebrew/bin", "/usr/local/bin",
-        "\(home.path)/bin", "/usr/bin", "/bin",
-    ]
-    env["PATH"] = (shims + [env["PATH"] ?? ""]).filter { !$0.isEmpty }.joined(separator: ":")
-    task.environment = env
+    let task = scriptProcess(script, ["live", "--columns", String(columns)])
     let pipe = Pipe()
     task.standardOutput = pipe
     task.standardError = FileHandle.nullDevice
@@ -158,7 +200,45 @@ func readSnapshot(columns: Int) -> Snapshot? {
         log("spawn failed: \(error.localizedDescription)")
         return nil
     }
+    return finishSnapshot(task, pipe)
+}
 
+/// The script as a process, with a PATH that can find node.
+func scriptProcess(_ script: URL, _ arguments: [String]) -> Process {
+    let task = Process()
+    task.executableURL = script
+    task.arguments = arguments
+    // Launched from Finder the app inherits launchd's bare PATH, which has no
+    // node: the script's `env node` line then fails with 127. Put the usual
+    // shims back, as the other local apps' launchers do.
+    var env = ProcessInfo.processInfo.environment
+    let shims = [
+        "\(home.path)/.local/bin", "\(home.path)/.asdf/shims", "/opt/homebrew/bin", "/usr/local/bin",
+        "\(home.path)/bin", "/usr/bin", "/bin",
+    ]
+    env["PATH"] = (shims + [env["PATH"] ?? ""]).filter { !$0.isEmpty }.joined(separator: ":")
+    task.environment = env
+    return task
+}
+
+/// Fetches the account's usage once, for the Fable quota: it only moves while
+/// Fable runs, and a Fable session keeps the shared cache fresh by itself, so
+/// one reading at launch covers the rest. Blocks; call it off the main thread.
+func refreshUsageOnce() {
+    let script = repoDir.appendingPathComponent("cc-statusline.js")
+    guard fm.isExecutableFile(atPath: script.path) else { return }
+    let task = scriptProcess(script, ["refresh-usage"])
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        log("usage refresh failed: \(error.localizedDescription)")
+    }
+}
+
+private func finishSnapshot(_ task: Process, _ pipe: Pipe) -> Snapshot? {
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     task.waitUntilExit()
     guard task.terminationStatus == 0 else {
@@ -172,6 +252,517 @@ func readSnapshot(columns: Int) -> Snapshot? {
         log("decode failed: \(error)")
         return nil
     }
+}
+
+// MARK: - Reading processes
+
+/// Memory and CPU of each session's Claude Code process and everything under it,
+/// read from the kernel: no ps, no subprocess. Listing processes with ps costs
+/// ~0.4 s of system time here, far more than everything else the app does.
+final class ProcessSampler {
+    struct Reading {
+        /// What Activity Monitor calls Memory: resident plus compressed.
+        let footprint: UInt64
+        /// Share of one core since the last reading; nil on the first.
+        let cpuPercent: Double?
+        /// CPU the session's own process has used since it started.
+        let cpuSeconds: Double
+        let processes: Int
+        /// When the youngest process under the session started, epoch seconds:
+        /// an approved shell command starts one, a pending prompt does not.
+        let newestChild: Double?
+    }
+
+    /// rusage times are in mach ticks, which are not nanoseconds on Apple silicon.
+    private let tick: Double = {
+        var base = mach_timebase_info_data_t()
+        mach_timebase_info(&base)
+        return Double(base.numer) / Double(base.denom)
+    }()
+    private var previous: [pid_t: UInt64] = [:]
+    private var previousAt: UInt64 = 0
+
+    /// The pid still runs and still owns the session's terminal. A pid is reused
+    /// once its process exits; the terminal is what ties it to the session.
+    func owns(pid: pid_t, tty: String?) -> Bool {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return false }
+        guard let tty = tty else { return true }
+        var st = stat()
+        guard stat(tty, &st) == 0 else { return false }
+        return info.e_tdev == UInt32(bitPattern: st.st_rdev)
+    }
+
+    private func usage(_ pid: pid_t) -> rusage_info_v2? {
+        var info = rusage_info_v2()
+        let ok = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) == 0
+            }
+        }
+        return ok ? info : nil
+    }
+
+    private func tree(_ root: pid_t) -> [pid_t] {
+        var out = [root]
+        var i = 0
+        while i < out.count && out.count < 512 {
+            var buffer = [pid_t](repeating: 0, count: 256)
+            let n = proc_listchildpids(out[i], &buffer, Int32(buffer.count * MemoryLayout<pid_t>.size))
+            if n > 0 { out += buffer.prefix(Int(n)).filter { $0 > 0 && !out.contains($0) } }
+            i += 1
+        }
+        return out
+    }
+
+    /// One reading per root pid. CPU is the change since the previous call, per
+    /// process, so a child that exits between readings is simply not counted.
+    func sample(_ roots: [pid_t]) -> [pid_t: Reading] {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsed = previousAt == 0 ? 0 : Double(now - previousAt)
+        var seen: [pid_t: UInt64] = [:]
+        var out: [pid_t: Reading] = [:]
+        for root in roots {
+            var footprint: UInt64 = 0
+            var spent: Double = 0
+            var own: Double = 0
+            var count = 0
+            var newest: Double? = nil
+            for pid in tree(root) {
+                guard let u = usage(pid) else { continue }
+                if pid != root {
+                    var info = proc_bsdinfo()
+                    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+                    if proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size {
+                        let started = Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1e6
+                        newest = max(newest ?? 0, started)
+                    }
+                }
+                let cpu = UInt64(Double(u.ri_user_time + u.ri_system_time) * tick)
+                footprint += u.ri_phys_footprint
+                if let before = previous[pid], cpu >= before { spent += Double(cpu - before) }
+                if pid == root { own = Double(cpu) / 1e9 }
+                seen[pid] = cpu
+                count += 1
+            }
+            guard count > 0 else { continue }
+            out[root] = Reading(
+                footprint: footprint, cpuPercent: elapsed > 0 ? 100 * spent / elapsed : nil,
+                cpuSeconds: own, processes: count, newestChild: newest)
+        }
+        previous = seen
+        previousAt = now
+        return out
+    }
+}
+
+/// What this tool costs the machine: the app, the `live` snapshots it runs, and
+/// the status line redraws in every session, as a share of one core over the
+/// last few minutes.
+final class SelfCost {
+    private static let window: Double = 300
+    private var appSamples: [(at: Double, cpu: Double)] = []
+    private var redraws: [(at: Double, cpu: Double)] = []
+    private var lastRedraw: [String: Double] = [:]
+    private let started = Date().timeIntervalSince1970
+
+    /// CPU of the app and of the children it has waited for: the snapshots.
+    private func appCpu() -> Double {
+        func seconds(_ who: Int32) -> Double {
+            var r = rusage()
+            getrusage(who, &r)
+            return Double(r.ru_utime.tv_sec + r.ru_stime.tv_sec)
+                + Double(r.ru_utime.tv_usec + r.ru_stime.tv_usec) / 1e6
+        }
+        return seconds(RUSAGE_SELF) + seconds(RUSAGE_CHILDREN)
+    }
+
+    func footprint() -> UInt64 {
+        var info = rusage_info_v2()
+        let ok = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(getpid(), RUSAGE_INFO_V2, $0) == 0
+            }
+        }
+        return ok ? info.ri_phys_footprint : 0
+    }
+
+    /// Each spool keeps only its latest redraw, so a redraw is counted when its
+    /// timestamp moves. The first snapshot only sets the baseline.
+    func record(_ sessions: [Session]) {
+        let now = Date().timeIntervalSince1970
+        let first = lastRedraw.isEmpty
+        for session in sessions {
+            guard let id = session.summary.session_id else { continue }
+            if !first, let seen = lastRedraw[id], session.updated_at > seen, let cpu = session.redraw?.cpu_ms {
+                redraws.append((now, cpu / 1000))
+            }
+            lastRedraw[id] = session.updated_at
+        }
+        appSamples.append((now, appCpu()))
+        appSamples.removeAll { now - $0.at > Self.window }
+        redraws.removeAll { now - $0.at > Self.window }
+    }
+
+    /// Shares of one core: (status line redraws, the app and its snapshots).
+    func load() -> (redraws: Double, app: Double)? {
+        let now = Date().timeIntervalSince1970
+        let span = min(Self.window, now - started)
+        guard span >= 30, let oldest = appSamples.first, let newest = appSamples.last, newest.at > oldest.at
+        else { return nil }
+        let app = 100 * (newest.cpu - oldest.cpu) / (newest.at - oldest.at)
+        let drawn = 100 * redraws.reduce(0) { $0 + $1.cpu } / span
+        return (drawn, app)
+    }
+}
+
+// MARK: - Session events and sounds
+
+/// The app's own files: the sound packs and their settings.
+let supportDir: URL =
+    (fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? home.appendingPathComponent("Library"))
+    .appendingPathComponent("Agent Bar Hopping")
+/// Where hooks/event.zsh leaves one file per Claude Code event.
+let eventsDir = cacheDir.appendingPathComponent("events")
+
+/// sounds.json in the support directory; written with these defaults when absent.
+struct SoundSettings: Codable {
+    var enabled = true
+    /// A directory under packs/ holding an openpeon.json manifest and its sounds.
+    var pack = "rick"
+    var volume: Float = 0.35
+    var categories: [String: Bool] = [
+        "task.complete": true, "task.error": true, "input.required": true,
+        "resource.limit": true, "user.spam": true,
+    ]
+    /// A reply that took less than this is not announced: you were watching.
+    var silent_window_seconds: Double = 7
+    /// This many prompts to one session inside the window is spam.
+    var annoyed_threshold = 3
+    var annoyed_window_seconds: Double = 10
+    /// Per-session overrides of `enabled`, by session id: true plays for that
+    /// session whatever the switch says, false mutes it. Dropped when the
+    /// session ends.
+    var sessions: [String: Bool] = [:]
+
+    init() {}
+
+    /// Every field optional, so a file written before a field existed still
+    /// loads, with the default for what it lacks.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = SoundSettings()
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? d.enabled
+        pack = try c.decodeIfPresent(String.self, forKey: .pack) ?? d.pack
+        volume = try c.decodeIfPresent(Float.self, forKey: .volume) ?? d.volume
+        categories = try c.decodeIfPresent([String: Bool].self, forKey: .categories) ?? d.categories
+        silent_window_seconds = try c.decodeIfPresent(Double.self, forKey: .silent_window_seconds) ?? d.silent_window_seconds
+        annoyed_threshold = try c.decodeIfPresent(Int.self, forKey: .annoyed_threshold) ?? d.annoyed_threshold
+        annoyed_window_seconds = try c.decodeIfPresent(Double.self, forKey: .annoyed_window_seconds) ?? d.annoyed_window_seconds
+        sessions = try c.decodeIfPresent([String: Bool].self, forKey: .sessions) ?? d.sessions
+    }
+}
+
+/// Turns Claude Code's hook events into sounds, and remembers the one thing the
+/// transcript cannot show: a permission prompt waiting on the user.
+final class EventCenter {
+    private var settings = SoundSettings()
+    /// Sound files per category, from the pack's manifest.
+    private var sounds: [String: [URL]] = [:]
+    private var playing: NSSound?
+    /// The last file per category, so a category never repeats itself.
+    private var lastPlayed: [String: URL] = [:]
+    /// The last completion in any session: several finishing together chime once.
+    private var lastComplete: Double = 0
+    private static let completeDebounceSeconds: Double = 5
+    private var watcher: DispatchSourceFileSystemObject?
+    private var promptStarted: [String: Double] = [:]
+    private var prompts: [String: [Double]] = [:]
+    /// When each session last asked for a permission, in epoch seconds.
+    private(set) var permissionAt: [String: Double] = [:]
+    /// Called on the main queue after events change what a row should show.
+    var onChange: (() -> Void)?
+
+    /// Events older than this when read were missed while the app was closed:
+    /// too late to announce, and a stale permission would mislead.
+    private static let freshSeconds: Double = 60
+
+    init() {
+        loadSettings()
+        loadPack()
+        try? fm.createDirectory(at: eventsDir, withIntermediateDirectories: true)
+        let fd = open(eventsDir.path, O_EVTONLY)
+        guard fd >= 0 else {
+            log("cannot watch \(eventsDir.path)")
+            return
+        }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .rename], queue: .main)
+        source.setEventHandler { [weak self] in self?.drain() }
+        source.setCancelHandler { Darwin.close(fd) }
+        source.resume()
+        watcher = source
+        drain()
+    }
+
+    private let settingsFile = supportDir.appendingPathComponent("sounds.json")
+
+    private func loadSettings() {
+        if let data = try? Data(contentsOf: settingsFile),
+            let s = try? JSONDecoder().decode(SoundSettings.self, from: data)
+        {
+            settings = s
+        }
+        save()
+    }
+
+    private func save() {
+        try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? encoder.encode(settings).write(to: settingsFile)
+    }
+
+    // MARK: Settings, for the controls
+
+    var current: SoundSettings { settings }
+
+    /// Applies a change and writes it straight away: there is no save button.
+    func update(_ change: (inout SoundSettings) -> Void) {
+        let pack = settings.pack
+        change(&settings)
+        if settings.pack != pack {
+            sounds = [:]
+            previewed = [:]
+            loadPack()
+        }
+        save()
+    }
+
+    /// The installed packs, by directory name.
+    var packs: [String] {
+        let dir = supportDir.appendingPathComponent("packs")
+        return ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { !$0.hasPrefix(".") }
+            .sorted()
+    }
+
+    /// A sample of the pack, whatever the switches say: picking a pack should
+    /// let you hear it.
+    func preview() {
+        play("task.complete", session: nil, force: true)
+    }
+
+    /// Where each category's preview is in its list: previews play a pack's
+    /// sounds in order, so each can be heard, where events pick at random.
+    private var previewed: [String: Int] = [:]
+
+    func soundCount(_ category: String) -> Int { sounds[category]?.count ?? 0 }
+
+    /// Plays the category's next sound in the pack's order, whatever the
+    /// switches say. Returns its place, 1-based, and how many there are.
+    func previewNext(_ category: String) -> (index: Int, count: Int)? {
+        guard let list = sounds[category], !list.isEmpty else { return nil }
+        let i = (previewed[category] ?? 0) % list.count
+        previewed[category] = i + 1
+        playFile(list[i])
+        return (i + 1, list.count)
+    }
+
+    func override(for session: String) -> Bool? { settings.sessions[session] }
+
+    func setOverride(_ value: Bool?, for session: String) {
+        update { $0.sessions[session] = value }
+    }
+
+    /// Overrides of sessions no longer open go.
+    func prune(keeping live: Set<String>) {
+        guard settings.sessions.keys.contains(where: { !live.contains($0) }) else { return }
+        update { $0.sessions = $0.sessions.filter { live.contains($0.key) } }
+    }
+
+    /// Reads an openpeon (CESP 1.0) manifest the way peon-ping does: a path with
+    /// a slash is relative to the pack, a bare name lives in sounds/, and nothing
+    /// may resolve outside the pack. A malformed entry is skipped, not the whole
+    /// pack; ogg files are skipped because macOS cannot play them.
+    private func loadPack() {
+        let dir = supportDir.appendingPathComponent("packs").appendingPathComponent(settings.pack)
+        let manifest = ["openpeon.json", "manifest.json"].lazy
+            .compactMap { try? Data(contentsOf: dir.appendingPathComponent($0)) }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+            .first
+        guard let categories = manifest?["categories"] as? [String: Any] else {
+            log("no sound pack at \(dir.path)")
+            return
+        }
+        let root = dir.standardizedFileURL.path + "/"
+        for (name, value) in categories {
+            let entries = ((value as? [String: Any])?["sounds"] as? [Any]) ?? []
+            let files: [URL] = entries.compactMap { entry in
+                guard let file = (entry as? [String: Any])?["file"] as? String, !file.isEmpty else { return nil }
+                let url = (file.contains("/") ? dir.appendingPathComponent(file)
+                    : dir.appendingPathComponent("sounds").appendingPathComponent(file)).standardizedFileURL
+                guard url.path.hasPrefix(root), url.pathExtension.lowercased() != "ogg",
+                    fm.fileExists(atPath: url.path)
+                else { return nil }
+                return url
+            }
+            if !files.isEmpty { sounds[name] = files }
+        }
+    }
+
+    /// Reads every waiting event in arrival order, then deletes it.
+    private func drain() {
+        guard let names = try? fm.contentsOfDirectory(atPath: eventsDir.path) else { return }
+        let now = Date().timeIntervalSince1970
+        var changed = false
+        for name in names.filter({ $0.hasSuffix(".json") }).sorted() {
+            let file = eventsDir.appendingPathComponent(name)
+            defer { try? fm.removeItem(at: file) }
+            let at = (Double(name.prefix { $0.isNumber }) ?? 0) / 1e6
+            guard now - at < Self.freshSeconds,
+                let data = try? Data(contentsOf: file),
+                let event = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { continue }
+            changed = handle(event, at: at) || changed
+        }
+        if changed { onChange?() }
+    }
+
+    /// Returns whether the event changed what a row shows.
+    private func handle(_ event: [String: Any], at: Double) -> Bool {
+        let name = event["hook_event_name"] as? String ?? ""
+        let session = event["session_id"] as? String ?? ""
+        switch name {
+        case "UserPromptSubmit":
+            promptStarted[session] = at
+            let recent = (prompts[session] ?? []).filter { at - $0 < settings.annoyed_window_seconds } + [at]
+            prompts[session] = recent
+            // Every prompt past the threshold inside the window is spam again.
+            if recent.count >= settings.annoyed_threshold { play("user.spam", session: session) }
+            return permissionAt.removeValue(forKey: session) != nil
+        case "Stop":
+            let started = promptStarted.removeValue(forKey: session)
+            let quick = started.map { at - $0 < settings.silent_window_seconds } ?? false
+            if !quick && at - lastComplete >= Self.completeDebounceSeconds {
+                play("task.complete", session: session)
+                lastComplete = at
+            }
+            return permissionAt.removeValue(forKey: session) != nil
+        case "StopFailure":
+            play("task.error", session: session)
+        case "PostToolUseFailure":
+            // Every tool reports failures here, and a shell command with an error
+            // is the one worth hearing about.
+            if event["tool_name"] as? String == "Bash", let error = event["error"] as? String, !error.isEmpty {
+                play("task.error", session: session)
+            }
+        case "PermissionRequest":
+            play("input.required", session: session)
+            permissionAt[session] = at
+            return true
+        case "PreToolUse":
+            // Registered only for AskUserQuestion and ExitPlanMode: a question
+            // or a plan now waits on the user.
+            play("input.required", session: session)
+        case "Notification":
+            if event["notification_type"] as? String == "elicitation_dialog" { play("input.required", session: session) }
+        case "PreCompact":
+            play("resource.limit", session: session)
+        default: break
+        }
+        return false
+    }
+
+    /// One sound at a time: a new one cuts the last short, as the events it
+    /// announces are newer. Never the same file twice running when a category
+    /// has more than one.
+    private func play(_ category: String, session: String?, force: Bool = false) {
+        // A session's own override beats the switch, both ways.
+        let on = session.flatMap { settings.sessions[$0] } ?? settings.enabled
+        guard force || (on && settings.categories[category] == true),
+            var choices = sounds[category], !choices.isEmpty
+        else { return }
+        if choices.count > 1, let last = lastPlayed[category] { choices.removeAll { $0 == last } }
+        guard let url = choices.randomElement() else { return }
+        playFile(url)
+        lastPlayed[category] = url
+    }
+
+    private func playFile(_ url: URL) {
+        guard let sound = NSSound(contentsOf: url, byReference: true) else { return }
+        playing?.stop()
+        sound.volume = settings.volume
+        sound.play()
+        playing = sound
+    }
+}
+
+/// The newest Claude Code release, from npm's public registry: one small request
+/// every six hours at most, cached in the cache dir so a relaunch does not ask
+/// again, and an hour's pause after a failure rather than a retry per refresh.
+final class LatestVersion {
+    private let file = cacheDir.appendingPathComponent("claude-latest.json")
+    private static let url = URL(string: "https://registry.npmjs.org/@anthropic-ai/claude-code/latest")!
+    private static let freshFor: Double = 6 * 3600
+    private static let pauseAfterFailure: Double = 3600
+    private struct Cache: Codable {
+        var version: String?
+        var fetched_at: Double
+        var failed_at: Double?
+    }
+    private var cache: Cache
+    private var inFlight = false
+    var version: String? { cache.version }
+    /// Called on the main queue when a fetch brought a new version.
+    var onChange: (() -> Void)?
+
+    init() {
+        cache =
+            (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Cache.self, from: $0) }
+            ?? Cache(version: nil, fetched_at: 0, failed_at: nil)
+    }
+
+    func refreshIfDue() {
+        let now = Date().timeIntervalSince1970
+        guard !inFlight, now - cache.fetched_at > Self.freshFor,
+            now - (cache.failed_at ?? 0) > Self.pauseAfterFailure
+        else { return }
+        inFlight = true
+        var request = URLRequest(url: Self.url)
+        request.timeoutInterval = 10
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            let version = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }?["version"] as? String
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200 && version != nil
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.inFlight = false
+                let now = Date().timeIntervalSince1970
+                if ok {
+                    let changed = self.cache.version != version
+                    self.cache = Cache(version: version, fetched_at: now, failed_at: nil)
+                    if changed { self.onChange?() }
+                } else {
+                    self.cache.failed_at = now
+                    log("latest version: fetch failed")
+                }
+                if let data = try? JSONEncoder().encode(self.cache) { try? data.write(to: self.file) }
+            }
+        }.resume()
+    }
+}
+
+func bytes(_ n: UInt64) -> String {
+    let mb = Double(n) / 1_048_576
+    return mb >= 1024 ? String(format: "%.1f GB", mb / 1024) : "\(Int(mb.rounded())) MB"
+}
+
+/// CPU time as the grid spells durations: 45s, 12m, 2.5h.
+func cpuTime(_ seconds: Double) -> String {
+    if seconds < 60 { return "\(Int(seconds))s" }
+    if seconds < 3600 { return "\(Int(seconds / 60))m" }
+    return trimmed(seconds / 3600, "h")
 }
 
 // MARK: - Colours, matching the status line's own
@@ -408,9 +999,17 @@ func focusTerminal(tty: String) {
 final class BarView: NSView {
     var fraction: Double = 0 { didSet { needsDisplay = true } }
     var colour: NSColor = .white { didSet { needsDisplay = true } }
+    /// Equal parts marked on the bar: 5 for a 5-hour window, 7 for a week, so
+    /// each tick is an hour or a day. 0 draws none.
+    var divisions = 0 { didSet { needsDisplay = true } }
+    /// The tick drawn in white instead of cut out: the end of the current hour
+    /// or day, the share a steady pace would have used by then.
+    var markedTick: Int? { didSet { needsDisplay = true } }
 
-    override func draw(_ dirtyRect: NSRect) {
-        let height: CGFloat = 4
+    static let thickness: CGFloat = 4
+
+    private func drawBar() {
+        let height = Self.thickness
         let track = NSRect(x: 0, y: (bounds.height - height) / 2, width: bounds.width, height: height)
         let radius = height / 2
         NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.10).setFill()
@@ -424,6 +1023,19 @@ final class BarView: NSView {
             xRadius: radius, yRadius: radius
         ).fill()
     }
+
+    /// Ticks are gaps cut in the background colour, so they read on the filled
+    /// part and the empty track alike.
+    override func draw(_ dirtyRect: NSRect) {
+        drawBar()
+        guard divisions > 1 else { return }
+        for i in 1..<divisions {
+            (i == markedTick ? Palette.text : Palette.background).setFill()
+            let x = (bounds.width * CGFloat(i) / CGFloat(divisions)).rounded()
+            // Only as tall as the bar itself, not the frame around it.
+            NSRect(x: x, y: (bounds.height - Self.thickness) / 2, width: 1, height: Self.thickness).fill()
+        }
+    }
 }
 
 /// A cell that acts on a click and says so with the cursor.
@@ -432,8 +1044,18 @@ final class ClickableCell: NSView {
         didSet { setAccessibilityRole(onClick == nil ? .group : .button) }
     }
 
+    /// A cell with its own click action keeps the event, so the table never
+    /// sees the double-click; the cell passes that on itself.
+    var onDoubleClick: (() -> Void)?
+
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount >= 1, let onClick = onClick { onClick() } else { super.mouseDown(with: event) }
+        if event.clickCount == 2, onClick != nil, let onDoubleClick = onDoubleClick {
+            onDoubleClick()
+        } else if event.clickCount == 1, let onClick = onClick {
+            onClick()
+        } else {
+            super.mouseDown(with: event)
+        }
     }
 
     override func resetCursorRects() {
@@ -498,6 +1120,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let table = NSTableView()
 
     private var rows: [(session: Session, past: Bool)] = []
+    /// Memory and CPU per Claude Code pid, from the latest reading.
+    private var loads: [pid_t: ProcessSampler.Reading] = [:]
+    /// Snapshots run one at a time, so the sampler's CPU deltas stay in order.
+    private let worker = DispatchQueue(label: "agent-bar-hopping.reload", qos: .userInitiated)
+    private let sampler = ProcessSampler()
+    private let selfCost = SelfCost()
+    private let events = EventCenter()
+    private let soundBar = NSStackView()
+    private let soundSwitch = NSSwitch()
+    private let volumeSlider = NSSlider(value: 0.35, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let packMenu = NSPopUpButton()
+    /// The events that can sound, in the order the checkboxes show them.
+    private static let soundEvents: [(key: String, title: String)] = [
+        ("task.complete", "done"), ("task.error", "error"), ("input.required", "needs you"),
+        ("resource.limit", "limit"), ("user.spam", "spam"),
+    ]
+    private var eventBoxes: [NSButton] = []
+    private var previewButtons: [NSButton] = []
+    private let latest = LatestVersion()
     private var watcher: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
     private var paintedOnce = false
@@ -528,7 +1169,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         window.setContentSize(NSSize(width: fitted, height: 720))
         window.center()
         window.setFrameAutosaveName("AgentBarHopping")
+        // A frame saved before a column was added would cut the new one off.
+        if let restored = window.contentView?.frame.width, restored < fitted {
+            window.setContentSize(NSSize(width: fitted, height: window.contentView?.frame.height ?? 720))
+        }
         startWatching()
+        events.onChange = { [weak self] in self?.refreshTable() }
+        latest.onChange = { [weak self] in self?.refreshTable(full: true) }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            refreshUsageOnce()
+            DispatchQueue.main.async { self?.reload() }
+        }
         reload()
     }
 
@@ -545,7 +1196,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         // The account-wide quotas, once, above a table whose rows may run long.
         quotaBar.orientation = .horizontal
-        quotaBar.alignment = .centerY
+        // Each quota is two rows, the reading and its pace; their tops line up.
+        quotaBar.alignment = .top
         quotaBar.spacing = 32
         quotaBar.translatesAutoresizingMaskIntoConstraints = false
 
@@ -565,7 +1217,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         table.allowsTypeSelect = false
         table.allowsEmptySelection = true
         table.target = self
-        table.doubleAction = nil
+        // A double-click on the columns that name a session goes to its terminal.
+        table.doubleAction = #selector(showClickedTerminal)
         // The default spacing plus per-cell padding is most of the row's width.
         table.intercellSpacing = NSSize(width: 4, height: 0)
         table.columnAutoresizingStyle = .noColumnAutoresizing
@@ -580,8 +1233,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         emptyLabel.font = NSFont.systemFont(ofSize: 13)
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        buildSoundBar()
         content.addSubview(statusLabel)
         content.addSubview(quotaBar)
+        content.addSubview(soundBar)
         content.addSubview(gridScroll)
         content.addSubview(emptyLabel)
 
@@ -590,7 +1245,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             quotaBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            quotaBar.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
+            quotaBar.trailingAnchor.constraint(lessThanOrEqualTo: soundBar.leadingAnchor, constant: -24),
+            // The sound settings take the space right of the quotas.
+            soundBar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            // Level with the bottom of the quotas, so it sits on the table.
+            soundBar.bottomAnchor.constraint(equalTo: quotaBar.bottomAnchor),
             gridScroll.topAnchor.constraint(equalTo: quotaBar.bottomAnchor, constant: 12),
             gridScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             gridScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -616,12 +1275,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         Column(key: "age", title: "Last Seen", width: 74),
         Column(key: "cwd", title: "Directory", width: 164),
         Column(key: "topic", title: "Doing", width: 300),
+        Column(key: "state", title: "State", width: 176),
         Column(key: "model", title: "Model", width: 58),
         Column(key: "effort", title: "Effort", width: 60),
         Column(key: "context", title: "Context", width: 82),
+        Column(key: "sound", title: "Sound", width: 60),
         Column(key: "cache", title: "Cache", width: 140),
         Column(key: "heat", title: "", width: 10),
-        Column(key: "started", title: "Launched at", width: 104),
+        Column(key: "tokens", title: "Tokens", width: 88),
+        Column(key: "memory", title: "Memory", width: 72),
+        Column(key: "cpu", title: "CPU", width: 60),
+        Column(key: "started", title: "Launched at", width: 112),
         Column(key: "git", title: "Branch", width: 132),
     ]
 
@@ -636,7 +1300,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             switch spec.key {
             case "context": column.headerCell.alignment = .center
             case "age": column.headerCell.alignment = .right
-            case "model", "cache": column.headerCell.alignment = .right
+            case "model", "cache", "tokens", "memory", "cpu": column.headerCell.alignment = .right
             case "effort": column.headerCell.alignment = .left
             default: break
             }
@@ -645,8 +1309,116 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             column.sortDescriptorPrototype = NSSortDescriptor(key: spec.key, ascending: true)
             table.addTableColumn(column)
         }
-        // Launch order, earliest at the top, until a header is clicked.
-        table.sortDescriptors = [NSSortDescriptor(key: "started", ascending: true)]
+        // The caches about to go cold first, until a header is clicked; with
+        // nothing warm that is the most recently active first.
+        table.sortDescriptors = [NSSortDescriptor(key: "cache", ascending: true)]
+        table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("cache"))?.title = "Cache · soonest"
+    }
+
+    // MARK: Sound settings
+
+    /// The global sound settings, in the header's spare room: the switch, the
+    /// volume and the pack on one line, which events sound on the next.
+    /// Everything applies at once; a session can override the switch in the
+    /// Sound column.
+    private func buildSoundBar() {
+        let settings = events.current
+        soundBar.orientation = .vertical
+        soundBar.alignment = .trailing
+        soundBar.spacing = 6
+        soundBar.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: "Sounds")
+        title.font = NSFont.systemFont(ofSize: 12)
+        title.textColor = Palette.dim
+        soundSwitch.controlSize = .mini
+        soundSwitch.state = settings.enabled ? .on : .off
+        soundSwitch.target = self
+        soundSwitch.action = #selector(soundSwitched)
+        soundSwitch.setAccessibilityLabel("Sounds for every session")
+        volumeSlider.controlSize = .mini
+        volumeSlider.floatValue = settings.volume
+        volumeSlider.target = self
+        volumeSlider.action = #selector(volumeChanged)
+        volumeSlider.isContinuous = false
+        volumeSlider.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        volumeSlider.setAccessibilityLabel("Volume")
+        packMenu.controlSize = .small
+        packMenu.font = NSFont.systemFont(ofSize: 11)
+        packMenu.addItems(withTitles: events.packs)
+        packMenu.selectItem(withTitle: settings.pack)
+        packMenu.target = self
+        packMenu.action = #selector(packChosen)
+        packMenu.setAccessibilityLabel("Sound pack")
+        let top = NSStackView(views: [title, soundSwitch, volumeSlider, packMenu])
+        top.spacing = 8
+
+        eventBoxes = Self.soundEvents.map { event in
+            let box = NSButton(checkboxWithTitle: event.title, target: self, action: #selector(eventToggled))
+            box.controlSize = .small
+            box.font = NSFont.systemFont(ofSize: 11)
+            box.state = settings.categories[event.key] == true ? .on : .off
+            box.identifier = NSUserInterfaceItemIdentifier(event.key)
+            return box
+        }
+        // A ▶ beside each: its sounds one by one, in the pack's order.
+        previewButtons = Self.soundEvents.map { event in
+            let play = NSButton(title: "▶", target: self, action: #selector(previewEvent))
+            play.isBordered = false
+            play.font = NSFont.systemFont(ofSize: 9)
+            play.contentTintColor = Palette.dim
+            play.identifier = NSUserInterfaceItemIdentifier(event.key)
+            play.toolTip = "Play the next \(event.title) sound"
+            play.setAccessibilityLabel("Preview \(event.title) sounds")
+            return play
+        }
+        let pairs = zip(eventBoxes, previewButtons).map { box, play -> NSView in
+            let pair = NSStackView(views: [box, play])
+            pair.spacing = 2
+            return pair
+        }
+        let boxes = NSStackView(views: pairs)
+        boxes.spacing = 10
+        updatePreviewButtons()
+        soundBar.addArrangedSubview(top)
+        soundBar.addArrangedSubview(boxes)
+    }
+
+    @objc private func soundSwitched() {
+        events.update { $0.enabled = soundSwitch.state == .on }
+        refreshTable()
+    }
+
+    @objc private func volumeChanged() {
+        events.update { $0.volume = volumeSlider.floatValue }
+        events.preview()
+    }
+
+    @objc private func packChosen() {
+        guard let pack = packMenu.titleOfSelectedItem else { return }
+        events.update { $0.pack = pack }
+        updatePreviewButtons()
+        events.preview()
+    }
+
+    /// A pack without sounds for an event has nothing to preview there.
+    private func updatePreviewButtons() {
+        for play in previewButtons {
+            play.isEnabled = events.soundCount(play.identifier?.rawValue ?? "") > 0
+        }
+    }
+
+    @objc private func previewEvent(_ play: NSButton) {
+        guard let key = play.identifier?.rawValue,
+            let title = Self.soundEvents.first(where: { $0.key == key })?.title,
+            let place = events.previewNext(key)
+        else { return }
+        note("\(events.current.pack) · \(title) \(place.index) of \(place.count)")
+    }
+
+    @objc private func eventToggled(_ box: NSButton) {
+        guard let key = box.identifier?.rawValue else { return }
+        events.update { $0.categories[key] = box.state == .on }
     }
 
     // MARK: Loading
@@ -662,13 +1434,36 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     func reload() {
         let cols = rowColumns()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        worker.async { [weak self] in
+            guard let self = self else { return }
             let snapshot = readSnapshot(columns: cols)
-            DispatchQueue.main.async { self?.apply(snapshot) }
+            var loads: [pid_t: ProcessSampler.Reading] = [:]
+            var reused = Set<String>()
+            if let snapshot = snapshot {
+                // The script knows the pid is alive; only the kernel can say it
+                // is still the same process, on the same terminal.
+                for s in snapshot.live {
+                    if let pid = s.pid, !self.sampler.owns(pid: pid, tty: s.tty), let id = s.summary.session_id {
+                        reused.insert(id)
+                    }
+                }
+                let pids = snapshot.live.compactMap { s -> pid_t? in
+                    guard let pid = s.pid, !reused.contains(s.summary.session_id ?? "") else { return nil }
+                    return pid
+                }
+                loads = self.sampler.sample(pids)
+                self.selfCost.record(snapshot.live + snapshot.history)
+            }
+            let cost = self.selfCost.load()
+            let footprint = self.selfCost.footprint()
+            DispatchQueue.main.async { self.apply(snapshot, loads: loads, reused: reused, cost: cost, footprint: footprint) }
         }
     }
 
-    private func apply(_ snapshot: Snapshot?) {
+    private func apply(
+        _ snapshot: Snapshot?, loads: [pid_t: ProcessSampler.Reading], reused: Set<String>,
+        cost: (redraws: Double, app: Double)?, footprint: UInt64
+    ) {
         guard let snapshot = snapshot else {
             statusLabel.stringValue = "cc-statusline not reachable — see \(logURL.path)"
             return
@@ -677,13 +1472,115 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             paintedOnce = true
             log("first paint: \(snapshot.live.count) live, \(snapshot.history.count) finished")
         }
-        rows = snapshot.live.map { ($0, false) } + snapshot.history.map { ($0, true) }
-        counts = "\(snapshot.live.count) live · \(snapshot.history.count) finished"
+        self.loads = loads
+        events.prune(keeping: Set(snapshot.live.compactMap { $0.summary.session_id }))
+        let keep = selected?.session.summary.session_id
+        let ended = { (s: Session) in reused.contains(s.summary.session_id ?? "") }
+        let live = snapshot.live.filter { !ended($0) }
+        let past = snapshot.live.filter(ended) + snapshot.history
+        rows = live.map { ($0, false) } + past.map { ($0, true) }
+        counts = "\(live.count) live · \(past.count) finished"
+        toolCost = (cost, footprint)
+        latest.refreshIfDue()
         if noteToken == nil { statusLabel.stringValue = counts }
         emptyLabel.isHidden = !rows.isEmpty
         drawQuotaBar(snapshot)
         sortRows()
-        table.reloadData()
+        refreshTable()
+        table.reloadData(forRowIndexes: IndexSet(integer: 0), columnIndexes: IndexSet(table.tableColumns.indices))
+        select(keep)
+    }
+
+    /// What watching all this costs, shown as the table's first row: the status
+    /// line redraws in every session and the app with its snapshots.
+    private var toolCost: (cpu: (redraws: Double, app: Double)?, footprint: UInt64) = (nil, 0)
+
+    private func toolCell(_ key: String) -> NSView? {
+        let text: String
+        var colour = Palette.dim
+        switch key {
+        case "cwd":
+            text = "this tool"
+        case "topic":
+            text = "cc-statusline"
+        case "started":
+            // Every session's version is held against this one.
+            text = "v" + (latest.version ?? "—") + " latest"
+        case "memory":
+            text = bytes(toolCost.footprint)
+            colour = Palette.text.withAlphaComponent(0.8)
+        case "cpu":
+            text = toolCost.cpu.map { String(format: "%.1f%%", $0.redraws + $0.app) } ?? "—"
+            colour = Palette.text.withAlphaComponent(0.8)
+        default:
+            return nil
+        }
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        field.textColor = colour
+        field.alignment = key == "memory" || key == "cpu" ? .right : .left
+        field.lineBreakMode = .byTruncatingTail
+        field.translatesAutoresizingMaskIntoConstraints = false
+        let cell = NSView()
+        cell.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        if key == "cpu", let cpu = toolCost.cpu {
+            // The split, for when the total is worth looking into.
+            cell.toolTip = String(format: "Status line redraws %.1f%%, app and its snapshots %.1f%%", cpu.redraws, cpu.app)
+        } else if key == "cpu" {
+            cell.toolTip = "Shown after the app has run for 30 seconds"
+        }
+        cell.setAccessibilityLabel(key == "cwd" ? "This tool's own cost" : text + (cell.toolTip.map { ", \($0)" } ?? ""))
+        return cell
+    }
+
+    /// A selection belongs to a session, not to a row number: new data or a new
+    /// sort moves rows, and the selected session keeps its highlight wherever it
+    /// lands. Gone from the list, nothing stays selected.
+    private func select(_ id: String?) {
+        guard let id = id, let row = rows.firstIndex(where: { $0.session.summary.session_id == id }) else {
+            table.deselectAll(nil)
+            return
+        }
+        if table.selectedRow != row + 1 {
+            table.selectRowIndexes(IndexSet(integer: row + 1), byExtendingSelection: false)
+        }
+    }
+
+    /// The contents each cell was last drawn with, and the rows they belong to.
+    private var drawnIds: [String] = []
+    private var drawn: [[String: CellContent]] = []
+
+    private func shownContent(_ key: String, row: Int) -> CellContent {
+        if row < drawn.count, let c = drawn[row][key] { return c }
+        return content(key, row: row)
+    }
+
+    /// Rebuilds only the cells whose contents changed while the rows stay the
+    /// same sessions in the same order; anything else redraws the table. Most
+    /// refreshes are one session's redraw, and every cell is a stack of views.
+    private func refreshTable(full: Bool = false) {
+        let keys = table.tableColumns.map { $0.identifier.rawValue }
+        let ids = rows.map { "\($0.session.summary.session_id ?? "")\($0.past ? "~" : "")" }
+        let next = rows.indices.map { row in
+            Dictionary(uniqueKeysWithValues: keys.map { ($0, content($0, row: row)) })
+        }
+        let same = !full && ids == drawnIds
+        let previous = drawn
+        drawn = next
+        drawnIds = ids
+        guard same else {
+            table.reloadData()
+            return
+        }
+        for row in rows.indices {
+            let changed = IndexSet(keys.indices.filter { next[row][keys[$0]] != previous[row][keys[$0]] })
+            if !changed.isEmpty { table.reloadData(forRowIndexes: IndexSet(integer: row + 1), columnIndexes: changed) }
+        }
     }
 
     // MARK: Watching
@@ -717,11 +1614,18 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     // MARK: Grid
 
-    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+    // Row 0 is the tool's own row; session i is table row i + 1.
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count + 1 }
+
+    /// One line, not two: it is a footnote to the sessions, not one of them.
+    private static let toolRowHeight: CGFloat = 22
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        tableView.rowHeight + (isBoundary(row) ? SessionRowView.boundaryPadding : 0)
+        if row == 0 { return Self.toolRowHeight }
+        return tableView.rowHeight + (isBoundary(row - 1) ? SessionRowView.boundaryPadding : 0)
     }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { row > 0 }
 
     /// The first finished row: the live sessions end above it.
     private func isBoundary(_ row: Int) -> Bool {
@@ -732,13 +1636,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let view = SessionRowView()
         // Live sessions always sort above finished ones; the line says where
         // that boundary is without spending a row on a heading.
-        view.drawsBoundary = isBoundary(row)
+        view.drawsBoundary = row > 0 && isBoundary(row - 1)
         return view
     }
 
     /// What ⌘C and ⌘↩ act on, and what a click selects.
     private var selected: (session: Session, past: Bool)? {
-        let row = table.selectedRow
+        let row = table.selectedRow - 1
         return row >= 0 && row < rows.count ? rows[row] : nil
     }
 
@@ -747,6 +1651,18 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(id, forType: .string)
         note("Copied \(id)")
+    }
+
+    /// The columns that say which session a row is: a double-click on them goes
+    /// to its terminal. The figures to the right stay inert.
+    private static let terminalColumns: Set<String> = ["age", "cwd", "topic", "state", "cache", "heat"]
+
+    @objc func showClickedTerminal() {
+        let column = table.clickedColumn
+        guard column >= 0, Self.terminalColumns.contains(table.tableColumns[column].identifier.rawValue) else { return }
+        let row = table.clickedRow - 1
+        guard row >= 0, row < rows.count, !rows[row].past, let tty = rows[row].session.tty else { return }
+        focusTerminal(tty: tty)
     }
 
     @objc func showSelectedTerminal() {
@@ -765,8 +1681,18 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard let key = tableColumn?.identifier.rawValue, row < rows.count else { return nil }
+    /// Everything one cell shows. Two cells with equal contents draw the same,
+    /// so a refresh rebuilds only the cells whose contents changed.
+    struct CellContent: Equatable {
+        var text: NSAttributedString
+        var heat: NSColor?
+        var percent: Double?
+        var past: Bool
+        var drop: CGFloat
+        var alignment: NSTextAlignment
+    }
+
+    private func content(_ key: String, row: Int) -> CellContent {
         let (session, past) = rows[row]
         // The boundary row is taller; its content sits below the line, not
         // centred across it.
@@ -777,18 +1703,67 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // Every cell is a stack: the status line's own drawing on top, the value
         // spelled out underneath.
         let top: NSAttributedString
-        let bottom: String
+        var bottom: String
         // A background tint for the columns where the number is a temperature.
         var heat: NSColor? = nil
+        var captionColour = Palette.dim
+        // A stretch of the caption drawn in yellow: the part that needs attention.
+        var highlight: NSRange? = nil
+        var captionIndent: CGFloat = 0
         switch key {
         case "topic":
             // The dot leads the topic: the two together say what the session is
             // doing and how alive it is.
             let dot = mono(past ? "○  " : "●  ", dotColour(session, past: past))
+            // The caption lines up with the topic, not with the dot before it.
+            captionIndent = ceil(dot.size().width)
             let title = NSMutableAttributedString(attributedString: dot)
             title.append(prose(s.topic ?? "—", (s.topic_is_new ?? false) ? Palette.yellow : Palette.text))
             top = title
-            bottom = s.session_id ?? ""
+            // Claude Code's own name for the session, under the topic ours derives.
+            bottom = s.session_name ?? ""
+        case "state":
+            let (word, colour) = stateWords(session, past: past)
+            // The state and the permission mode share the top line; under them,
+            // a background agent still out. Your turn and a pending agent are
+            // both true at once: the session picks up again when it reports back.
+            let line = NSMutableAttributedString(attributedString: prose(word, colour))
+            if let mode = session.transcript?.mode { line.append(prose(" · \(mode)", Palette.dim)) }
+            top = line
+            bottom = ""
+            if !past, let running = session.transcript?.agents?.running, running > 0 {
+                bottom = "waiting on \(running == 1 ? "1 agent" : "\(running) agents")"
+                captionColour = Palette.text
+            }
+        case "tokens":
+            top = mono(session.transcript?.tokens.map { tokens($0.total) } ?? "—", Palette.text)
+            bottom = s.lines.map { "+\(Int($0.added)) −\(Int($0.removed))" } ?? ""
+        case "memory", "cpu":
+            if let pid = session.pid, !past, let load = loads[pid] {
+                if key == "memory" {
+                    top = mono(bytes(load.footprint), Palette.text)
+                    bottom = load.processes > 1 ? "+\(load.processes - 1) procs" : ""
+                } else {
+                    // Now on top, as it is what moves; the lifetime total under it.
+                    top = mono(load.cpuPercent.map { String(format: "%.0f%%", $0) } ?? "…", Palette.text)
+                    bottom = cpuTime(load.cpuSeconds)
+                }
+            } else {
+                top = mono("—", Palette.dim)
+                bottom = ""
+            }
+        case "sound":
+            // Whether this session sounds: the global switch unless overridden.
+            if past || s.session_id == nil {
+                top = NSAttributedString(string: "")
+            } else {
+                switch events.override(for: s.session_id!) {
+                case .some(true): top = prose("on", Palette.text)
+                case .some(false): top = prose("muted", Palette.yellow)
+                case .none: top = prose(events.current.enabled ? "default" : "default off", Palette.dim)
+                }
+            }
+            bottom = ""
         case "cwd":
             top = prose(s.cwd ?? "—", Palette.text)
             bottom = session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
@@ -797,15 +1772,30 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             bottom = gitWords(s.git)
         case "model":
             top = drawn(seg.model)
-            bottom = s.model ?? ""
+            bottom = (s.model ?? "") + ((s.fast_mode ?? false) ? " fast" : "")
         case "effort":
             top = drawn(seg.effort)
             bottom = s.effort ?? ""
         case "started":
             top = drawn(seg.started)
-            bottom = s.started_at.map { "\(ago($0)) ago" } ?? ""
+            let age = s.started_at.map { "\(ago($0)) ago" } ?? ""
+            bottom = age
+            // A session started before an update keeps running the old version,
+            // named first and set against the latest in the row above. Only the
+            // parts that differ are yellow: 2.1.270 against 2.1.271 marks the
+            // 270, against 2.2.0 the 1.270.
+            if !past, let v = s.version, let reference = latest.version ?? newestVersion, versionOrder(v, reference) {
+                let mine = v.split(separator: ".").map(String.init)
+                let theirs = reference.split(separator: ".").map(String.init)
+                let same = zip(mine, theirs).prefix { $0 == $1 }.count
+                let kept = "v" + mine.prefix(same).map { $0 + "." }.joined()
+                let changed = mine.dropFirst(same).joined(separator: ".")
+                bottom = kept + changed + (age.isEmpty ? "" : " · " + age)
+                highlight = NSRange(location: (kept as NSString).length, length: (changed as NSString).length)
+            }
         case "context":
-            return progressCell(s.context, past: past, drop: drop)
+            return CellContent(
+                text: NSAttributedString(), heat: nil, percent: s.context, past: past, drop: drop, alignment: .left)
         case "heat":
             // A stripe beside the cache, not a wash behind it: the colour is a
             // scale to read along, and a tinted cell fights the text in it.
@@ -821,10 +1811,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                     .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
                     .foregroundColor: Palette.text,
                 ])
-            bottom = ""
+            bottom = cacheRecord(s.cache)
         case "age":
             top = mono("\(ago(session.active_at ?? session.updated_at)) ago", Palette.dim)
-            bottom = ""
+            // Enough of the id to tell sessions apart; a click copies all of it.
+            bottom = s.session_id.map { String($0.prefix(8)) } ?? ""
         default:
             top = NSAttributedString(string: "")
             bottom = ""
@@ -835,36 +1826,68 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // yellow so the choice can still be checked; the captions join in.
         let pending = s.context == nil && !past && (key == "model" || key == "effort")
         if !bottom.isEmpty {
-            // The session id is meant to be copied into `claude --resume`, so it
-            // is monospaced and never shortened.
             // Numbers in a column should line up: tabular figures, and the
             // session id monospaced because it is copied, not read.
             let font: NSFont =
-                key == "topic"
+                key == "age"
                 ? NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-                : NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+                : key == "topic"
+                    ? NSFont.systemFont(ofSize: 11)
+                    : NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
             stack.append(
                 NSAttributedString(
                     string: "\n" + bottom,
                     attributes: [
                         .font: font,
                         .foregroundColor: pending
-                            ? Palette.yellow : past ? Palette.dim.withAlphaComponent(0.8) : Palette.dim,
+                            ? Palette.yellow
+                            : past ? Palette.dim.withAlphaComponent(0.8) : captionColour,
                     ]))
+            if captionIndent > 0 {
+                let style = NSMutableParagraphStyle()
+                style.firstLineHeadIndent = captionIndent
+                style.headIndent = captionIndent
+                style.lineBreakMode = .byTruncatingTail
+                stack.addAttribute(
+                    .paragraphStyle, value: style,
+                    range: NSRange(location: stack.length - (bottom as NSString).length, length: (bottom as NSString).length))
+            }
+            if let range = highlight {
+                // The caption starts after the top line and its newline.
+                let start = stack.length - (bottom as NSString).length
+                stack.addAttribute(
+                    .foregroundColor, value: Palette.yellow,
+                    range: NSRange(location: start + range.location, length: range.length))
+            }
         }
 
         // Model and effort are shapes rather than sentences; the model ends at
         // the gap and the effort starts there, so the pair reads together.
         let alignment: NSTextAlignment =
-            (key == "model" || key == "cache" || key == "age") ? .right : .left
+            ["model", "cache", "age", "tokens", "memory", "cpu"].contains(key) ? .right : .left
         if alignment != .left {
             let style = NSMutableParagraphStyle()
             style.alignment = alignment
             stack.addAttribute(
                 .paragraphStyle, value: style, range: NSRange(location: 0, length: stack.length))
         }
+        return CellContent(text: stack, heat: heat, percent: nil, past: past, drop: drop, alignment: alignment)
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let key = tableColumn?.identifier.rawValue else { return nil }
+        if row == 0 { return toolCell(key) }
+        let row = row - 1
+        guard row < rows.count else { return nil }
+        let (session, past) = rows[row]
+        let s = session.summary
+        let c = shownContent(key, row: row)
+        let drop = c.drop
+        if key == "context" { return progressCell(c.percent, past: past, drop: drop) }
+        let heat = c.heat
+        let alignment = c.alignment
         let field = NSTextField(labelWithString: "")
-        field.attributedStringValue = stack
+        field.attributedStringValue = c.text
         // Selectable text steals the click and re-styles itself when focused, so
         // the cells act on a click instead of letting text be dragged over.
         field.isSelectable = false
@@ -892,20 +1915,52 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // VoiceOver reads the cell, not the two lines inside it, so each one
         // says what it holds and what clicking it does.
         cell.setAccessibilityLabel(accessibilityText(key: key, session: session, past: past))
-        if key == "topic", let id = s.session_id {
-            field.toolTip = [s.topic, id, "Click to copy the session id"].compactMap { $0 }.joined(
-                separator: "\n")
+        if key == "tokens", let t = session.transcript?.tokens {
+            field.toolTip =
+                "Tokens this session has sent and received, subagents not included:\n"
+                + "input \(tokens(t.input)) · cache write \(tokens(t.cache_write)) · "
+                + "cache read \(tokens(t.cache_read)) · output \(tokens(t.output))\n"
+                + "Lines added and removed, as Claude Code counts them."
+        } else if key == "cache", let causes = s.cache?.last_miss_causes, !causes.isEmpty {
+            field.toolTip = "Last went cold: \(causes.joined(separator: ", "))"
+        } else if key == "memory", let pid = session.pid, loads[pid] != nil {
+            field.toolTip = "Memory of Claude Code (pid \(pid)) and every process under it, compressed pages included"
+        } else if key == "cpu", session.pid != nil {
+            field.toolTip = "CPU now as a share of one core, for Claude Code and every process under it; "
+                + "under it, the CPU time Claude Code's own process has used since it started"
+        }
+        if key == "sound", !past, let id = s.session_id {
+            field.toolTip = "Click to cycle: default (follows the Sounds switch) → on → muted"
+            cell.onClick = { [weak self] in
+                guard let self = self else { return }
+                let next: Bool? = {
+                    switch self.events.override(for: id) {
+                    case .none: return true
+                    case .some(true): return false
+                    case .some(false): return nil
+                    }
+                }()
+                self.events.setOverride(next, for: id)
+                self.refreshTable()
+            }
+        }
+        if key == "age", let id = s.session_id {
+            field.toolTip = [id, "Click to copy the session id", "Double-click to show its terminal"].joined(separator: "\n")
             cell.onClick = { [weak self, weak cell] in
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(id, forType: .string)
                 cell?.flash()
                 self?.note("Copied \(id)")
             }
+            if !past, let tty = session.tty { cell.onDoubleClick = { focusTerminal(tty: tty) } }
         } else if key == "cwd", let tty = session.tty, !past {
             // The directory cell names the terminal under it; clicking goes there.
             field.toolTip = "Show \(tty) in iTerm"
             cell.onClick = { focusTerminal(tty: tty) }
         }
+        // On the cell as well as the text: the text is only as tall as its
+        // lines, and a hover below them would find no tooltip.
+        cell.toolTip = field.toolTip
         cell.addSubview(field)
         NSLayoutConstraint.activate([
             field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: key == "effort" ? 3 : 4),
@@ -942,69 +1997,157 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         let five = source { $0.summary.five_hour }
         let seven = source { $0.summary.seven_day }
-        let fable = source { $0.summary.fable }
-        quotaBar.addArrangedSubview(quotaItem("5-hour quota", five, five?.summary.five_hour))
-        quotaBar.addArrangedSubview(quotaItem("7-day quota", seven, seven?.summary.seven_day))
-        quotaBar.addArrangedSubview(quotaItem("Fable quota", fable, fable?.summary.fable))
+        let hour: Double = 3600
+        quotaBar.addArrangedSubview(
+            quotaItem("5-hour quota", readAt: five?.updated_at, five?.summary.five_hour, window: 5 * hour))
+        quotaBar.addArrangedSubview(
+            quotaItem("7-day quota", readAt: seven?.updated_at, seven?.summary.seven_day, window: 168 * hour))
+        // Fable comes from the account's own reading, not from a session: only a
+        // session running Fable reports it, and the quota matters without one.
+        let fable = snapshot.fable.map { Limit(percent: $0.percent, resets_at: $0.resets_at) }
+        quotaBar.addArrangedSubview(
+            quotaItem("Fable quota", readAt: snapshot.fable?.read_at, fable, window: 168 * hour))
     }
 
     /// One quota: its name, a drawn bar, the share, and when it comes back. The
-    /// colours are the status line's own thresholds.
-    private func quotaItem(_ title: String, _ source: Session?, _ limit: Limit?) -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
+    /// colours are the status line's own thresholds. Under it, dimmed, the pace
+    /// row: how much of the window's time has gone, drawn on the same scale, and
+    /// where spending at this rate would end up by the reset. Level bars mean an
+    /// even pace; a used bar ahead of its ghost runs out early.
+    private func quotaItem(_ title: String, readAt: Double?, _ limit: Limit?, window: Double) -> NSView {
+        let grid = NSGridView()
+        grid.rowSpacing = 4
+        grid.columnSpacing = 8
+        grid.yPlacement = .center
 
-        let name = NSTextField(labelWithString: title)
-        name.font = NSFont.systemFont(ofSize: 12)
-        name.textColor = Palette.dim
-        row.addArrangedSubview(name)
+        func label(_ text: String, _ colour: NSColor, _ font: NSFont) -> NSTextField {
+            let field = NSTextField(labelWithString: text)
+            field.font = font
+            field.textColor = colour
+            return field
+        }
+        func bar(_ fraction: Double, _ colour: NSColor) -> BarView {
+            let view = BarView()
+            view.fraction = fraction
+            view.colour = colour
+            view.divisions = Int((window / (window < 86400 ? 3600 : 86400)).rounded())
+            view.translatesAutoresizingMaskIntoConstraints = false
+            view.widthAnchor.constraint(equalToConstant: 96).isActive = true
+            view.heightAnchor.constraint(equalToConstant: 12).isActive = true
+            return view
+        }
+        let name = label(title, Palette.dim, NSFont.systemFont(ofSize: 12))
+        let small = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
 
-        guard let limit = limit, let percent = limit.percent, let source = source else {
-            let none = NSTextField(labelWithString: "—")
-            none.font = barFont
-            none.textColor = Palette.dim
-            row.addArrangedSubview(none)
-            return row
+        guard let limit = limit, let percent = limit.percent, let readAt = readAt else {
+            // The same row as a reading, with the bar kept invisible, so the
+            // name lines up with its neighbours' names.
+            let placeholder = bar(0, .clear)
+            placeholder.divisions = 0
+            placeholder.alphaValue = 0
+            // A blank line where the others say which hour or day it is.
+            grid.addRow(with: [NSView(), label(" ", Palette.dim, small)])
+            grid.addRow(with: [
+                name, placeholder,
+                label("—", Palette.dim, NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)),
+            ])
+            // And one where the pace row goes: every quota is three rows tall,
+            // so the names stay on one line whichever way the bar aligns them.
+            grid.addRow(with: [NSView(), label(" ", Palette.dim, small)])
+            return grid
         }
 
         let colour = Palette.threshold(percent)
-        let bar = BarView()
-        bar.fraction = percent / 100
-        bar.colour = colour
-        bar.translatesAutoresizingMaskIntoConstraints = false
-        bar.widthAnchor.constraint(equalToConstant: 96).isActive = true
-        bar.heightAnchor.constraint(equalToConstant: 12).isActive = true
-        row.addArrangedSubview(bar)
-
-        let share = NSTextField(labelWithString: "\(Int(percent.rounded()))%")
-        share.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        share.textColor = colour
-        row.addArrangedSubview(share)
-
+        let share = label(
+            "\(Int(percent.rounded()))%", colour, NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium))
         // A reading only changes when a session redraws, so an old one is still
         // the truth — as long as the bar says how old it is.
-        let age = Date().timeIntervalSince1970 - source.updated_at / 1000
+        let age = Date().timeIntervalSince1970 - readAt / 1000
         var caption = limitWords(limit)
         if age > 120 {
             caption += caption.isEmpty ? "" : " · "
-            caption += "read \(ago(source.updated_at)) ago"
+            caption += "read \(ago(readAt)) ago"
         }
-        if !caption.isEmpty {
-            let note = NSTextField(labelWithString: caption)
-            note.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-            note.textColor = age > 1800 ? Palette.yellow : Palette.dim
-            row.addArrangedSubview(note)
+        let note = label(caption, age > 1800 ? Palette.yellow : Palette.dim, small)
+        // Which hour of the five, or which day of the seven, the window is in:
+        // 2.6 hours to the reset is 2.4 gone, so hour 3.
+        let unit: Double = window < 86400 ? 3600 : 86400
+        let units = Int((window / unit).rounded())
+        var position = " "
+        var marked: Int? = nil
+        if let resets = limit.resets_at {
+            let gone = window - (resets / 1000 - Date().timeIntervalSince1970)
+            let current = min(units, max(1, Int(gone / unit) + 1))
+            position = "\(unit == 3600 ? "hour" : "day") \(current) of \(units)"
+            // Where this hour or day ends; on the last one the bar's end is it.
+            if current < units { marked = current }
         }
-        return row
+        grid.addRow(with: [NSView(), label(position, Palette.dim, small)])
+        grid.addRow(with: [name, bar(percent / 100, colour), share, note])
+
+        // The pace row needs to know where in the window we are, which only the
+        // reset time says.
+        guard let resets = limit.resets_at else { return grid }
+        let left = resets / 1000 - Date().timeIntervalSince1970
+        let elapsed = max(0, min(1, 1 - left / window))
+        let ghost = Palette.dim.withAlphaComponent(0.55)
+        var projection = ""
+        var projectionColour = ghost
+        // Too early in the window, a rate is mostly noise: a single prompt a
+        // minute after the reset would read as a runaway pace.
+        if elapsed >= 0.02 {
+            let pace = percent / elapsed
+            projection = "on pace for \(Int(pace.rounded()))%"
+            if pace >= 100 {
+                projectionColour = Palette.red.withAlphaComponent(0.75)
+            } else if pace >= 85 {
+                projectionColour = Palette.yellow.withAlphaComponent(0.75)
+            }
+        }
+        let elapsedText = String(format: "%.0f%%", elapsed * 100)
+        let paceBar = bar(elapsed, ghost)
+        paceBar.markedTick = marked
+        grid.addRow(with: [
+            label("pace target", ghost, NSFont.systemFont(ofSize: 11)), paceBar,
+            label(elapsedText, ghost, small), label(projection, projectionColour, small),
+        ])
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 2).xPlacement = .trailing
+        return grid
     }
 
     // MARK: Sorting
 
+    /// The cache column sorts three ways, in turn on each click of its header:
+    /// warm soonest-to-expire first with cold last — the caches about to be
+    /// lost, in the order they go — then by time left rising (cold first), then
+    /// falling.
+    private enum CacheOrder { case rising, falling, soonest }
+    private var cacheOrder = CacheOrder.soonest
+    private var settingSort = false
+
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange old: [NSSortDescriptor]) {
+        guard !settingSort else { return }
+        let isCache = { (key: String?) in key == "cache" || key == "heat" }
+        if let key = tableView.sortDescriptors.first?.key, isCache(key) {
+            // AppKit only flips ascending; the third order is ours to add.
+            if isCache(old.first?.key) {
+                cacheOrder = cacheOrder == .soonest ? .rising : cacheOrder == .rising ? .falling : .soonest
+            } else {
+                cacheOrder = .soonest
+            }
+            settingSort = true
+            tableView.sortDescriptors = [NSSortDescriptor(key: key, ascending: cacheOrder != .falling)]
+            settingSort = false
+        } else {
+            cacheOrder = .soonest
+        }
+        tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("cache"))?.title =
+            isCache(tableView.sortDescriptors.first?.key) && cacheOrder == .soonest ? "Cache · soonest" : "Cache"
+        let keep = selected?.session.summary.session_id
         sortRows()
-        tableView.reloadData()
+        refreshTable(full: true)
+        select(keep)
     }
 
     /// Each column sorts by its meaning: a model by how capable it is, an effort
@@ -1026,8 +2169,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             case "context": return (s.context ?? -1, "")
             // The stripe and the cache column show the same thing, so they sort
             // the same way: by how much cache life is left, cold last.
-            case "cache", "heat": return (cacheLeft(s.cache), "")
+            case "cache", "heat":
+                let left = cacheLeft(s.cache)
+                return (cacheOrder == .soonest && left < 0 ? .greatestFiniteMagnitude : left, "")
             case "age": return (entry.session.active_at ?? entry.session.updated_at, "")
+            case "state": return (0, stateWords(entry.session, past: entry.past).0)
+            case "tokens": return (entry.session.transcript?.tokens?.total ?? -1, "")
+            case "memory":
+                return (entry.session.pid.flatMap { loads[$0] }.map { Double($0.footprint) } ?? -1, "")
+            case "cpu":
+                return (entry.session.pid.flatMap { loads[$0]?.cpuPercent } ?? -1, "")
             default: return (0, "")
             }
         }
@@ -1038,7 +2189,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let (bn, bt) = rank(b)
             if an != bn { return ascending ? an < bn : an > bn }
             if at != bt { return ascending ? at < bt : at > bt }
-            return a.session.updated_at > b.session.updated_at
+            // Ties go to the most recently active: every open session redraws
+            // on a timer, so the redraw time would order them by nothing.
+            return (a.session.active_at ?? a.session.updated_at) > (b.session.active_at ?? b.session.updated_at)
         }
     }
 
@@ -1067,7 +2220,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// Seconds of cache life left; a cold cache has none.
     private func cacheLeft(_ cache: CacheState?) -> Double {
         guard let cache = cache, cache.warm, let expires = cache.expires_at else { return -1 }
-        return max(0, expires / 1000 - Date().timeIntervalSince1970)
+        // Past its expiry it is cold, as the cell already says, whatever the
+        // flag from the last redraw.
+        let left = expires / 1000 - Date().timeIntervalSince1970
+        return left > 0 ? left : -1
     }
 
     /// "▓▓▓░░ 52%": the bar, then the number it stands for.
@@ -1125,7 +2281,21 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let age = "\(ago(session.active_at ?? session.updated_at)) ago"
         switch key {
         case "topic":
-            return "\(past ? "Finished" : "Live") session, \(s.topic ?? "no topic"). Click to copy its id."
+            return "\(past ? "Finished" : "Live") session, \(s.topic ?? "no topic")"
+                + (s.session_name.map { ", named \($0)" } ?? "")
+        case "state":
+            let caption = stateCaption(session.transcript)
+            return "State \(stateWords(session, past: past).0)" + (caption.isEmpty ? "" : ", \(caption)")
+        case "tokens":
+            return "Tokens \(session.transcript?.tokens.map { tokens($0.total) } ?? "unknown")"
+                + (s.lines.map { ", \(Int($0.added)) lines added, \(Int($0.removed)) removed" } ?? "")
+        case "memory":
+            guard let pid = session.pid, let load = loads[pid] else { return "Memory unknown" }
+            return "Memory \(bytes(load.footprint))"
+        case "cpu":
+            guard let pid = session.pid, let load = loads[pid] else { return "CPU unknown" }
+            return "CPU " + (load.cpuPercent.map { String(format: "%.0f percent", $0) } ?? "not yet measured")
+                + ", \(cpuTime(load.cpuSeconds)) in total"
         case "cwd":
             return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? ""). "
                 + "Click to show that terminal."
@@ -1138,7 +2308,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return "Context window \(s.context.map { "\(Int($0.rounded())) percent used" } ?? "unknown")"
         case "cache": return "Prompt cache, \(cacheWords(s.cache))"
         case "heat": return ""
-        case "age": return "Last seen \(age)"
+        case "age": return "Last seen \(age). Click to copy the session id."
+        case "sound":
+            guard !past, let id = s.session_id else { return "" }
+            let state = events.override(for: id).map { $0 ? "on" : "muted" } ?? "following the Sounds switch"
+            return "Sound \(state). Click to change."
         default: return ""
         }
     }
@@ -1212,6 +2386,65 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         guard let expires = cache.expires_at else { return "warm" }
         return "\(until(expires)) left"
+    }
+
+    /// What the session is doing, from your side: what needs you is in yellow,
+    /// what is in progress is faint. A running tool may be a permission prompt
+    /// the transcript cannot see, so it says how long it has been at it.
+    private func stateWords(_ session: Session, past: Bool) -> (String, NSColor) {
+        guard !past else { return ("ended", Palette.dim) }
+        guard let t = session.transcript, let state = t.state else { return ("—", Palette.dim) }
+        let since = t.state_at.map { " \(ago($0))" } ?? ""
+        switch state {
+        case "idle": return ("your turn", Palette.text)
+        case "asking": return (t.tool == "ExitPlanMode" ? "plan" : "question", Palette.yellow)
+        case "tool":
+            // The permission came after the tool call, and nothing has started
+            // since: the prompt is still open.
+            if let id = session.summary.session_id, let asked = events.permissionAt[id],
+                asked >= (t.state_at ?? 0) / 1000,
+                (session.pid.flatMap { loads[$0]?.newestChild } ?? 0) < asked
+            {
+                return ("approve?", Palette.yellow)
+            }
+            return ((t.tool ?? "tool") + since, Palette.dim)
+        case "thinking": return ("working", Palette.dim)
+        case "interrupted": return ("stopped", Palette.text)
+        default: return (state, Palette.dim)
+        }
+    }
+
+    /// The permission mode, then any background subagents still running.
+    private func stateCaption(_ t: TranscriptState?) -> String {
+        guard let t = t else { return "" }
+        var parts: [String] = []
+        if let mode = t.mode { parts.append(mode) }
+        if let running = t.agents?.running, running > 0 {
+            parts.append(running == 1 ? "1 agent" : "\(running) agents")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// How well the cache has served the session: its hit rate and misses.
+    private func cacheRecord(_ cache: CacheState?) -> String {
+        guard let c = cache, let ratio = c.hit_ratio else { return "" }
+        let misses = Int(c.misses ?? 0)
+        return "\(Int((ratio * 100).rounded()))% hit · \(misses) \(misses == 1 ? "miss" : "misses")"
+    }
+
+    /// The newest Claude Code version any live session runs.
+    private var newestVersion: String? {
+        rows.filter { !$0.past }.compactMap { $0.session.summary.version }.max { versionOrder($0, $1) }
+    }
+
+    /// True when a is an older version than b: 2.1.9 before 2.1.10.
+    private func versionOrder(_ a: String, _ b: String) -> Bool {
+        let (x, y) = (a.split(separator: ".").map { Int($0) ?? 0 }, b.split(separator: ".").map { Int($0) ?? 0 })
+        for i in 0..<max(x.count, y.count) {
+            let (p, q) = (i < x.count ? x[i] : 0, i < y.count ? y[i] : 0)
+            if p != q { return p < q }
+        }
+        return false
     }
 
     /// The branch symbols spelled out: what ⇡1 ~ * actually stand for.
