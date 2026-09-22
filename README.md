@@ -46,7 +46,7 @@ Five columns come from outside the status line input:
 | Column | Top line | Under it | Source |
 |---|---|---|---|
 | State | `your turn`, `question`, `plan`, `approve?`, a running tool with its time (`Bash 3m`), `working`, or `stopped`, then the permission mode (`· auto`) | `waiting on 1 agent` while background subagents are still out: your turn and a pending agent are both true at once | The session's transcript, and the event hook for `approve?` |
-| Sound | `default` (follows the Sounds switch at the top right), `on` or `muted`; a click cycles them | — | The app's `sounds.json` |
+| Sound | A speaker glyph: faint while it follows the Sounds switch at the top right, bright when forced on, a yellow muted speaker when muted; a click cycles them | — | The app's `sounds.json` |
 | Tokens | Tokens the session has sent and received, subagents excluded | Lines added and removed, as Claude Code counts them (files written from the shell included) | The transcript; the lines from the status line input |
 | Memory | Memory of the Claude Code process and every process under it, compressed pages included | How many processes are under it | The kernel, read by the app (`proc_pid_rusage`) |
 | CPU | CPU now as a share of one core, for the same processes | The CPU time the Claude Code process has used since it started | The kernel, as above |

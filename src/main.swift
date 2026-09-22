@@ -1279,7 +1279,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         Column(key: "model", title: "Model", width: 58),
         Column(key: "effort", title: "Effort", width: 60),
         Column(key: "context", title: "Context", width: 82),
-        Column(key: "sound", title: "Sound", width: 60),
+        Column(key: "sound", title: "Sound", width: 46),
         Column(key: "cache", title: "Cache", width: 140),
         Column(key: "heat", title: "", width: 10),
         Column(key: "tokens", title: "Tokens", width: 88),
@@ -1298,7 +1298,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // A header follows its cells, or the two disagree. Model and effort
             // face each other across the gap, so the pair reads as one unit.
             switch spec.key {
-            case "context": column.headerCell.alignment = .center
+            case "context", "sound": column.headerCell.alignment = .center
             case "age": column.headerCell.alignment = .right
             case "model", "cache", "tokens", "memory", "cpu": column.headerCell.alignment = .right
             case "effort": column.headerCell.alignment = .left
@@ -1350,8 +1350,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         packMenu.target = self
         packMenu.action = #selector(packChosen)
         packMenu.setAccessibilityLabel("Sound pack")
-        let top = NSStackView(views: [title, soundSwitch, volumeSlider, packMenu])
+        // The pack menu sits at the right edge, over the end of the checkbox
+        // row; the gap before it takes up the difference.
+        let gap = NSView()
+        gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let top = NSStackView(views: [title, soundSwitch, volumeSlider, gap, packMenu])
         top.spacing = 8
+        top.distribution = .fill
 
         eventBoxes = Self.soundEvents.map { event in
             let box = NSButton(checkboxWithTitle: event.title, target: self, action: #selector(eventToggled))
@@ -1382,6 +1387,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         updatePreviewButtons()
         soundBar.addArrangedSubview(top)
         soundBar.addArrangedSubview(boxes)
+        top.widthAnchor.constraint(equalTo: boxes.widthAnchor).isActive = true
     }
 
     @objc private func soundSwitched() {
@@ -1757,10 +1763,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             if past || s.session_id == nil {
                 top = NSAttributedString(string: "")
             } else {
+                // One glyph (Nerd Font speakers): faint while it follows the
+                // switch, bright when forced on, yellow when muted.
+                let speaker = "\u{F057E}", silent = "\u{F0581}"
                 switch events.override(for: s.session_id!) {
-                case .some(true): top = prose("on", Palette.text)
-                case .some(false): top = prose("muted", Palette.yellow)
-                case .none: top = prose(events.current.enabled ? "default" : "default off", Palette.dim)
+                case .some(true): top = mono(speaker, Palette.text)
+                case .some(false): top = mono(silent, Palette.yellow)
+                case .none: top = mono(events.current.enabled ? speaker : silent, Palette.dim)
                 }
             }
             bottom = ""
@@ -1864,7 +1873,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // Model and effort are shapes rather than sentences; the model ends at
         // the gap and the effort starts there, so the pair reads together.
         let alignment: NSTextAlignment =
-            ["model", "cache", "age", "tokens", "memory", "cpu"].contains(key) ? .right : .left
+            key == "sound"
+            ? .center : ["model", "cache", "age", "tokens", "memory", "cpu"].contains(key) ? .right : .left
         if alignment != .left {
             let style = NSMutableParagraphStyle()
             style.alignment = alignment
@@ -1930,7 +1940,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 + "under it, the CPU time Claude Code's own process has used since it started"
         }
         if key == "sound", !past, let id = s.session_id {
-            field.toolTip = "Click to cycle: default (follows the Sounds switch) → on → muted"
+            field.toolTip = [
+                "Sound: " + (events.override(for: id).map { $0 ? "on for this session" : "muted for this session" }
+                    ?? "follows the Sounds switch"),
+                "Click to cycle: follow the switch → on → muted",
+            ].joined(separator: "\n")
             cell.onClick = { [weak self] in
                 guard let self = self else { return }
                 let next: Bool? = {
