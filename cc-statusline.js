@@ -1,5 +1,10 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S -u NODE_USE_ENV_PROXY node
 'use strict';
+
+// Started without NODE_USE_ENV_PROXY: it makes node load its proxy machinery at
+// startup, doubling the cost of a launch (~30 ms of CPU to ~60), and a redraw
+// never goes on the web. The processes that do are started with it put back —
+// see networkEnv — so their requests still go through the proxy.
 
 const { execFileSync, spawn } = require('child_process');
 const {
@@ -279,6 +284,14 @@ function checkInput(input) {
   );
 }
 
+// The environment for a child that makes web requests: this process was started
+// without NODE_USE_ENV_PROXY, and a request should honour the proxy the session
+// was given, not skip it.
+function networkEnv() {
+  const proxied = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+  return proxied ? { ...process.env, NODE_USE_ENV_PROXY: '1' } : process.env;
+}
+
 // Takes the refresh lock, clearing one left behind by a refresh that died.
 function takeLock() {
   try {
@@ -303,7 +316,7 @@ function maybeRefreshUsage(cached, sevenPct) {
   try {
     const args = [__filename, '--refresh-usage'];
     if (sevenPct != null) args.push(String(sevenPct));
-    spawn(process.execPath, args, { detached: true, stdio: 'ignore' }).unref();
+    spawn(process.execPath, args, { detached: true, stdio: 'ignore', env: networkEnv() }).unref();
   } catch (err) {
     logError(`spawn: ${err.message}`);
     try {
@@ -497,6 +510,7 @@ function maybeRefreshTopic(paths, auto, lastAt, sessionId, tty, transcriptPath) 
   }
   try {
     spawn(process.execPath, [__filename, '--refresh-topic', sessionId, transcriptPath], {
+      env: networkEnv(),
       detached: true,
       stdio: 'ignore',
     }).unref();
@@ -663,7 +677,7 @@ function runHaiku(excerpt) {
   // status line, and it keeps no transcript of its own. Claude Code's default
   // system prompt is ~6k tokens and Haiku thinks by default; both are replaced
   // or turned off, which makes a call about 1-3k input and 10 output tokens.
-  const env = { ...process.env, MAX_THINKING_TOKENS: '0' };
+  const env = { ...networkEnv(), MAX_THINKING_TOKENS: '0' };
   for (const key of Object.keys(env)) {
     if (key === 'CLAUDECODE' || key.startsWith('CLAUDE_CODE_')) delete env[key];
   }
@@ -1015,6 +1029,9 @@ function peerName(pid, sessionId) {
   }
 }
 
+// What Claude Code says about each running session, by session id: its name,
+// and its status — busy, idle, or waiting with what for (`input needed` while
+// a question is up).
 function peerNames() {
   const dir = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'sessions');
   const names = new Map();
@@ -1027,7 +1044,13 @@ function peerNames() {
   for (const name of files) {
     try {
       const entry = JSON.parse(readFileSync(join(dir, name), 'utf8'));
-      if (entry.sessionId && entry.name) names.set(entry.sessionId, entry.name);
+      if (entry.sessionId) {
+        names.set(entry.sessionId, {
+          name: entry.name || null,
+          status: entry.status || null,
+          waiting_for: entry.waitingFor || null,
+        });
+      }
     } catch {}
   }
   return names;
@@ -1088,7 +1111,12 @@ function liveSnapshot(columns) {
   const ended = entries.filter((e) => !isLive(e)).sort((a, b) => b.active_at - a.active_at);
 
   const peers = peerNames();
-  for (const e of live) e.peer_name = peers.get(e.summary.session_id) ?? null;
+  for (const e of live) {
+    const peer = peers.get(e.summary.session_id);
+    e.peer_name = peer?.name ?? null;
+    e.peer_status = peer?.status ?? null;
+    e.peer_waiting_for = peer?.status === 'waiting' ? peer.waiting_for : null;
+  }
 
   // Live sessions read what their transcripts gained; finished ones keep the
   // totals they ended with.

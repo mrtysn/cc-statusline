@@ -10,6 +10,7 @@
 // one definition of what a bar looks like, shared with the terminal.
 
 import AppKit
+import CryptoKit
 import Foundation
 
 // MARK: - Paths
@@ -162,6 +163,10 @@ struct Session: Decodable {
     let transcript: TranscriptState?
     /// The name other sessions message this one by, e.g. `finance-be`.
     let peer_name: String?
+    /// Claude Code's own word for the session: busy, idle or waiting.
+    let peer_status: String?
+    /// While waiting, what for: `input needed`, `dialog open`, …
+    let peer_waiting_for: String?
     let rows: [String]
     let summary: Summary
     let segments: Segments
@@ -581,6 +586,13 @@ final class EventCenter {
         save()
     }
 
+    /// Reads the pack again, for when its files changed under the same name.
+    func reloadPack() {
+        sounds = [:]
+        previewed = [:]
+        loadPack()
+    }
+
     /// The installed packs, by directory name.
     var packs: [String] {
         let dir = supportDir.appendingPathComponent("packs")
@@ -809,6 +821,300 @@ final class LatestVersion {
                 if let data = try? JSONEncoder().encode(self.cache) { try? data.write(to: self.file) }
             }
         }.resume()
+    }
+}
+
+// MARK: - Sound pack registry
+
+/// One pack in the openpeon registry, as far as browsing and installing needs.
+struct RegistryPack: Decodable {
+    let name: String
+    let display_name: String?
+    let description: String?
+    let language: String?
+    let sound_count: Int?
+    let total_size_bytes: Int?
+    let source_repo: String
+    let source_ref: String
+    let source_path: String?
+    let manifest_sha256: String?
+}
+
+/// Browses and installs packs from the openpeon registry, the one peon-ping's
+/// `peon packs install` uses. The index is fetched when the browser opens, at
+/// most daily, and an hour's pause follows a failure. An install fetches the
+/// manifest and each sound from the pack's GitHub repo — what peon-ping does —
+/// but also checks the sha256 the registry and the manifest publish, which
+/// peon-ping does not. It stops at the first refusal, skips ogg (macOS cannot
+/// play it), and builds the pack in a hidden directory, so a failed install
+/// leaves nothing half-made in packs/.
+final class PackStore {
+    private static let indexURL = URL(string: "https://peonping.github.io/registry/index.json")!
+    private let cache = supportDir.appendingPathComponent("registry.json")
+    private let packsDir = supportDir.appendingPathComponent("packs")
+    private var failedAt: Double = 0
+
+    /// The cached index, whatever its age.
+    var packs: [RegistryPack] {
+        struct Index: Decodable { let packs: [RegistryPack] }
+        guard let data = try? Data(contentsOf: cache) else { return [] }
+        return (try? JSONDecoder().decode(Index.self, from: data))?.packs ?? []
+    }
+
+    var installed: Set<String> {
+        Set(((try? fm.contentsOfDirectory(atPath: packsDir.path)) ?? []).filter { !$0.hasPrefix(".") })
+    }
+
+    /// Fetches the index if the cached one is a day old; calls back on the main
+    /// queue either way, with an error when there was one.
+    func refreshIndex(_ done: @escaping (String?) -> Void) {
+        let age = Date().timeIntervalSince(
+            ((try? fm.attributesOfItem(atPath: cache.path))?[.modificationDate] as? Date) ?? .distantPast)
+        let now = Date().timeIntervalSince1970
+        guard age > 86400, now - failedAt > 3600 else { return done(nil) }
+        fetch(Self.indexURL) { [weak self] data, error in
+            guard let self = self else { return }
+            let decoded = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let ok = (decoded?["packs"] as? [Any])?.isEmpty == false
+            if data != nil { checkFormat("registry/index", ok, "sound pack registry: no packs[] in its index") }
+            if let data = data, ok {
+                try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
+                try? data.write(to: self.cache, options: .atomic)
+                done(nil)
+            } else {
+                self.failedAt = now
+                done(error ?? "the registry answered in an unexpected shape")
+            }
+        }
+    }
+
+    /// Installs a pack; `progress` gets (done, total) sounds, `done` an error or nil.
+    func install(
+        _ pack: RegistryPack, progress: @escaping (Int, Int) -> Void, done: @escaping (String?) -> Void
+    ) {
+        var base = "https://raw.githubusercontent.com/\(pack.source_repo)/\(pack.source_ref)"
+        if let path = pack.source_path, !path.isEmpty, path != "." {
+            guard Self.safe(path) else { return done("unsafe source path") }
+            base += "/" + path
+        }
+        let staging = packsDir.appendingPathComponent(".\(pack.name).partial")
+        try? fm.removeItem(at: staging)
+        fetch(URL(string: base + "/openpeon.json")!) { [weak self] data, error in
+            guard let self = self else { return }
+            guard let manifest = data else { return done(error ?? "no manifest") }
+            if let expected = pack.manifest_sha256, Self.sha256(manifest) != expected.lowercased() {
+                return done("the manifest does not match the registry's checksum")
+            }
+            guard let root = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any],
+                let categories = root["categories"] as? [String: Any]
+            else { return done("the manifest has no categories") }
+            // Each sound once, as peon-ping names it: a path under sounds/ keeps
+            // its folders, anything else is its base name there.
+            var files: [(rel: String, sha: String?)] = []
+            var seen = Set<String>()
+            for case let category as [String: Any] in categories.values {
+                for case let sound as [String: Any] in (category["sounds"] as? [Any]) ?? [] {
+                    guard let file = sound["file"] as? String else { continue }
+                    let rel = file.hasPrefix("sounds/") ? String(file.dropFirst(7)) : (file as NSString).lastPathComponent
+                    guard Self.safe(rel), !rel.lowercased().hasSuffix(".ogg"), seen.insert(rel).inserted else { continue }
+                    files.append((rel, sound["sha256"] as? String))
+                }
+            }
+            guard !files.isEmpty else { return done("no sounds macOS can play") }
+            do {
+                try fm.createDirectory(at: staging.appendingPathComponent("sounds"), withIntermediateDirectories: true)
+                try manifest.write(to: staging.appendingPathComponent("openpeon.json"))
+            } catch { return done(error.localizedDescription) }
+            // One at a time: a pack is a few dozen small files, and a refusal
+            // should end it before the next request goes out.
+            func next(_ i: Int) {
+                progress(i, files.count)
+                guard i < files.count else {
+                    let target = self.packsDir.appendingPathComponent(pack.name)
+                    try? fm.removeItem(at: target)
+                    do { try fm.moveItem(at: staging, to: target) } catch { return done(error.localizedDescription) }
+                    return done(nil)
+                }
+                let (rel, sha) = files[i]
+                let encoded = rel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "?!()")))
+                guard let encoded = encoded, let url = URL(string: base + "/sounds/" + encoded) else {
+                    try? fm.removeItem(at: staging)
+                    return done("bad file name \(rel)")
+                }
+                self.fetch(url) { data, error in
+                    guard let data = data else {
+                        try? fm.removeItem(at: staging)
+                        return done("\(rel): \(error ?? "no data")")
+                    }
+                    if let sha = sha, Self.sha256(data) != sha.lowercased() {
+                        try? fm.removeItem(at: staging)
+                        return done("\(rel) does not match its checksum")
+                    }
+                    let dest = staging.appendingPathComponent("sounds").appendingPathComponent(rel)
+                    try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? data.write(to: dest)
+                    next(i + 1)
+                }
+            }
+            next(0)
+        }
+    }
+
+    private static func safe(_ name: String) -> Bool {
+        name.range(of: "^[A-Za-z0-9._?!() /-]+$", options: .regularExpression) != nil
+            && !name.contains("..") && !name.hasPrefix("/")
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// A GET whose answer arrives on the main queue: the body on a 200, else why not.
+    private func fetch(_ url: URL, _ done: @escaping (Data?, String?) -> Void) {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode
+            DispatchQueue.main.async {
+                if status == 200, let data = data { return done(data, nil) }
+                done(nil, status.map { "HTTP \($0)" } ?? error?.localizedDescription ?? "no answer")
+            }
+        }.resume()
+    }
+}
+
+/// The registry, searchable, in a window of its own: pick a pack and Install.
+final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    private let store: PackStore
+    private let onInstalled: (String) -> Void
+    private let table = NSTableView()
+    private let search = NSSearchField()
+    private let status = NSTextField(labelWithString: "")
+    private let installButton = NSButton(title: "Install", target: nil, action: nil)
+    private var shown: [RegistryPack] = []
+    private var busy = false
+
+    init(store: PackStore, onInstalled: @escaping (String) -> Void) {
+        self.store = store
+        self.onInstalled = onInstalled
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 460),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "Sound packs"
+        super.init(window: window)
+        build()
+        status.stringValue = "Loading the registry…"
+        store.refreshIndex { [weak self] error in
+            self?.filter()
+            if let error = error { self?.status.stringValue = "Registry not refreshed: \(error)" }
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        search.placeholderString = "Search name, language or description"
+        search.delegate = self
+        let columns: [(String, String, CGFloat)] = [
+            ("name", "Pack", 200), ("language", "Lang", 50), ("sounds", "Sounds", 60), ("size", "Size", 70),
+            ("installed", "", 30),
+        ]
+        for (key, title, width) in columns {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
+            column.title = title
+            column.width = width
+            table.addTableColumn(column)
+        }
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(installSelected)
+        table.usesAlternatingRowBackgroundColors = true
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        installButton.target = self
+        installButton.action = #selector(installSelected)
+        installButton.keyEquivalent = "\r"
+        status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byTruncatingTail
+        for view in [search, scroll, status, installButton] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            search.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            search.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            search.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            scroll.bottomAnchor.constraint(equalTo: installButton.topAnchor, constant: -8),
+            installButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            installButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            status.centerYAnchor.constraint(equalTo: installButton.centerYAnchor),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: installButton.leadingAnchor, constant: -12),
+        ])
+    }
+
+    func controlTextDidChange(_ obj: Notification) { filter() }
+
+    private func filter() {
+        let term = search.stringValue.lowercased()
+        shown = store.packs.filter { pack in
+            term.isEmpty
+                || [pack.name, pack.display_name, pack.language, pack.description].compactMap { $0 }
+                    .contains { $0.lowercased().contains(term) }
+        }
+        table.reloadData()
+        if !busy { status.stringValue = "\(shown.count) of \(store.packs.count) packs · \(store.installed.count) installed" }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let key = tableColumn?.identifier.rawValue, row < shown.count else { return nil }
+        let pack = shown[row]
+        let text: String
+        switch key {
+        case "name": text = pack.display_name ?? pack.name
+        case "language": text = pack.language ?? ""
+        case "sounds": text = pack.sound_count.map(String.init) ?? ""
+        case "size": text = pack.total_size_bytes.map { bytes(UInt64($0)) } ?? ""
+        case "installed": text = store.installed.contains(pack.name) ? "✓" : ""
+        default: text = ""
+        }
+        let field = NSTextField(labelWithString: text)
+        field.lineBreakMode = .byTruncatingTail
+        field.toolTip = key == "name" ? [pack.name, pack.description].compactMap { $0 }.joined(separator: "\n") : nil
+        return field
+    }
+
+    @objc private func installSelected() {
+        let row = table.selectedRow
+        guard !busy, row >= 0, row < shown.count else { return }
+        let pack = shown[row]
+        busy = true
+        installButton.isEnabled = false
+        // Says what it is about to fetch before it does.
+        status.stringValue = "\(pack.name): \(pack.sound_count.map { "\($0) sounds" } ?? "sounds")"
+            + (pack.total_size_bytes.map { ", \(bytes(UInt64($0)))" } ?? "") + " from GitHub…"
+        store.install(pack, progress: { [weak self] done, total in
+            self?.status.stringValue = "\(pack.name): \(done) of \(total)"
+        }, done: { [weak self] error in
+            guard let self = self else { return }
+            self.busy = false
+            self.installButton.isEnabled = true
+            if let error = error {
+                self.status.stringValue = "\(pack.name) not installed: \(error)"
+            } else {
+                self.status.stringValue = "\(pack.name) installed and chosen"
+                self.table.reloadData()
+                self.onInstalled(pack.name)
+            }
+        })
     }
 }
 
@@ -1213,10 +1519,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         ("resource.limit", "limit"), ("user.spam", "spam"),
     ]
     private var eventBoxes: [NSButton] = []
+    private let packStore = PackStore()
+    private var packBrowser: PackBrowser?
+    private static let morePacks = "More packs…"
     private var previewButtons: [NSButton] = []
     private let latest = LatestVersion()
     private var watcher: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
+    private var sessionsWatcher: DispatchSourceFileSystemObject?
     private var paintedOnce = false
     private var noteToken: UUID?
     private var counts = ""
@@ -1421,8 +1731,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         packMenu.controlSize = .small
         packMenu.isBordered = false
         packMenu.font = NSFont.systemFont(ofSize: 11)
-        packMenu.addItems(withTitles: events.packs)
-        packMenu.selectItem(withTitle: settings.pack)
+        fillPackMenu()
         packMenu.target = self
         packMenu.action = #selector(packChosen)
         packMenu.setAccessibilityLabel("Sound pack")
@@ -1497,8 +1806,33 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         events.preview()
     }
 
+    /// The installed packs, then the way to more.
+    private func fillPackMenu() {
+        packMenu.removeAllItems()
+        packMenu.addItems(withTitles: events.packs)
+        packMenu.menu?.addItem(.separator())
+        packMenu.addItem(withTitle: Self.morePacks)
+        packMenu.selectItem(withTitle: events.current.pack)
+    }
+
     @objc private func packChosen() {
         guard let pack = packMenu.titleOfSelectedItem else { return }
+        if pack == Self.morePacks {
+            packMenu.selectItem(withTitle: events.current.pack)
+            if packBrowser == nil {
+                packBrowser = PackBrowser(store: packStore) { [weak self] name in
+                    guard let self = self else { return }
+                    self.events.update { $0.pack = name }
+                    self.events.reloadPack()
+                    self.fillPackMenu()
+                    self.updatePreviewButtons()
+                    self.events.preview()
+                }
+            }
+            packBrowser?.showWindow(nil)
+            packBrowser?.window?.center()
+            return
+        }
         events.update { $0.pack = pack }
         updatePreviewButtons()
         events.preview()
@@ -1719,6 +2053,19 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         source.setCancelHandler { Darwin.close(fd) }
         source.resume()
         watcher = source
+
+        // Claude Code rewrites a session's file when it starts waiting on you,
+        // which need not come with a redraw; the table follows it at once.
+        let sessionsDir = xdgDir("CLAUDE_CONFIG_DIR", fallback: ".claude").appendingPathComponent("sessions")
+        let sfd = open(sessionsDir.path, O_EVTONLY)
+        if sfd >= 0 {
+            let sessions = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: sfd, eventMask: [.write, .extend, .rename, .delete], queue: .main)
+            sessions.setEventHandler { [weak self] in self?.scheduleReload() }
+            sessions.setCancelHandler { Darwin.close(sfd) }
+            sessions.resume()
+            sessionsWatcher = sessions
+        }
 
         // Countdowns keep running while nothing redraws, and a session only
         // becomes "finished" with the passage of time.
@@ -2542,6 +2889,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// the transcript cannot see, so it says how long it has been at it.
     private func stateWords(_ session: Session, past: Bool) -> (String, NSColor) {
         guard !past else { return ("ended", Palette.dim) }
+        // Claude Code's own record beats anything read from the transcript: a
+        // dialog waiting on you is not written there until it is answered.
+        if session.peer_status == "waiting" {
+            switch session.peer_waiting_for {
+            case "input needed": return ("question", Palette.yellow)
+            case "sandbox request": return ("sandbox?", Palette.yellow)
+            case "goal proposal": return ("goal?", Palette.yellow)
+            case let other?: return (other, Palette.yellow)
+            case nil: return ("needs you", Palette.yellow)
+            }
+        }
         guard let t = session.transcript, let state = t.state else { return ("—", Palette.dim) }
         let since = t.state_at.map { " \(ago($0))" } ?? ""
         switch state {
