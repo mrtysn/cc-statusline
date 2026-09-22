@@ -1739,7 +1739,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         Column(key: "age", title: "Last Seen", width: 74),
         Column(key: "cwd", title: "Directory", width: 164),
         Column(key: "topic", title: "Doing", width: 300),
-        Column(key: "state", title: "State", width: 176),
+        Column(key: "state", title: "State", width: 128),
         // Beside the state: what a session is doing and how long its cache has
         // are read together.
         Column(key: "cache", title: "Cache", width: 140),
