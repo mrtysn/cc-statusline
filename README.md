@@ -73,6 +73,20 @@ From those events the app plays a sound per kind, from an [openpeon](https://git
 
 The switch, volume, pack and one checkbox per category sit at the top right of the window, and the Sound column overrides the switch for one session; all of it is kept in `sounds.json` beside the packs, which the app writes with defaults on first launch. Picking a pack or a volume plays a sample. Packs load as peon-ping loads them: a file named without a directory is in `sounds/`, nothing may point outside the pack, `manifest.json` stands in for `openpeon.json`, and a malformed entry is skipped rather than the whole pack. `.ogg` files are skipped, since macOS cannot play them. Completions in several sessions within five seconds chime once, and each category avoids repeating its last sound. The [registry](https://peonping.github.io/registry/index.json) lists every published pack; one is installed by copying its directory into `packs/`. A `PermissionRequest` also turns the session's State to `approve?` in yellow, until a process starts under the session (an approved command) or the transcript moves on. Events more than a minute old when read, from while the app was closed, are dropped.
 
+## When a format changes
+
+Everything the tool reads comes from formats Anthropic can change without notice, and a changed format rarely throws: the JSON still parses, a field is simply gone, and a segment quietly disappears. So each reader states what it expects, and a broken expectation is recorded in `health.json` in the cache directory, with the Claude Code version it first appeared under, when, and how often:
+
+| Source | Expectation |
+|---|---|
+| Status line input | `context_window.context_window_size` and `cost.total_duration_ms` are numbers |
+| Transcripts | lines are JSON, entries are typed `user` / `assistant`, assistant messages carry `message.usage`, `stop_reason` is a known value (judged only on a new chunk big enough to tell) |
+| Usage endpoint | a 2xx answer with `limits[]` and a numeric Fable percent; an outage or a missing token does not count |
+| Hook events | the event is one the hook is registered for, with a `session_id` |
+| npm registry | the answer has `version`; an outage does not count |
+
+Any recorded problem puts a red `!` at the end of every session's last status line row and turns the app's `cc-statusline` row red with the problem in words; its tooltip lists them all. `error.log` gets a `format:` line when a problem appears and a `format ok again:` line when it clears, which it does by itself on the next reading that passes.
+
 ## Fable quota
 
 Claude Code does not pass per-model limits to the status line, so the Fable weekly figure comes from the account usage endpoint (`/api/oauth/usage`, the same one `/usage` reads). The script reads Claude Code's OAuth token from the macOS Keychain, never renews it, and makes the request in a detached background process so a redraw never waits on it. Sessions on other models neither show the bar nor make the request. Agent Bar Hopping shows the Fable quota whatever the sessions run: it fetches once at launch (`cc-statusline.js refresh-usage`), unless the cache is under five minutes old, and after that relies on Fable sessions, which refresh the same cache while they run; the quota only moves then. A reading past its reset shows as 0%. It is shown whether or not the server marks it `is_active`, as claude.ai's usage page shows it.

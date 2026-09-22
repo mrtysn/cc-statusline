@@ -211,6 +211,74 @@ function logError(message) {
   } catch {}
 }
 
+// Loud failures. Everything here reads formats Anthropic can change without
+// notice — the status line input, transcripts, hook events, the usage endpoint —
+// and a changed format rarely throws: the JSON still parses, the field is just
+// gone, and a segment quietly disappears. So each reader states what it expects,
+// and a broken expectation lands in HEALTH_FILE, which puts a red ! on every
+// status line and the problem in words in the app, tagged with the Claude Code
+// version that brought it. A later pass clears it again.
+const HEALTH_FILE = join(CACHE_DIR, 'health.json');
+// A standing failure is rewritten at most this often, not on every redraw.
+const HEALTH_REFRESH_MS = 60000;
+
+function readHealth() {
+  try {
+    return JSON.parse(readFileSync(HEALTH_FILE, 'utf8')) || {};
+  } catch {
+    return {};
+  }
+}
+
+function checkFormat(key, ok, problem, example = null, version = null) {
+  const health = readHealth();
+  const known = health[key];
+  const now = Date.now();
+  if (ok) {
+    if (!known) return;
+    delete health[key];
+    logError(`format ok again: ${key}`);
+  } else {
+    if (known && now - known.last_seen < HEALTH_REFRESH_MS) return;
+    health[key] = {
+      problem,
+      version: known?.version ?? version,
+      first_seen: known?.first_seen ?? now,
+      last_seen: now,
+      count: (known?.count ?? 0) + 1,
+      example: example != null ? String(example).slice(0, 300) : known?.example ?? null,
+    };
+    if (!known) logError(`format: ${key}: ${problem}${version ? ` (Claude Code ${version})` : ''}`);
+  }
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    const tmp = `${HEALTH_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(health));
+    renameSync(tmp, HEALTH_FILE);
+  } catch {}
+}
+
+// The status line input's shape, independent of the session's state: these are
+// there from the first redraw on, whether or not anything has been said.
+function checkInput(input) {
+  if (!input.session_id) return;
+  const keys = Object.keys(input).join(',');
+  checkFormat(
+    'input/context_window',
+    typeof input.context_window?.context_window_size === 'number',
+    'status line input has no context_window.context_window_size',
+    keys,
+    input.version
+  );
+  checkFormat(
+    'input/cost',
+    typeof input.cost?.total_duration_ms === 'number',
+    'status line input has no cost.total_duration_ms',
+    keys,
+    input.version
+  );
+}
+
 // Takes the refresh lock, clearing one left behind by a refresh that died.
 function takeLock() {
   try {
@@ -301,9 +369,13 @@ async function refreshUsage(sevenArg) {
     next.fable = entry
       ? { percent: entry.percent, resets_at: entry.resets_at ?? null, is_active: entry.is_active === true }
       : null;
+    checkFormat('usage/response', true);
   } catch (err) {
     next.error = err.message;
     logError(err.message);
+    // A changed or moved endpoint, not an outage: no network or no keychain
+    // says nothing about the format.
+    if (/^(parse|http)/.test(err.message)) checkFormat('usage/response', false, `usage endpoint: ${err.message}`);
   }
   try {
     const tmp = `${USAGE_FILE}.${process.pid}.tmp`;
@@ -385,7 +457,8 @@ function lastMessageAt(transcriptPath) {
       const lines = slice.text.split('\n');
       if (slice.partial) lines.shift();
       for (let i = lines.length - 1; i >= 0; i--) {
-        if (!lines[i].includes('"type":"user"') && !lines[i].includes('"type":"assistant"')) continue;
+        // Loose, so a change of JSON spacing cannot hide every line from it.
+        if (!/"type"\s*:\s*"(user|assistant)"/.test(lines[i])) continue;
         let entry;
         try {
           entry = JSON.parse(lines[i]);
@@ -798,6 +871,43 @@ function scanPath(sessionId) {
   return join(SCAN_DIR, `${sessionId.replace(/[^\w-]/g, '')}.json`);
 }
 
+// What a transcript chunk held, for judging whether its format is still the
+// one this file reads.
+const KNOWN_STOPS = new Set([
+  'end_turn', 'tool_use', 'stop_sequence', 'max_tokens', 'refusal', 'pause_turn', 'model_context_window_exceeded',
+]);
+function tallyEntry(tally, entry) {
+  if (entry.version) tally.version = entry.version;
+  if (entry.type !== 'user' && entry.type !== 'assistant') return;
+  tally.typed++;
+  if (entry.type !== 'assistant' || !entry.message) return;
+  tally.assistant++;
+  if (entry.message.usage) tally.usage++;
+  const stop = entry.message.stop_reason;
+  if (stop != null && !KNOWN_STOPS.has(stop)) tally.stops.add(stop);
+}
+
+// Each expectation is judged only on a chunk big enough to judge it, so a
+// two-line append proves nothing either way.
+function judgeTranscript(t) {
+  if (t.lines >= 20) {
+    checkFormat('transcript/json', t.broken / t.lines <= 0.1, `transcript: ${t.broken} of ${t.lines} lines are not JSON`, null, t.version);
+    checkFormat('transcript/types', t.typed > 0, `transcript: ${t.lines} lines, none of type user or assistant`, null, t.version);
+  }
+  if (t.assistant >= 5) {
+    checkFormat('transcript/usage', t.usage > 0, 'transcript: assistant messages carry no message.usage', null, t.version);
+  }
+  if (t.assistant > 0) {
+    checkFormat(
+      'transcript/stop_reason',
+      t.stops.size === 0,
+      `transcript: unknown stop_reason ${[...t.stops].join(', ')}`,
+      [...t.stops].join(', '),
+      t.version
+    );
+  }
+}
+
 // `fresh` false reads only the saved totals: a finished session's transcript is
 // not opened again.
 function transcriptScan(sessionId, transcriptPath, fresh) {
@@ -824,12 +934,23 @@ function transcriptScan(sessionId, transcriptPath, fresh) {
         }
         // Only whole lines: a line still being written is read next time.
         const end = chunk.lastIndexOf(0x0a) + 1;
+        const tally = { lines: 0, broken: 0, typed: 0, assistant: 0, usage: 0, stops: new Set(), version: null };
         for (const line of chunk.subarray(0, end).toString('utf8').split('\n')) {
           if (!line) continue;
+          tally.lines++;
+          let entry;
           try {
-            scanEntry(scan, JSON.parse(line));
+            entry = JSON.parse(line);
+          } catch {
+            tally.broken++;
+            continue;
+          }
+          tallyEntry(tally, entry);
+          try {
+            scanEntry(scan, entry);
           } catch {}
         }
+        judgeTranscript(tally);
         if (end > 0) {
           scan.offset += end;
           mkdirSync(SCAN_DIR, { recursive: true });
@@ -961,7 +1082,8 @@ function liveSnapshot(columns) {
     const over = resets != null && resets <= now;
     fable = { percent: over ? 0 : cached.fable.percent, resets_at: over ? null : resets, read_at: cached.fetched_at ?? null };
   }
-  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).map(strip), fable };
+  const health = Object.entries(readHealth()).map(([key, value]) => ({ key, ...value }));
+  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).map(strip), fable, health };
 }
 
 function main() {
@@ -988,6 +1110,7 @@ function main() {
     previous = JSON.parse(readFileSync(spoolFile(input.session_id), 'utf8'));
   } catch {}
   const terminal = ownTerminal(previous);
+  checkInput(input);
   const lastAt = lastMessageAt(input.transcript_path);
   const repo = cachedGit(cwd, previous, lastAt);
   const args = {
@@ -1002,6 +1125,8 @@ function main() {
 
   const out = render({
     ...args,
+    // Any expectation broken anywhere: a red ! on every session's line.
+    alarm: Object.keys(readHealth()).length > 0,
     columns: terminalColumns(terminal.tty),
     // Text in place of the few Nerd Font glyphs, for terminals without one.
     icons: process.env.CC_STATUSLINE_ICONS !== '0',

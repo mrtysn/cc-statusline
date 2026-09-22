@@ -172,10 +172,49 @@ struct FableQuota: Decodable {
     let read_at: Double?
 }
 
+/// An outside format that stopped matching what the tool reads; see health.json.
+struct HealthIssue: Decodable {
+    let key: String
+    let problem: String
+    let version: String?
+    let first_seen: Double
+    let count: Int
+}
+
 struct Snapshot: Decodable {
     let live: [Session]
     let history: [Session]
     let fable: FableQuota?
+    let health: [HealthIssue]?
+}
+
+/// The app's half of the format checks, for what only it reads: hook events and
+/// the npm registry. Same file and rules as the script's checkFormat: a failure
+/// is written when it appears and at most once a minute after, a pass clears it.
+func checkFormat(_ key: String, _ ok: Bool, _ problem: String, example: String? = nil) {
+    let file = cacheDir.appendingPathComponent("health.json")
+    var health = (try? Data(contentsOf: file)).flatMap {
+        (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
+    } ?? [:]
+    let known = health[key] as? [String: Any]
+    let now = Date().timeIntervalSince1970 * 1000
+    if ok {
+        guard known != nil else { return }
+        health.removeValue(forKey: key)
+        log("format ok again: \(key)")
+    } else {
+        if let last = known?["last_seen"] as? Double, now - last < 60000 { return }
+        health[key] = [
+            "problem": problem,
+            "version": known?["version"] ?? NSNull(),
+            "first_seen": known?["first_seen"] ?? now,
+            "last_seen": now,
+            "count": ((known?["count"] as? Int) ?? 0) + 1,
+            "example": example.map { String($0.prefix(300)) } ?? known?["example"] ?? NSNull(),
+        ]
+        if known == nil { log("format: \(key): \(problem)") }
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: health) { try? data.write(to: file, options: .atomic) }
 }
 
 // MARK: - Reading the spool
@@ -631,9 +670,21 @@ final class EventCenter {
     }
 
     /// Returns whether the event changed what a row shows.
+    /// The events hooks/event.zsh is registered for; anything else means a name
+    /// changed under us.
+    private static let registered: Set<String> = [
+        "UserPromptSubmit", "Stop", "StopFailure", "PostToolUseFailure", "PermissionRequest", "PreToolUse",
+        "Notification", "PreCompact",
+    ]
+
     private func handle(_ event: [String: Any], at: Double) -> Bool {
         let name = event["hook_event_name"] as? String ?? ""
         let session = event["session_id"] as? String ?? ""
+        checkFormat(
+            "hooks/event", Self.registered.contains(name) && !session.isEmpty,
+            name.isEmpty || session.isEmpty
+                ? "hook events have no hook_event_name or session_id" : "unknown hook event \(name)",
+            example: event.keys.sorted().joined(separator: ","))
         switch name {
         case "UserPromptSubmit":
             promptStarted[session] = at
@@ -734,7 +785,13 @@ final class LatestVersion {
         request.timeoutInterval = 10
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             let version = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }?["version"] as? String
-            let ok = (response as? HTTPURLResponse)?.statusCode == 200 && version != nil
+            let status = (response as? HTTPURLResponse)?.statusCode
+            let ok = status == 200 && version != nil
+            // An answer without a version is a changed format; no answer is an outage.
+            if let status = status {
+                checkFormat(
+                    "npm/latest", ok, "npm registry: HTTP \(status)\(version == nil ? ", no version field" : "")")
+            }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.inFlight = false
@@ -1487,6 +1544,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         rows = live.map { ($0, false) } + past.map { ($0, true) }
         counts = "\(live.count) live · \(past.count) finished"
         toolCost = (cost, footprint)
+        healthIssues = snapshot.health ?? []
         latest.refreshIfDue()
         if noteToken == nil { statusLabel.stringValue = counts }
         emptyLabel.isHidden = !rows.isEmpty
@@ -1500,6 +1558,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// What watching all this costs, shown as the table's first row: the status
     /// line redraws in every session and the app with its snapshots.
     private var toolCost: (cpu: (redraws: Double, app: Double)?, footprint: UInt64) = (nil, 0)
+    /// Outside formats that stopped matching; the row turns red and says which.
+    private var healthIssues: [HealthIssue] = []
 
     private func toolCell(_ key: String) -> NSView? {
         let text: String
@@ -1508,7 +1568,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         case "cwd":
             text = "this tool"
         case "topic":
-            text = "cc-statusline"
+            if let first = healthIssues.first {
+                // Loud on purpose: a format changed and something reads wrong.
+                text = "cc-statusline · ⚠ " + first.problem
+                    + (healthIssues.count > 1 ? " (+\(healthIssues.count - 1) more)" : "")
+                colour = Palette.red
+            } else {
+                text = "cc-statusline"
+            }
         case "started":
             // Every session's version is held against this one.
             text = "v" + (latest.version ?? "—") + " latest"
@@ -1534,7 +1601,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
             field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
-        if key == "cpu", let cpu = toolCost.cpu {
+        if key == "topic", !healthIssues.isEmpty {
+            cell.toolTip = healthIssues.map { issue in
+                let since = clock(issue.first_seen)
+                return "\(issue.problem) — since \(since)"
+                    + (issue.version.map { ", Claude Code \($0)" } ?? "") + ", seen \(issue.count)×"
+            }.joined(separator: "\n") + "\nDetails in error.log; cleared once parsing works again."
+        } else if key == "cpu", let cpu = toolCost.cpu {
             // The split, for when the total is worth looking into.
             cell.toolTip = String(format: "Status line redraws %.1f%%, app and its snapshots %.1f%%", cpu.redraws, cpu.app)
         } else if key == "cpu" {
