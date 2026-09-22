@@ -160,6 +160,8 @@ struct Session: Decodable {
     /// What the latest status line redraw cost.
     let redraw: RedrawCost?
     let transcript: TranscriptState?
+    /// The name other sessions message this one by, e.g. `finance-be`.
+    let peer_name: String?
     let rows: [String]
     let summary: Summary
     let segments: Segments
@@ -1095,6 +1097,22 @@ final class BarView: NSView {
     }
 }
 
+/// A menu item that runs a closure, for menus built per cell.
+final class ActionItem: NSMenuItem {
+    private let run: () -> Void
+
+    init(_ title: String, enabled: Bool = true, _ run: @escaping () -> Void) {
+        self.run = run
+        super.init(title: title, action: #selector(fire), keyEquivalent: "")
+        target = self
+        isEnabled = enabled
+    }
+
+    required init(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func fire() { run() }
+}
+
 /// A cell that acts on a click and says so with the cursor.
 final class ClickableCell: NSView {
     var onClick: (() -> Void)? {
@@ -1185,7 +1203,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let selfCost = SelfCost()
     private let events = EventCenter()
     private let soundBar = NSStackView()
-    private let soundSwitch = NSSwitch()
+    /// The speaker glyph the Sound column uses, as the switch for every session.
+    private let soundSwitch = NSButton(title: "", target: nil, action: nil)
     private let volumeSlider = NSSlider(value: 0.35, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let packMenu = NSPopUpButton()
     /// The events that can sound, in the order the checkboxes show them.
@@ -1385,15 +1404,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         soundBar.spacing = 6
         soundBar.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = NSTextField(labelWithString: "Sounds")
-        title.font = NSFont.systemFont(ofSize: 12)
-        title.textColor = Palette.dim
-        soundSwitch.controlSize = .mini
-        soundSwitch.state = settings.enabled ? .on : .off
+        // The app's own colours throughout, not the system accent: a blue switch
+        // and blue boxes would be the only colour in the header that means nothing.
+        soundSwitch.isBordered = false
         soundSwitch.target = self
         soundSwitch.action = #selector(soundSwitched)
-        soundSwitch.setAccessibilityLabel("Sounds for every session")
+        drawSoundSwitch()
         volumeSlider.controlSize = .mini
+        volumeSlider.trackFillColor = Palette.dim
         volumeSlider.floatValue = settings.volume
         volumeSlider.target = self
         volumeSlider.action = #selector(volumeChanged)
@@ -1401,6 +1419,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         volumeSlider.widthAnchor.constraint(equalToConstant: 80).isActive = true
         volumeSlider.setAccessibilityLabel("Volume")
         packMenu.controlSize = .small
+        packMenu.isBordered = false
         packMenu.font = NSFont.systemFont(ofSize: 11)
         packMenu.addItems(withTitles: events.packs)
         packMenu.selectItem(withTitle: settings.pack)
@@ -1411,24 +1430,26 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // row; the gap before it takes up the difference.
         let gap = NSView()
         gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let top = NSStackView(views: [title, soundSwitch, volumeSlider, gap, packMenu])
+        let top = NSStackView(views: [soundSwitch, volumeSlider, gap, packMenu])
         top.spacing = 8
         top.distribution = .fill
 
+        // Text toggles rather than checkboxes: ● on, ○ off, in the palette.
         eventBoxes = Self.soundEvents.map { event in
-            let box = NSButton(checkboxWithTitle: event.title, target: self, action: #selector(eventToggled))
-            box.controlSize = .small
-            box.font = NSFont.systemFont(ofSize: 11)
-            box.state = settings.categories[event.key] == true ? .on : .off
+            let box = NSButton(title: "", target: self, action: #selector(eventToggled))
+            box.isBordered = false
             box.identifier = NSUserInterfaceItemIdentifier(event.key)
+            drawEventToggle(box, on: settings.categories[event.key] == true)
             return box
         }
-        // A ▶ beside each: its sounds one by one, in the pack's order.
+        // A ▸ beside each: its sounds one by one, in the pack's order.
         previewButtons = Self.soundEvents.map { event in
-            let play = NSButton(title: "▶", target: self, action: #selector(previewEvent))
+            // ▸ at the labels' own size sits at their text height; a smaller ▶
+            // rode high beside them.
+            let play = NSButton(title: "", target: self, action: #selector(previewEvent))
             play.isBordered = false
-            play.font = NSFont.systemFont(ofSize: 9)
-            play.contentTintColor = Palette.dim
+            play.attributedTitle = NSAttributedString(
+                string: "▸", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim])
             play.identifier = NSUserInterfaceItemIdentifier(event.key)
             play.toolTip = "Play the next \(event.title) sound"
             play.setAccessibilityLabel("Preview \(event.title) sounds")
@@ -1437,6 +1458,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let pairs = zip(eventBoxes, previewButtons).map { box, play -> NSView in
             let pair = NSStackView(views: [box, play])
             pair.spacing = 2
+            pair.alignment = .firstBaseline
             return pair
         }
         let boxes = NSStackView(views: pairs)
@@ -1447,8 +1469,26 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         top.widthAnchor.constraint(equalTo: boxes.widthAnchor).isActive = true
     }
 
+    private func drawSoundSwitch() {
+        let on = events.current.enabled
+        soundSwitch.attributedTitle = NSAttributedString(
+            string: on ? "\u{F057E}" : "\u{F0581}",
+            attributes: [.font: barFont, .foregroundColor: on ? Palette.text : Palette.dim])
+        soundSwitch.toolTip = on ? "Sounds on — click to turn them off" : "Sounds off — click to turn them on"
+        soundSwitch.setAccessibilityLabel("Sounds for every session, \(on ? "on" : "off")")
+    }
+
+    private func drawEventToggle(_ box: NSButton, on: Bool) {
+        let title = Self.soundEvents.first { $0.key == box.identifier?.rawValue }?.title ?? ""
+        box.attributedTitle = NSAttributedString(
+            string: (on ? "● " : "○ ") + title,
+            attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
+        box.setAccessibilityLabel("\(title) sounds, \(on ? "on" : "off")")
+    }
+
     @objc private func soundSwitched() {
-        events.update { $0.enabled = soundSwitch.state == .on }
+        events.update { $0.enabled.toggle() }
+        drawSoundSwitch()
         refreshTable()
     }
 
@@ -1481,7 +1521,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     @objc private func eventToggled(_ box: NSButton) {
         guard let key = box.identifier?.rawValue else { return }
-        events.update { $0.categories[key] = box.state == .on }
+        let on = events.current.categories[key] != true
+        events.update { $0.categories[key] = on }
+        drawEventToggle(box, on: on)
     }
 
     // MARK: Loading
@@ -1848,7 +1890,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             bottom = ""
         case "cwd":
             top = prose(s.cwd ?? "—", Palette.text)
-            bottom = session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
+            // The name other sessions message this one by; the terminal it runs
+            // in is in the tooltip. A finished session has no name, so its
+            // caption falls back to the terminal.
+            bottom = session.peer_name ?? session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
         case "git":
             top = mono(gitText(s.git), Palette.text)
             bottom = gitWords(s.git)
@@ -2015,7 +2060,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if key == "sound", !past, let id = s.session_id {
             field.toolTip = [
                 "Sound: " + (events.override(for: id).map { $0 ? "on for this session" : "muted for this session" }
-                    ?? "follows the Sounds switch"),
+                    ?? "follows the speaker switch at the top right"),
                 "Click to cycle: follow the switch → on → muted",
             ].joined(separator: "\n")
             cell.onClick = { [weak self] in
@@ -2041,9 +2086,26 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             if !past, let tty = session.tty { cell.onDoubleClick = { focusTerminal(tty: tty) } }
         } else if key == "cwd", let tty = session.tty, !past {
-            // The directory cell names the terminal under it; clicking goes there.
-            field.toolTip = "Show \(tty) in iTerm"
-            cell.onClick = { focusTerminal(tty: tty) }
+            // The table's double-click goes to the terminal; a single click only
+            // selects, as in every other cell.
+            field.toolTip = "\(tty.replacingOccurrences(of: "/dev/", with: "")) · double-click to show this terminal in iTerm"
+        }
+        if key == "cwd" {
+            // Right-click copies what the cell names, the path in full rather
+            // than with its ~.
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            let path = s.cwd.map { ($0 as NSString).expandingTildeInPath }
+            let name = session.peer_name
+            let copy = { [weak self, weak cell] (text: String) in
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                cell?.flash()
+                self?.note("Copied \(text)")
+            }
+            menu.addItem(ActionItem("Copy Path", enabled: path != nil) { path.map(copy) })
+            menu.addItem(ActionItem("Copy Session Name", enabled: name != nil) { name.map(copy) })
+            cell.menu = menu
         }
         // On the cell as well as the text: the text is only as tall as its
         // lines, and a hover below them would find no tooltip.
@@ -2385,7 +2447,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 + ", \(cpuTime(load.cpuSeconds)) in total"
         case "cwd":
             return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? ""). "
-                + "Click to show that terminal."
+                + "Double-click to show that terminal."
         case "git": return "Branch \(gitText(s.git)), \(gitWords(s.git))"
         case "model": return "Model \(s.model ?? "unknown")"
         case "effort": return "Effort \(s.effort ?? "unknown")"
@@ -2398,7 +2460,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         case "age": return "Last seen \(age). Click to copy the session id."
         case "sound":
             guard !past, let id = s.session_id else { return "" }
-            let state = events.override(for: id).map { $0 ? "on" : "muted" } ?? "following the Sounds switch"
+            let state = events.override(for: id).map { $0 ? "on" : "muted" } ?? "following the speaker switch at the top right"
             return "Sound \(state). Click to change."
         default: return ""
         }

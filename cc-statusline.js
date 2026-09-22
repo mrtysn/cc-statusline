@@ -1000,6 +1000,39 @@ function processAlive(pid) {
   }
 }
 
+// The names other sessions use to message each one (`finance-be`), by session
+// id: Claude Code keeps a small file per running session in its config dir.
+// Local files only; a session that has ended has none.
+// This session's own name, from its Claude Code process's file; one read.
+function peerName(pid, sessionId) {
+  if (!pid) return null;
+  try {
+    const dir = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'sessions');
+    const entry = JSON.parse(readFileSync(join(dir, `${pid}.json`), 'utf8'));
+    return entry.sessionId === sessionId ? entry.name || null : null;
+  } catch {
+    return null;
+  }
+}
+
+function peerNames() {
+  const dir = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'sessions');
+  const names = new Map();
+  let files = [];
+  try {
+    files = readdirSync(dir).filter((n) => n.endsWith('.json'));
+  } catch {
+    return names;
+  }
+  for (const name of files) {
+    try {
+      const entry = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      if (entry.sessionId && entry.name) names.set(entry.sessionId, entry.name);
+    } catch {}
+  }
+  return names;
+}
+
 // Every spooled session, drawn and tabulated, for the Agent Bar Hopping app:
 // `cc-statusline.js live [--columns N]` prints one JSON document and exits.
 
@@ -1053,6 +1086,9 @@ function liveSnapshot(columns) {
     .filter(isLive)
     .sort((a, b) => String(a.tty).localeCompare(String(b.tty)) || a.updated_at - b.updated_at);
   const ended = entries.filter((e) => !isLive(e)).sort((a, b) => b.active_at - a.active_at);
+
+  const peers = peerNames();
+  for (const e of live) e.peer_name = peers.get(e.summary.session_id) ?? null;
 
   // Live sessions read what their transcripts gained; finished ones keep the
   // totals they ended with.
@@ -1119,6 +1155,7 @@ function main() {
     usage,
     topic: renderTopic(input.session_id || '', input.transcript_path, terminal.tty, lastAt),
     waiting: waitingAgents(input.session_id, input.transcript_path),
+    peer: peerName(terminal.pid, input.session_id),
     git: repo.info,
     home: homedir(),
   };
