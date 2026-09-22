@@ -120,6 +120,8 @@ struct GitState: Decodable {
 struct Summary: Decodable {
     let session_id: String?
     let model: String?
+    /// The name with its version, e.g. `Opus 5.5`; the strip shows only the tier.
+    let model_full: String?
     let effort: String?
     let started_at: Double?
     let context: Double?
@@ -1662,7 +1664,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         Column(key: "cwd", title: "Directory", width: 164),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "state", title: "State", width: 176),
-        Column(key: "model", title: "Model", width: 58),
+        Column(key: "model", title: "Model", width: 74),
         Column(key: "effort", title: "Effort", width: 60),
         Column(key: "context", title: "Context", width: 82),
         Column(key: "sound", title: "Sound", width: 46),
@@ -2246,7 +2248,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             bottom = gitWords(s.git)
         case "model":
             top = drawn(seg.model)
-            bottom = (s.model ?? "") + ((s.fast_mode ?? false) ? " fast" : "")
+            // The version too: the strip above says only which tier it is.
+            bottom = (s.model_full ?? s.model ?? "") + ((s.fast_mode ?? false) ? " fast" : "")
         case "effort":
             top = drawn(seg.effort)
             bottom = s.effort ?? ""
@@ -2796,7 +2799,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? ""). "
                 + "Double-click to show that terminal."
         case "git": return "Branch \(gitText(s.git)), \(gitWords(s.git))"
-        case "model": return "Model \(s.model ?? "unknown")"
+        case "model": return "Model \(s.model_full ?? s.model ?? "unknown")"
         case "effort": return "Effort \(s.effort ?? "unknown")"
         case "started":
             return "Launched \(s.started_at.map { "\(ago($0)) ago" } ?? "at an unknown time")"
