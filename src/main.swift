@@ -2067,9 +2067,21 @@ final class SessionRowView: NSTableRowView {
     var drawsBoundary = false
     /// Extra height on that row, so the line sits in clear space.
     static let boundaryPadding: CGFloat = 26
+    /// Set on a finished row from a different day than the one above it.
+    var startsDay = false
 
     override func drawBackground(in dirtyRect: NSRect) {
         super.drawBackground(in: dirtyRect)
+        if startsDay {
+            // Faint and dashed, so it reads as a date and never as the boundary.
+            let line = NSBezierPath()
+            line.move(to: NSPoint(x: 12, y: 0.5))
+            line.line(to: NSPoint(x: bounds.width - 12, y: 0.5))
+            line.lineWidth = 1
+            line.setLineDash([3, 4], count: 2, phase: 0)
+            NSColor(srgbRed: 0.42, green: 0.44, blue: 0.51, alpha: 0.35).setStroke()
+            line.stroke()
+        }
         guard drawsBoundary else { return }
         NSColor(srgbRed: 0.42, green: 0.44, blue: 0.51, alpha: 0.9).setFill()
         // Centred in the padding: half the gap above the line, half below it,
@@ -2635,11 +2647,28 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         row < rows.count && rows[row].past && (row == 0 || !rows[row - 1].past)
     }
 
+    /// Finished rows on a different calendar day from the row above: by launch
+    /// under the Started sort, last activity otherwise. Worked out once per sort,
+    /// not once per row view.
+    private var daySplits: Set<Int> = []
+
+    private func findDaySplits() -> Set<Int> {
+        let started = table.sortDescriptors.first?.key == "started"
+        let past = rows.indices.filter { rows[$0].past }
+        let times = past.map { i -> Double in
+            let s = rows[i].session
+            return started ? s.summary.started_at ?? 0 : s.active_at ?? s.updated_at
+        }
+        let days = times.map { Calendar.current.startOfDay(for: Date(timeIntervalSince1970: $0 / 1000)) }
+        return Set(past.indices.dropFirst().filter { days[$0] != days[$0 - 1] }.map { past[$0] })
+    }
+
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let view = SessionRowView()
         // Live sessions always sort above finished ones; the line says where
         // that boundary is without spending a row on a heading.
         view.drawsBoundary = row > 0 && isBoundary(row - 1)
+        view.startsDay = row > 0 && daySplits.contains(row - 1)
         // A rebuilt row under a still mouse is already hovered: no fade in.
         view.hover = row == hoveredRow ? 1 : 0
         return view
@@ -3433,6 +3462,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // on a timer, so the redraw time would order them by nothing.
             return (a.session.active_at ?? a.session.updated_at) > (b.session.active_at ?? b.session.updated_at)
         }
+        daySplits = findDaySplits()
     }
 
     /// Haiku, Sonnet, Opus, Fable: the tiers in order of capability.
