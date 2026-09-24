@@ -787,6 +787,27 @@ function writeSpool(args, terminal, lastAt, gitStampNow) {
   }
 }
 
+// `cc-statusline.js session-end`, from the SessionEnd hook with the event on
+// stdin: how the session ended goes into its spool. A session whose process is
+// gone without one crashed, from when this first ran; ENDS_SINCE says when.
+const ENDS_SINCE = join(CACHE_DIR, 'session-ends-since');
+
+function recordSessionEnd(event) {
+  const file = spoolFile(event.session_id);
+  if (!file) return;
+  try {
+    if (!existsSync(ENDS_SINCE)) writeFileSync(ENDS_SINCE, String(Date.now()));
+    const entry = JSON.parse(readFileSync(file, 'utf8'));
+    entry.ended = { reason: event.reason || null, at: Date.now() };
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(entry));
+    renameSync(tmp, file);
+  } catch (err) {
+    // No spool: the session never drew a status line.
+    if (err.code !== 'ENOENT') logError(`session-end: ${err.message}`);
+  }
+}
+
 // What a session's transcript says it is doing, kept up to date by reading only
 // what was appended since the last snapshot: the first read of a session walks
 // the whole file once, every later one a few kilobytes. The running totals live
@@ -1083,6 +1104,7 @@ function liveSnapshot(columns) {
         tty: entry.tty || null,
         pid: entry.pid || null,
         redraw: entry.redraw || null,
+        ended: entry.ended || null,
         transcript_path: transcript || null,
         rows: render({ ...entry.args, columns }).split('\n'),
         // The duration in a spool was read at its redraw, not now.
@@ -1109,6 +1131,16 @@ function liveSnapshot(columns) {
     .filter(isLive)
     .sort((a, b) => String(a.tty).localeCompare(String(b.tty)) || a.updated_at - b.updated_at);
   const ended = entries.filter((e) => !isLive(e)).sort((a, b) => b.active_at - a.active_at);
+  // Without a SessionEnd a finished session crashed, if it was still drawing
+  // once they were recorded; before that, nothing can be said. A closed
+  // terminal is not this: its hangup still runs the hook, as `other`.
+  let endsSince = null;
+  try {
+    endsSince = Number(readFileSync(ENDS_SINCE, 'utf8')) || null;
+  } catch {}
+  for (const e of ended) {
+    if (!e.ended && endsSince && e.updated_at >= endsSince) e.ended = { reason: 'crashed', at: null };
+  }
 
   const peers = peerNames();
   for (const e of live) {
@@ -1214,6 +1246,12 @@ if (process.argv[2] === 'live') {
   if (age >= REFRESH_MS && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
 } else if (process.argv[2] === '--refresh-usage') {
   refreshUsage(process.argv[3]).catch((err) => logError(`refresh: ${err.message}`));
+} else if (process.argv[2] === 'session-end') {
+  try {
+    recordSessionEnd(JSON.parse(readFileSync(0, 'utf8')));
+  } catch (err) {
+    logError(`session-end: ${err.message}`);
+  }
 } else if (process.argv[2] === '--refresh-topic') {
   refreshTopic(process.argv[3], process.argv[4]);
 } else {

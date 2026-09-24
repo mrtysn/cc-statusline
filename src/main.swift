@@ -156,6 +156,11 @@ struct Segments: Decodable {
     let cache: String?
 }
 
+struct Ended: Decodable {
+    let reason: String?
+    let at: Double?
+}
+
 struct Session: Decodable {
     let updated_at: Double
     /// The later of the last redraw and the last transcript write: a busy
@@ -173,6 +178,9 @@ struct Session: Decodable {
     let peer_status: String?
     /// While waiting, what for: `input needed`, `dialog open`, …
     let peer_waiting_for: String?
+    /// How a finished session ended: Claude Code's SessionEnd reason, or
+    /// `crashed` when its process went without one.
+    let ended: Ended?
     let rows: [String]
     let summary: Summary
     let segments: Segments
@@ -694,7 +702,7 @@ final class EventCenter {
     /// changed under us.
     private static let registered: Set<String> = [
         "UserPromptSubmit", "Stop", "StopFailure", "PostToolUseFailure", "PermissionRequest", "PreToolUse",
-        "Notification", "PreCompact",
+        "Notification", "PreCompact", "SessionEnd",
     ]
 
     private func handle(_ event: [String: Any], at: Double) -> Bool {
@@ -3103,7 +3111,21 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// what is in progress is faint. A running tool may be a permission prompt
     /// the transcript cannot see, so it says how long it has been at it.
     private func stateWords(_ session: Session, past: Bool) -> (String, NSColor) {
-        guard !past else { return ("ended", Palette.dim) }
+        guard !past else {
+            switch session.ended?.reason {
+            // Ctrl+D or /exit.
+            case "prompt_input_exit": return ("exited", Palette.dim)
+            case "clear": return ("cleared", Palette.dim)
+            case "resume": return ("resumed", Palette.dim)
+            case "logout": return ("logged out", Palette.dim)
+            // A hangup or SIGTERM: the tab closed, iTerm quit, or the machine
+            // restarted, with the session still open.
+            case "other": return ("closed", Palette.text)
+            // No SessionEnd at all: the process was killed outright.
+            case "crashed": return ("crashed", Palette.yellow)
+            default: return ("ended", Palette.dim)
+            }
+        }
         // Claude Code's own record beats anything read from the transcript: a
         // dialog waiting on you is not written there until it is answered.
         if session.peer_status == "waiting" {

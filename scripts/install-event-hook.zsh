@@ -38,7 +38,11 @@ wanted = [
     ('UserPromptSubmit', ''), ('Stop', ''), ('StopFailure', ''),
     ('PostToolUseFailure', 'Bash'), ('PermissionRequest', ''),
     ('PreToolUse', 'AskUserQuestion|ExitPlanMode'), ('Notification', ''), ('PreCompact', ''),
+    ('SessionEnd', ''),
 ]
+# Claude Code is exiting when SessionEnd runs, and an async hook need not
+# outlive it: this one it waits for, which costs the exit one node start.
+waits = {'SessionEnd'}
 ours = lambda entry: any(h.get('command', '').endswith('cc-statusline-event.zsh') for h in entry.get('hooks', []))
 changed = 0
 for event, matcher in wanted:
@@ -52,7 +56,7 @@ for event, matcher in wanted:
         continue
     if any(ours(e) for e in entries):
         continue
-    entry = {'hooks': [{'type': 'command', 'command': hook, 'async': True, 'timeout': 5}]}
+    entry = {'hooks': [{'type': 'command', 'command': hook, 'async': event not in waits, 'timeout': 5}]}
     if matcher:
         entry['matcher'] = matcher
     entries.append(entry)
