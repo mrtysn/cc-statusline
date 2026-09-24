@@ -2341,6 +2341,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             focusTerminal(tty: tty)
             return
         }
+        // No transcript means no prompt was ever sent: nothing to resume.
+        guard session.transcript != nil else {
+            note("Nothing to resume: the session never had a prompt")
+            return
+        }
         guard let command = resumeCommand(session.summary, mode: session.transcript?.mode) else {
             note("Cannot resume: the session's launch directory was never recorded")
             return
@@ -2673,7 +2678,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             menu.addItem(ActionItem("Copy Session Name", enabled: name != nil) { name.map(copy) })
             if past {
                 menu.addItem(.separator())
-                menu.addItem(ActionItem("Resume Session") { [weak self] in self?.resume(session) })
+                menu.addItem(ActionItem("Resume Session", enabled: session.transcript != nil) { [weak self] in self?.resume(session) })
             }
             cell.menu = menu
         }
