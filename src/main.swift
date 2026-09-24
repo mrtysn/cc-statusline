@@ -122,6 +122,8 @@ struct Summary: Decodable {
     let model: String?
     /// The name with its version, e.g. `Opus 5.5`; the strip shows only the tier.
     let model_full: String?
+    /// The id Claude Code runs, e.g. `claude-opus-5-5`, for resuming with it.
+    let model_id: String?
     let effort: String?
     let started_at: Double?
     let context: Double?
@@ -133,6 +135,8 @@ struct Summary: Decodable {
     let topic: String?
     let topic_is_new: Bool?
     let cwd: String?
+    /// Where the session was launched, which is where it resumes.
+    let project_dir: String?
     let git: GitState?
     let lines: LineCount?
     let session_name: String?
@@ -1398,6 +1402,63 @@ func focusTerminal(tty: String) {
         end tell
         return "not found"
         """
+    runScript(script, label: "focus \(tty)")
+    // The script selects the tab, but a hotkey window hides again unless iTerm is
+    // the active app — and AppleScript's own `activate` makes iTerm open a fresh
+    // tab when that window is hidden.
+    bringITermForward(label: "focus \(tty)")
+}
+
+/// The shell command that opens a finished session again: from the directory it
+/// was launched in, since Claude Code files a transcript under that directory,
+/// and with the model, effort and permission mode it last ran.
+func resumeCommand(_ s: Summary, mode: String?) -> String? {
+    guard let id = s.session_id, let dir = s.project_dir else { return nil }
+    let quote = { (text: String) in "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    var parts = ["cd", quote((dir as NSString).expandingTildeInPath), "&&", "claude", "--resume", id]
+    if let model = s.model_id { parts += ["--model", quote(model)] }
+    if let effort = s.effort { parts += ["--effort", effort] }
+    // The transcript still says `default` for what the command line calls `manual`.
+    if let mode = mode { parts += ["--permission-mode", mode == "default" ? "manual" : mode] }
+    return parts.joined(separator: " ")
+}
+
+/// Runs a command in a new tab of iTerm's hotkey window, and shows that window;
+/// with no hotkey window, in a new window. The tab starts with the command rather
+/// than having it typed: text written into a fresh tab races the shell's startup,
+/// and a terminal reply landing in front of it garbled the first word. The shell
+/// is interactive so aliases and functions load, and replaces itself with a
+/// plain login shell afterwards so the tab outlives the command.
+func runInNewTab(_ command: String) {
+    let shell = getpwuid(getuid()).flatMap { String(validatingUTF8: $0.pointee.pw_shell) } ?? "/bin/zsh"
+    let quote = { (text: String) in "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let launch = "\(shell) -lic \(quote("\(command); exec \(shell) -l"))"
+    let text = launch.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    let script = """
+        tell application "iTerm2"
+          set target to missing value
+          repeat with w in windows
+            if is hotkey window of w then set target to w
+          end repeat
+          if target is missing value then
+            set target to (create window with default profile command "\(text)")
+            select target
+            activate
+            return "window"
+          end if
+          tell target to create tab with default profile command "\(text)"
+          reveal hotkey window
+          return "ok"
+        end tell
+        """
+    let result = runScript(script, label: "resume")
+    if result == "ok" { bringITermForward(label: "resume") }
+}
+
+/// Runs an AppleScript and returns what it printed. Apple Events can be refused
+/// silently, so whatever osascript says is logged.
+@discardableResult
+func runScript(_ script: String, label: String) -> String {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     task.arguments = ["-e", script]
@@ -1408,31 +1469,30 @@ func focusTerminal(tty: String) {
     do {
         try task.run()
     } catch {
-        log("focus \(tty): \(error.localizedDescription)")
-        return
+        log("\(label): \(error.localizedDescription)")
+        return ""
     }
-    // Apple Events can be refused silently; whatever osascript says is logged.
     let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     task.waitUntilExit()
-    log(
-        "focus \(tty): exit \(task.terminationStatus) out=\(stdout.trimmingCharacters(in: .whitespacesAndNewlines)) "
-            + "err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+    let result = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    log("\(label): exit \(task.terminationStatus) out=\(result) err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+    return result
+}
 
-    // The script selects the tab, but a hotkey window hides again unless iTerm is
-    // the active app — and AppleScript's own `activate` makes iTerm open a fresh
-    // tab when that window is hidden. `open -a` on an app that is already running
-    // just brings it forward, and does so from inside a bundle where
-    // NSRunningApplication's lookup came back empty.
+/// Brings iTerm to the front, so a hotkey window it just revealed stays up.
+/// `open -a` on an app that is already running just brings it forward, and does
+/// so from inside a bundle where NSRunningApplication's lookup came back empty.
+func bringITermForward(label: String) {
     let bring = Process()
     bring.executableURL = URL(fileURLWithPath: "/usr/bin/open")
     bring.arguments = ["-a", "iTerm"]
     do {
         try bring.run()
         bring.waitUntilExit()
-        if bring.terminationStatus != 0 { log("focus \(tty): open -a iTerm exited \(bring.terminationStatus)") }
+        if bring.terminationStatus != 0 { log("\(label): open -a iTerm exited \(bring.terminationStatus)") }
     } catch {
-        log("focus \(tty): open -a iTerm failed: \(error.localizedDescription)")
+        log("\(label): open -a iTerm failed: \(error.localizedDescription)")
     }
 }
 
@@ -1571,7 +1631,7 @@ final class SessionRowView: NSTableRowView {
 
 // MARK: - Window
 
-final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
     private let statusLabel = NSTextField(labelWithString: "")
     private let quotaBar = NSStackView()
     private let gridScroll = NSScrollView()
@@ -2226,6 +2286,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return row >= 0 && row < rows.count ? rows[row] : nil
     }
 
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard item.action == #selector(showSelectedTerminal) else { return true }
+        item.title = selected?.past == true ? "Resume Session" : "Show Terminal"
+        return selected != nil
+    }
+
     @objc func copySelectedSessionId() {
         guard let id = selected?.session.summary.session_id else { return }
         NSPasteboard.general.clearContents()
@@ -2241,13 +2307,38 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let column = table.clickedColumn
         guard column >= 0, Self.terminalColumns.contains(table.tableColumns[column].identifier.rawValue) else { return }
         let row = table.clickedRow - 1
-        guard row >= 0, row < rows.count, !rows[row].past, let tty = rows[row].session.tty else { return }
-        focusTerminal(tty: tty)
+        guard row >= 0, row < rows.count else { return }
+        go(to: rows[row])
     }
 
     @objc func showSelectedTerminal() {
-        guard let entry = selected, !entry.past, let tty = entry.session.tty else { return }
-        focusTerminal(tty: tty)
+        guard let entry = selected else { return }
+        go(to: entry)
+    }
+
+    /// A live session's terminal, or a finished one opened again in a new tab.
+    private func go(to entry: (session: Session, past: Bool)) {
+        if !entry.past {
+            if let tty = entry.session.tty { focusTerminal(tty: tty) }
+            return
+        }
+        resume(entry.session)
+    }
+
+    /// Opens a finished session again, unless it is already open elsewhere, in
+    /// which case its terminal comes forward instead.
+    private func resume(_ session: Session) {
+        let id = session.summary.session_id
+        if let live = rows.first(where: { !$0.past && $0.session.summary.session_id == id }), let tty = live.session.tty {
+            focusTerminal(tty: tty)
+            return
+        }
+        guard let command = resumeCommand(session.summary, mode: session.transcript?.mode) else {
+            note("Cannot resume: the session's launch directory was never recorded")
+            return
+        }
+        runInNewTab(command)
+        note("Resuming \(id ?? "session")")
     }
 
     /// A line of feedback for an action that changes nothing on screen.
@@ -2537,18 +2628,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
         }
         if key == "age", let id = s.session_id {
-            field.toolTip = [id, "Click to copy the session id", "Double-click to show its terminal"].joined(separator: "\n")
+            field.toolTip = [id, "Click to copy the session id", past ? "Double-click to resume it" : "Double-click to show its terminal"]
+                .joined(separator: "\n")
             cell.onClick = { [weak self, weak cell] in
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(id, forType: .string)
                 cell?.flash()
                 self?.note("Copied \(id)")
             }
-            if !past, let tty = session.tty { cell.onDoubleClick = { focusTerminal(tty: tty) } }
+            if !past, let tty = session.tty {
+                cell.onDoubleClick = { focusTerminal(tty: tty) }
+            } else if past {
+                cell.onDoubleClick = { [weak self] in self?.resume(session) }
+            }
         } else if key == "cwd", let tty = session.tty, !past {
             // The table's double-click goes to the terminal; a single click only
             // selects, as in every other cell.
             field.toolTip = "\(tty.replacingOccurrences(of: "/dev/", with: "")) · double-click to show this terminal in iTerm"
+        } else if key == "cwd", past {
+            field.toolTip = "Double-click to resume in a new iTerm tab"
         }
         if key == "cwd" {
             // Right-click copies what the cell names, the path in full rather
@@ -2565,6 +2663,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             menu.addItem(ActionItem("Copy Path", enabled: path != nil) { path.map(copy) })
             menu.addItem(ActionItem("Copy Session Name", enabled: name != nil) { name.map(copy) })
+            if past {
+                menu.addItem(.separator())
+                menu.addItem(ActionItem("Resume Session") { [weak self] in self?.resume(session) })
+            }
             cell.menu = menu
         }
         // On the cell as well as the text: the text is only as tall as its
