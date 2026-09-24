@@ -10,6 +10,8 @@
 // one definition of what a bar looks like, shared with the terminal.
 
 import AppKit
+import AudioToolbox
+import AVFoundation
 import CryptoKit
 import Foundation
 
@@ -524,13 +526,31 @@ struct SoundSettings: Codable {
     }
 }
 
+/// Whether this Mac can decode a sound file. Ogg Vorbis is the one format
+/// packs use that depends on the system: Core Audio decodes it on macOS 15 and
+/// not on older releases, so ask for its decoder rather than a version.
+func playable(_ file: String) -> Bool {
+    file.lowercased().hasSuffix(".ogg") ? vorbisDecodes : true
+}
+
+let vorbisDecodes: Bool = {
+    var size: UInt32 = 0
+    guard AudioFormatGetPropertyInfo(kAudioFormatProperty_DecodeFormatIDs, 0, nil, &size) == noErr else { return false }
+    var ids = [AudioFormatID](repeating: 0, count: Int(size) / MemoryLayout<AudioFormatID>.size)
+    guard AudioFormatGetProperty(kAudioFormatProperty_DecodeFormatIDs, 0, nil, &size, &ids) == noErr else { return false }
+    return ids.contains(0x766F_7262)  // 'vorb'
+}()
+
 /// Turns Claude Code's hook events into sounds, and remembers the one thing the
 /// transcript cannot show: a permission prompt waiting on the user.
 final class EventCenter {
     private var settings = SoundSettings()
     /// Sound files per category, from the pack's manifest.
     private var sounds: [String: [URL]] = [:]
-    private var playing: NSSound?
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    /// Which play is the latest, so only its end stops the engine.
+    private var playCount = 0
     /// The last file per category, so a category never repeats itself.
     private var lastPlayed: [String: URL] = [:]
     /// The last completion in any session: several finishing together chime once.
@@ -594,7 +614,6 @@ final class EventCenter {
         change(&settings)
         if settings.pack != pack {
             sounds = [:]
-            previewed = [:]
             loadPack()
         }
         save()
@@ -603,8 +622,14 @@ final class EventCenter {
     /// Reads the pack again, for when its files changed under the same name.
     func reloadPack() {
         sounds = [:]
-        previewed = [:]
         loadPack()
+    }
+
+    /// Drops what was read of a pack, after it was installed again or removed.
+    func forget(_ pack: String) {
+        otherPacks[pack] = nil
+        previewed = previewed.filter { !$0.key.hasPrefix(pack + "/") }
+        if pack == settings.pack { reloadPack() }
     }
 
     /// The installed packs, by directory name.
@@ -621,18 +646,33 @@ final class EventCenter {
         play("task.complete", session: nil, force: true)
     }
 
-    /// Where each category's preview is in its list: previews play a pack's
-    /// sounds in order, so each can be heard, where events pick at random.
+    /// Where each pack's category preview is in its list, by "pack/category":
+    /// previews play a pack's sounds in order, so each can be heard, where
+    /// events pick at random.
     private var previewed: [String: Int] = [:]
+    /// Installed packs other than the one in use, read when first previewed.
+    private var otherPacks: [String: [String: [URL]]] = [:]
 
-    func soundCount(_ category: String) -> Int { sounds[category]?.count ?? 0 }
+    private func sounds(of pack: String) -> [String: [URL]] {
+        if pack == settings.pack { return sounds }
+        if let read = otherPacks[pack] { return read }
+        let read = Self.readPack(pack)
+        otherPacks[pack] = read
+        return read
+    }
+
+    func soundCount(_ category: String, pack: String? = nil) -> Int {
+        sounds(of: pack ?? settings.pack)[category]?.count ?? 0
+    }
 
     /// Plays the category's next sound in the pack's order, whatever the
     /// switches say. Returns its place, 1-based, and how many there are.
-    func previewNext(_ category: String) -> (index: Int, count: Int)? {
-        guard let list = sounds[category], !list.isEmpty else { return nil }
-        let i = (previewed[category] ?? 0) % list.count
-        previewed[category] = i + 1
+    func previewNext(_ category: String, pack: String? = nil) -> (index: Int, count: Int)? {
+        let pack = pack ?? settings.pack
+        guard let list = sounds(of: pack)[category], !list.isEmpty else { return nil }
+        let key = pack + "/" + category
+        let i = (previewed[key] ?? 0) % list.count
+        previewed[key] = i + 1
         playFile(list[i])
         return (i + 1, list.count)
     }
@@ -649,34 +689,36 @@ final class EventCenter {
         update { $0.sessions = $0.sessions.filter { live.contains($0.key) } }
     }
 
+    private func loadPack() {
+        sounds = Self.readPack(settings.pack)
+        if sounds.isEmpty { log("no playable sound pack at packs/\(settings.pack)") }
+    }
+
     /// Reads an openpeon (CESP 1.0) manifest the way peon-ping does: a path with
     /// a slash is relative to the pack, a bare name lives in sounds/, and nothing
     /// may resolve outside the pack. A malformed entry is skipped, not the whole
-    /// pack; ogg files are skipped because macOS cannot play them.
-    private func loadPack() {
-        let dir = supportDir.appendingPathComponent("packs").appendingPathComponent(settings.pack)
+    /// pack, and so is a file this Mac cannot decode.
+    static func readPack(_ name: String) -> [String: [URL]] {
+        let dir = supportDir.appendingPathComponent("packs").appendingPathComponent(name)
         let manifest = ["openpeon.json", "manifest.json"].lazy
             .compactMap { try? Data(contentsOf: dir.appendingPathComponent($0)) }
             .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
             .first
-        guard let categories = manifest?["categories"] as? [String: Any] else {
-            log("no sound pack at \(dir.path)")
-            return
-        }
+        guard let categories = manifest?["categories"] as? [String: Any] else { return [:] }
         let root = dir.standardizedFileURL.path + "/"
-        for (name, value) in categories {
+        var found: [String: [URL]] = [:]
+        for (category, value) in categories {
             let entries = ((value as? [String: Any])?["sounds"] as? [Any]) ?? []
             let files: [URL] = entries.compactMap { entry in
                 guard let file = (entry as? [String: Any])?["file"] as? String, !file.isEmpty else { return nil }
                 let url = (file.contains("/") ? dir.appendingPathComponent(file)
                     : dir.appendingPathComponent("sounds").appendingPathComponent(file)).standardizedFileURL
-                guard url.path.hasPrefix(root), url.pathExtension.lowercased() != "ogg",
-                    fm.fileExists(atPath: url.path)
-                else { return nil }
+                guard url.path.hasPrefix(root), playable(url.path), fm.fileExists(atPath: url.path) else { return nil }
                 return url
             }
-            if !files.isEmpty { sounds[name] = files }
+            if !files.isEmpty { found[category] = files }
         }
+        return found
     }
 
     /// Reads every waiting event in arrival order, then deletes it.
@@ -769,12 +811,31 @@ final class EventCenter {
         lastPlayed[category] = url
     }
 
-    private func playFile(_ url: URL) {
-        guard let sound = NSSound(contentsOf: url, byReference: true) else { return }
-        playing?.stop()
-        sound.volume = settings.volume
-        sound.play()
-        playing = sound
+    /// Through an engine rather than NSSound: NSSound and AVAudioPlayer open an
+    /// Ogg Vorbis file and then refuse to play it, where decoding it into a
+    /// buffer works. The engine runs only while a sound does, so the audio
+    /// device is not held open between them.
+    func playFile(_ url: URL) {
+        guard let file = try? AVAudioFile(forReading: url),
+            let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
+            (try? file.read(into: buffer)) != nil
+        else { return log("cannot decode \(url.lastPathComponent)") }
+        player.stop()
+        if player.engine == nil { engine.attach(player) }
+        engine.disconnectNodeOutput(player)
+        engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
+        do { if !engine.isRunning { try engine.start() } } catch { return log("audio engine: \(error.localizedDescription)") }
+        playCount += 1
+        let count = playCount
+        player.volume = settings.volume
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self, self.playCount == count else { return }
+                self.player.stop()
+                self.engine.stop()
+            }
+        }
+        player.play()
     }
 }
 
@@ -852,6 +913,23 @@ struct RegistryPack: Decodable {
     let source_ref: String
     let source_path: String?
     let manifest_sha256: String?
+    /// The events the pack has sounds for.
+    let categories: [String]?
+
+    /// An installed pack the registry does not list.
+    init(local name: String) {
+        self.name = name
+        display_name = nil
+        description = "installed here, not in the registry"
+        language = nil
+        sound_count = nil
+        total_size_bytes = nil
+        source_repo = ""
+        source_ref = ""
+        source_path = nil
+        manifest_sha256 = nil
+        categories = nil
+    }
 }
 
 /// Browses and installs packs from the openpeon registry, the one peon-ping's
@@ -902,38 +980,110 @@ final class PackStore {
         }
     }
 
+    /// Where the pack's files are on GitHub, or nil for a path that could escape.
+    private static func base(_ pack: RegistryPack) -> String? {
+        guard !pack.source_repo.isEmpty else { return nil }
+        var base = "https://raw.githubusercontent.com/\(pack.source_repo)/\(pack.source_ref)"
+        if let path = pack.source_path, !path.isEmpty, path != "." {
+            guard safe(path) else { return nil }
+            base += "/" + path
+        }
+        return base
+    }
+
+    /// The manifest's sounds per category, as peon-ping names them under
+    /// sounds/: a path there keeps its folders, anything else is its base name.
+    /// Unsafe names and files this Mac cannot decode are left out.
+    private static func sounds(_ manifest: Data) -> [String: [(rel: String, sha: String?)]]? {
+        guard let root = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any],
+            let categories = root["categories"] as? [String: Any]
+        else { return nil }
+        var found: [String: [(rel: String, sha: String?)]] = [:]
+        for (name, value) in categories {
+            guard let category = value as? [String: Any] else { continue }
+            for case let sound as [String: Any] in (category["sounds"] as? [Any]) ?? [] {
+                guard let file = sound["file"] as? String else { continue }
+                let rel = file.hasPrefix("sounds/") ? String(file.dropFirst(7)) : (file as NSString).lastPathComponent
+                guard safe(rel), playable(rel) else { continue }
+                found[name, default: []].append((rel, sound["sha256"] as? String))
+            }
+        }
+        return found
+    }
+
+    /// The pack's manifest, checked against the registry's checksum.
+    private func manifest(_ pack: RegistryPack, base: String, _ done: @escaping (Data?, String?) -> Void) {
+        fetch(URL(string: base + "/openpeon.json")!) { data, error in
+            guard let manifest = data else { return done(nil, error ?? "no manifest") }
+            if let expected = pack.manifest_sha256, Self.sha256(manifest) != expected.lowercased() {
+                return done(nil, "the manifest does not match the registry's checksum")
+            }
+            done(manifest, nil)
+        }
+    }
+
+    private static func url(base: String, _ rel: String) -> URL? {
+        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "?!()"))
+        return rel.addingPercentEncoding(withAllowedCharacters: allowed).flatMap { URL(string: base + "/sounds/" + $0) }
+    }
+
+    /// Previews of packs not installed: each manifest's sounds once read, and
+    /// each sound fetched only the first time it is played.
+    private var previewManifests: [String: [String: [(rel: String, sha: String?)]]] = [:]
+    private let previewDir = cacheDir.appendingPathComponent("pack-previews")
+
+    /// Fetches the category's sound at `index` (wrapping) of a pack that is not
+    /// installed: one request for the manifest the first time, then one for
+    /// the sound unless it was fetched before. Calls back with the file and
+    /// its place, 1-based, of how many, or an error.
+    func previewSound(
+        _ pack: RegistryPack, _ category: String, index: Int,
+        _ done: @escaping (_ file: URL?, _ place: Int, _ count: Int, _ error: String?) -> Void
+    ) {
+        guard let base = Self.base(pack), Self.safe(pack.name), !pack.name.contains("/") else {
+            return done(nil, 0, 0, "unsafe source path")
+        }
+        guard let listed = previewManifests[pack.name] else {
+            return manifest(pack, base: base) { [weak self] data, error in
+                guard let self = self else { return }
+                guard let data = data else { return done(nil, 0, 0, error) }
+                guard let sounds = Self.sounds(data) else { return done(nil, 0, 0, "the manifest has no categories") }
+                self.previewManifests[pack.name] = sounds
+                self.previewSound(pack, category, index: index, done)
+            }
+        }
+        guard let list = listed[category], !list.isEmpty else { return done(nil, 0, 0, "no sounds for this") }
+        let i = index % list.count
+        let (rel, sha) = list[i]
+        let dest = previewDir.appendingPathComponent(pack.name).appendingPathComponent(rel)
+        if fm.fileExists(atPath: dest.path) { return done(dest, i + 1, list.count, nil) }
+        guard let url = Self.url(base: base, rel) else { return done(nil, 0, 0, "bad file name \(rel)") }
+        fetch(url) { data, error in
+            guard let data = data else { return done(nil, 0, 0, "\(rel): \(error ?? "no data")") }
+            if let sha = sha, Self.sha256(data) != sha.lowercased() {
+                return done(nil, 0, 0, "\(rel) does not match its checksum")
+            }
+            try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            do { try data.write(to: dest) } catch { return done(nil, 0, 0, error.localizedDescription) }
+            done(dest, i + 1, list.count, nil)
+        }
+    }
+
     /// Installs a pack; `progress` gets (done, total) sounds, `done` an error or nil.
     func install(
         _ pack: RegistryPack, progress: @escaping (Int, Int) -> Void, done: @escaping (String?) -> Void
     ) {
-        var base = "https://raw.githubusercontent.com/\(pack.source_repo)/\(pack.source_ref)"
-        if let path = pack.source_path, !path.isEmpty, path != "." {
-            guard Self.safe(path) else { return done("unsafe source path") }
-            base += "/" + path
-        }
+        guard let base = Self.base(pack) else { return done("unsafe source path") }
         let staging = packsDir.appendingPathComponent(".\(pack.name).partial")
         try? fm.removeItem(at: staging)
-        fetch(URL(string: base + "/openpeon.json")!) { [weak self] data, error in
+        manifest(pack, base: base) { [weak self] data, error in
             guard let self = self else { return }
-            guard let manifest = data else { return done(error ?? "no manifest") }
-            if let expected = pack.manifest_sha256, Self.sha256(manifest) != expected.lowercased() {
-                return done("the manifest does not match the registry's checksum")
-            }
-            guard let root = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any],
-                let categories = root["categories"] as? [String: Any]
-            else { return done("the manifest has no categories") }
-            // Each sound once, as peon-ping names it: a path under sounds/ keeps
-            // its folders, anything else is its base name there.
+            guard let manifest = data else { return done(error) }
+            guard let categories = Self.sounds(manifest) else { return done("the manifest has no categories") }
+            // Each sound once, though several events may share it.
             var files: [(rel: String, sha: String?)] = []
             var seen = Set<String>()
-            for case let category as [String: Any] in categories.values {
-                for case let sound as [String: Any] in (category["sounds"] as? [Any]) ?? [] {
-                    guard let file = sound["file"] as? String else { continue }
-                    let rel = file.hasPrefix("sounds/") ? String(file.dropFirst(7)) : (file as NSString).lastPathComponent
-                    guard Self.safe(rel), !rel.lowercased().hasSuffix(".ogg"), seen.insert(rel).inserted else { continue }
-                    files.append((rel, sound["sha256"] as? String))
-                }
-            }
+            for sound in categories.values.joined() where seen.insert(sound.rel).inserted { files.append(sound) }
             guard !files.isEmpty else { return done("no sounds macOS can play") }
             do {
                 try fm.createDirectory(at: staging.appendingPathComponent("sounds"), withIntermediateDirectories: true)
@@ -950,8 +1100,7 @@ final class PackStore {
                     return done(nil)
                 }
                 let (rel, sha) = files[i]
-                let encoded = rel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "?!()")))
-                guard let encoded = encoded, let url = URL(string: base + "/sounds/" + encoded) else {
+                guard let url = Self.url(base: base, rel) else {
                     try? fm.removeItem(at: staging)
                     return done("bad file name \(rel)")
                 }
@@ -1008,52 +1157,220 @@ final class PackStore {
     }
 }
 
-/// The registry, searchable, in a window of its own: pick a pack and Install.
-final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
-    private let store: PackStore
-    private let onInstalled: (String) -> Void
-    /// The pack in use, so it is never deleted underneath the app.
-    private let onCurrentPack: () -> String
-    /// Called after a removal, so the picker drops it.
-    private let onRemoved: () -> Void
-    private let table = NSTableView()
-    private let search = NSSearchField()
-    private let status = NSTextField(labelWithString: "")
-    private let installButton = NSButton(title: "Install", target: nil, action: nil)
-    private let removeButton = NSButton(title: "Remove", target: nil, action: nil)
-    private var shown: [RegistryPack] = []
-    private var busy = false
+/// The global sound settings as controls: the switch and the volume on one
+/// row, which events sound on another, each with a ▶ to hear it. The sessions
+/// window and the pack browser each hold a copy; a change in either redraws
+/// both. The app's own colours throughout, not the system accent: a blue
+/// switch and blue boxes would be the only colour that means nothing.
+final class SoundControls: NSObject {
+    /// The events that can sound, in the order the toggles show them.
+    static let events: [(key: String, title: String)] = [
+        ("task.complete", "done"), ("task.error", "error"), ("input.required", "needs you"),
+        ("resource.limit", "limit"), ("user.spam", "spam"),
+    ]
+    static func title(_ key: String) -> String { events.first { $0.key == key }?.title ?? key }
+    /// Posted after a control changes a setting or the pack in use changes.
+    static let changed = Notification.Name("SoundControlsChanged")
 
-    init(
-        store: PackStore, current: @escaping () -> String, onInstalled: @escaping (String) -> Void,
-        onRemoved: @escaping () -> Void
-    ) {
-        self.store = store
-        self.onCurrentPack = current
-        self.onInstalled = onInstalled
-        self.onRemoved = onRemoved
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 460),
-            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        window.title = "Sound packs"
-        super.init(window: window)
-        build()
-        status.stringValue = "Loading the registry…"
-        store.refreshIndex { [weak self] error in
-            self?.filter()
-            if let error = error { self?.status.stringValue = "Registry not refreshed: \(error)" }
+    let volumeRow = NSStackView()
+    let eventRow = NSStackView()
+    private let center: EventCenter
+    /// The speaker glyph the Sound column uses, as the switch for every session.
+    private let soundSwitch = NSButton(title: "", target: nil, action: nil)
+    private let volumeSlider = NSSlider(value: 0.35, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let volumeLabel = NSTextField(labelWithString: "")
+    private var eventBoxes: [NSButton] = []
+    private var previewButtons: [NSButton] = []
+
+    /// What ▶ plays and whether it has anything to; the pack in use when unset.
+    var previewer: ((String) -> Void)?
+    var previewable: ((String) -> Bool)?
+    /// What a volume change plays; the pack in use when unset.
+    var sampler: (() -> Void)?
+    /// Where a line of feedback goes.
+    var report: (String) -> Void = { _ in }
+
+    /// `roomy` for the pack browser, where ▶ is the point of the window: the
+    /// largest glyph, on a target the size of a small button. The header's has
+    /// to fit beside the quotas, so it is smaller, on a smaller target.
+    init(center: EventCenter, roomy: Bool = false) {
+        self.center = center
+        super.init()
+        soundSwitch.isBordered = false
+        soundSwitch.target = self
+        soundSwitch.action = #selector(soundSwitched)
+        volumeSlider.controlSize = .mini
+        volumeSlider.trackFillColor = Palette.dim
+        volumeSlider.target = self
+        volumeSlider.action = #selector(volumeChanged)
+        volumeSlider.isContinuous = false
+        volumeSlider.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        volumeSlider.setAccessibilityLabel("Volume")
+        // The share, as the quota bars carry theirs; muted reads 0%, because
+        // that is what comes out.
+        volumeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        volumeLabel.alignment = .right
+        volumeLabel.translatesAutoresizingMaskIntoConstraints = false
+        volumeLabel.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        for view in [soundSwitch, volumeSlider, volumeLabel] { volumeRow.addArrangedSubview(view) }
+        volumeRow.spacing = 8
+
+        // Text toggles rather than checkboxes: ● on, ○ off, in the palette.
+        eventBoxes = Self.events.map { event in
+            let box = NSButton(title: "", target: self, action: #selector(eventToggled))
+            box.isBordered = false
+            box.identifier = NSUserInterfaceItemIdentifier(event.key)
+            return box
+        }
+        // A ▶ beside each: its sounds one by one, in the pack's order.
+        previewButtons = Self.events.map { event in
+            let play = NSButton(title: "", target: self, action: #selector(previewEvent))
+            play.isBordered = false
+            play.attributedTitle = NSAttributedString(
+                string: "▶",
+                attributes: [.font: NSFont.systemFont(ofSize: roomy ? 13 : 9), .foregroundColor: roomy ? Palette.text : Palette.dim])
+            play.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                play.widthAnchor.constraint(equalToConstant: roomy ? 26 : 18),
+                play.heightAnchor.constraint(equalToConstant: roomy ? 22 : 18),
+            ])
+            play.identifier = NSUserInterfaceItemIdentifier(event.key)
+            play.toolTip = "Play the next \(event.title) sound"
+            play.setAccessibilityLabel("Preview \(event.title) sounds")
+            return play
+        }
+        for (box, play) in zip(eventBoxes, previewButtons) {
+            let pair = NSStackView(views: [box, play])
+            pair.spacing = 2
+            // ▶ centres on the label: on a shared baseline it rides low.
+            pair.alignment = .centerY
+            eventRow.addArrangedSubview(pair)
+        }
+        eventRow.spacing = roomy ? 6 : 8
+        redraw()
+        NotificationCenter.default.addObserver(
+            forName: Self.changed, object: nil, queue: .main) { [weak self] _ in self?.redraw() }
+    }
+
+    /// Everything from the settings, and ▶ only where there is a sound to play.
+    func redraw() {
+        let settings = center.current
+        let on = settings.enabled
+        soundSwitch.attributedTitle = NSAttributedString(
+            string: on ? "\u{F057E}" : "\u{F0581}",
+            attributes: [.font: barFont, .foregroundColor: on ? Palette.text : Palette.dim])
+        soundSwitch.toolTip = on ? "Sounds on — click to turn them off" : "Sounds off — click to turn them on"
+        soundSwitch.setAccessibilityLabel("Sounds for every session, \(on ? "on" : "off")")
+        volumeSlider.floatValue = settings.volume
+        let percent = on ? Int((settings.volume * 100).rounded()) : 0
+        volumeLabel.stringValue = "\(percent)%"
+        volumeLabel.textColor = percent == 0 ? Palette.dim : Palette.text
+        volumeLabel.setAccessibilityLabel("Volume \(percent) percent")
+        for box in eventBoxes {
+            let key = box.identifier?.rawValue ?? ""
+            let on = settings.categories[key] == true
+            box.attributedTitle = NSAttributedString(
+                string: (on ? "● " : "○ ") + Self.title(key),
+                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
+            box.setAccessibilityLabel("\(Self.title(key)) sounds, \(on ? "on" : "off")")
+        }
+        for play in previewButtons {
+            let key = play.identifier?.rawValue ?? ""
+            play.isEnabled = previewable?(key) ?? (center.soundCount(key) > 0)
         }
     }
 
+    private func changed() {
+        NotificationCenter.default.post(name: Self.changed, object: nil)
+    }
+
+    @objc private func soundSwitched() {
+        center.update { $0.enabled.toggle() }
+        changed()
+    }
+
+    @objc private func volumeChanged() {
+        let volume = volumeSlider.floatValue
+        // Dragged to nothing is muted, and up from nothing is on: the switch
+        // says so too.
+        center.update {
+            $0.volume = volume
+            if volume == 0 { $0.enabled = false } else if !$0.enabled { $0.enabled = true }
+        }
+        changed()
+        if let sampler = sampler { sampler() } else { center.preview() }
+    }
+
+    @objc private func eventToggled(_ box: NSButton) {
+        guard let key = box.identifier?.rawValue else { return }
+        center.update { $0.categories[key] = $0.categories[key] != true }
+        changed()
+    }
+
+    @objc private func previewEvent(_ play: NSButton) {
+        guard let key = play.identifier?.rawValue else { return }
+        if let previewer = previewer { return previewer(key) }
+        guard let place = center.previewNext(key) else { return }
+        report("\(center.current.pack) · \(Self.title(key)) \(place.index) of \(place.count)")
+    }
+}
+
+/// The registry, searchable, in a window of its own, with the installed packs
+/// first: pick one to hear it with the same controls the sessions window has,
+/// then Use it, or Install it first.
+final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    private let store: PackStore
+    private let events: EventCenter
+    private let controls: SoundControls
+    private let table = NSTableView()
+    private let search = NSSearchField()
+    private let status = NSTextField(labelWithString: "")
+    private let actionButton = NSButton(title: "Install", target: nil, action: nil)
+    private let removeButton = NSButton(title: "Remove", target: nil, action: nil)
+    private var shown: [RegistryPack] = []
+    private var installed: Set<String> = []
+    private var busy = false
+    /// Where each not-installed pack's category preview is, by "pack/category".
+    private var previewPlace: [String: Int] = [:]
+
+    init(store: PackStore, events: EventCenter) {
+        self.store = store
+        self.events = events
+        controls = SoundControls(center: events, roomy: true)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 500),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "Sound packs"
+        // The controls draw in the sessions window's palette, which is dark.
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.contentMinSize = NSSize(width: 560, height: 300)
+        super.init(window: window)
+        build()
+        status.stringValue = "Loading the registry…"
+        filter(selecting: events.current.pack)
+        store.refreshIndex { [weak self] error in
+            guard let self = self else { return }
+            self.filter(selecting: self.selected?.name ?? events.current.pack)
+            if let error = error { self.status.stringValue = "Registry not refreshed: \(error)" }
+        }
+        NotificationCenter.default.addObserver(
+            forName: SoundControls.changed, object: nil, queue: .main) { [weak self] _ in self?.refresh() }
+    }
+
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    private var selected: RegistryPack? {
+        let row = table.selectedRow
+        return row >= 0 && row < shown.count ? shown[row] : nil
+    }
 
     private func build() {
         guard let content = window?.contentView else { return }
         search.placeholderString = "Search name, language or description"
         search.delegate = self
         let columns: [(String, String, CGFloat)] = [
-            ("name", "Pack", 200), ("language", "Lang", 50), ("sounds", "Sounds", 60), ("size", "Size", 70),
-            ("installed", "", 30),
+            ("name", "Pack", 220), ("language", "Lang", 50), ("sounds", "Sounds", 60), ("size", "Size", 70),
+            ("installed", "", 60),
         ]
         for (key, title, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
@@ -1064,20 +1381,28 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         table.dataSource = self
         table.delegate = self
         table.target = self
-        table.doubleAction = #selector(installSelected)
+        table.doubleAction = #selector(act)
         table.usesAlternatingRowBackgroundColors = true
+        table.rowHeight = 22
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
-        installButton.target = self
-        installButton.action = #selector(installSelected)
-        installButton.keyEquivalent = "\r"
+        actionButton.target = self
+        actionButton.action = #selector(act)
+        actionButton.keyEquivalent = "\r"
         removeButton.target = self
         removeButton.action = #selector(removeSelected)
-        table.rowHeight = 22
         status.textColor = .secondaryLabelColor
         status.lineBreakMode = .byTruncatingTail
-        for view in [search, scroll, status, installButton, removeButton] as [NSView] {
+        controls.previewer = { [weak self] key in self?.preview(key) }
+        controls.previewable = { [weak self] key in self?.canPreview(key) ?? false }
+        controls.sampler = { [weak self] in self?.sample() }
+        controls.report = { [weak self] line in self?.status.stringValue = line }
+        let gap = NSView()
+        gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let soundRow = NSStackView(views: [controls.volumeRow, gap, controls.eventRow])
+        soundRow.distribution = .fill
+        for view in [search, scroll, soundRow, status, actionButton, removeButton] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -1088,38 +1413,134 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
             scroll.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            scroll.bottomAnchor.constraint(equalTo: installButton.topAnchor, constant: -8),
-            installButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            installButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
-            removeButton.trailingAnchor.constraint(equalTo: installButton.leadingAnchor, constant: -8),
-            removeButton.centerYAnchor.constraint(equalTo: installButton.centerYAnchor),
+            scroll.bottomAnchor.constraint(equalTo: soundRow.topAnchor, constant: -10),
+            soundRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            soundRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            soundRow.bottomAnchor.constraint(equalTo: actionButton.topAnchor, constant: -10),
+            actionButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            actionButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            removeButton.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -8),
+            removeButton.centerYAnchor.constraint(equalTo: actionButton.centerYAnchor),
             status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            status.centerYAnchor.constraint(equalTo: installButton.centerYAnchor),
+            status.centerYAnchor.constraint(equalTo: actionButton.centerYAnchor),
             status.trailingAnchor.constraint(lessThanOrEqualTo: removeButton.leadingAnchor, constant: -12),
         ])
     }
 
-    func controlTextDidChange(_ obj: Notification) { filter() }
+    /// Opens on the pack in use, whatever was searched last time.
+    func present() {
+        search.stringValue = ""
+        filter(selecting: events.current.pack)
+        showWindow(nil)
+        window?.makeFirstResponder(table)
+    }
 
-    private func filter() {
+    func controlTextDidChange(_ obj: Notification) { filter(selecting: selected?.name) }
+
+    /// The installed packs first, those the registry does not list among them,
+    /// then the rest in the registry's order.
+    private func filter(selecting name: String?) {
+        installed = store.installed
+        let registry = store.packs
+        let listed = Set(registry.map(\.name))
+        let local = installed.subtracting(listed).sorted().map { RegistryPack(local: $0) }
+        let all = local + registry
         let term = search.stringValue.lowercased()
-        shown = store.packs.filter { pack in
+        let matching = all.filter { pack in
             term.isEmpty
                 || [pack.name, pack.display_name, pack.language, pack.description].compactMap { $0 }
                     .contains { $0.lowercased().contains(term) }
         }
+        shown = matching.filter { installed.contains($0.name) } + matching.filter { !installed.contains($0.name) }
         table.reloadData()
-        updateButtons()
-        if !busy { status.stringValue = "\(shown.count) of \(store.packs.count) packs · \(store.installed.count) installed" }
+        if let name = name, let row = shown.firstIndex(where: { $0.name == name }) {
+            table.selectRowIndexes([row], byExtendingSelection: false)
+            table.scrollRowToVisible(row)
+        }
+        refresh()
+        guard !busy else { return }
+        if selected != nil { describeSelected() } else {
+            status.stringValue = "\(shown.count) of \(all.count) packs · \(installed.count) installed"
+        }
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) { updateButtons() }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        refresh()
+        if !busy { describeSelected() }
+    }
 
-    private func updateButtons() {
-        let row = table.selectedRow
-        let pack = row >= 0 && row < shown.count ? shown[row] : nil
-        installButton.isEnabled = !busy && pack != nil
-        removeButton.isEnabled = !busy && pack.map { store.installed.contains($0.name) } == true
+    /// The status line names the selected pack, and whether it is here: the
+    /// ▶s play whichever pack this says.
+    private func describeSelected() {
+        guard let pack = selected else { return }
+        let name = pack.display_name ?? pack.name
+        let where_ = pack.name == events.current.pack ? "in use"
+            : installed.contains(pack.name) ? "installed"
+            : "not installed" + (pack.sound_count.map { " · \($0) sounds" } ?? "")
+                + (pack.total_size_bytes.map { ", \(bytes(UInt64($0)))" } ?? "")
+        status.stringValue = "\(name) — \(where_)"
+    }
+
+    /// The buttons and the ▶s for the selected pack, and the in-use mark.
+    private func refresh() {
+        let pack = selected
+        let current = events.current.pack
+        let isInstalled = pack.map { installed.contains($0.name) } == true
+        if pack?.name == current {
+            actionButton.title = "In use"
+            actionButton.isEnabled = false
+        } else {
+            actionButton.title = isInstalled ? "Use" : "Install"
+            actionButton.isEnabled = !busy && pack != nil
+        }
+        removeButton.isEnabled = !busy && isInstalled && pack?.name != current
+        controls.redraw()
+        if let column = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "installed" }),
+            !shown.isEmpty
+        {
+            table.reloadData(forRowIndexes: IndexSet(integersIn: 0..<shown.count), columnIndexes: [column])
+        }
+    }
+
+    private func canPreview(_ key: String) -> Bool {
+        guard let pack = selected else { return false }
+        if installed.contains(pack.name) { return events.soundCount(key, pack: pack.name) > 0 }
+        return pack.categories?.contains(key) ?? true
+    }
+
+    /// The selected pack's next sound for the event: from disk when installed,
+    /// else fetched from the pack's repo the first time it is played.
+    private func preview(_ key: String) {
+        guard let pack = selected else { return }
+        let title = SoundControls.title(key)
+        let name = pack.display_name ?? pack.name
+        if installed.contains(pack.name) {
+            guard let place = events.previewNext(key, pack: pack.name) else { return }
+            status.stringValue = "\(name) · \(title) \(place.index) of \(place.count)"
+            return
+        }
+        let slot = pack.name + "/" + key
+        let index = previewPlace[slot] ?? 0
+        status.stringValue = "\(name) · \(title): fetching from GitHub…"
+        store.previewSound(pack, key, index: index) { [weak self] file, place, count, error in
+            guard let self = self else { return }
+            guard let file = file else {
+                self.status.stringValue = "\(name) · \(title): \(error ?? "no sound")"
+                return
+            }
+            self.previewPlace[slot] = place
+            self.events.playFile(file)
+            self.status.stringValue = "\(name) · \(title) \(place) of \(count), not installed"
+        }
+    }
+
+    /// A volume change plays the selected pack when its sounds are here, and
+    /// the pack in use otherwise: a slider is no reason to fetch anything.
+    private func sample() {
+        if let pack = selected, installed.contains(pack.name), events.previewNext("task.complete", pack: pack.name) != nil {
+            return
+        }
+        events.preview()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
@@ -1133,7 +1554,8 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         case "language": text = pack.language ?? ""
         case "sounds": text = pack.sound_count.map(String.init) ?? ""
         case "size": text = pack.total_size_bytes.map { bytes(UInt64($0)) } ?? ""
-        case "installed": text = store.installed.contains(pack.name) ? "✓" : ""
+        case "installed":
+            text = pack.name == events.current.pack ? "in use" : installed.contains(pack.name) ? "✓" : ""
         default: text = ""
         }
         let field = NSTextField(labelWithString: text)
@@ -1152,16 +1574,43 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         return cell
     }
 
+    /// Return, a double-click and the button: use an installed pack, install
+    /// one that is not and use it.
+    @objc private func act() {
+        guard !busy, let pack = selected, pack.name != events.current.pack else { return }
+        if installed.contains(pack.name) { return use(pack.name) }
+        busy = true
+        refresh()
+        // Says what it is about to fetch before it does.
+        status.stringValue = "\(pack.name): \(pack.sound_count.map { "\($0) sounds" } ?? "sounds")"
+            + (pack.total_size_bytes.map { ", \(bytes(UInt64($0)))" } ?? "") + " from GitHub…"
+        store.install(pack, progress: { [weak self] done, total in
+            self?.status.stringValue = "\(pack.name): \(done) of \(total)"
+        }, done: { [weak self] error in
+            guard let self = self else { return }
+            self.busy = false
+            if let error = error {
+                self.status.stringValue = "\(pack.name) not installed: \(error)"
+                self.refresh()
+            } else {
+                self.events.forget(pack.name)
+                self.use(pack.name)
+                self.filter(selecting: pack.name)
+            }
+        })
+    }
+
+    private func use(_ name: String) {
+        events.update { $0.pack = name }
+        NotificationCenter.default.post(name: SoundControls.changed, object: nil)
+        events.preview()
+        describeSelected()
+    }
+
     @objc private func removeSelected() {
-        let row = table.selectedRow
-        guard !busy, row >= 0, row < shown.count else { return }
-        let pack = shown[row]
-        guard store.installed.contains(pack.name) else { return }
+        guard !busy, let pack = selected, installed.contains(pack.name) else { return }
         // Deleting files: asked first, and never the pack now in use.
-        if pack.name == onCurrentPack() {
-            status.stringValue = "\(pack.name) is in use — choose another pack first"
-            return
-        }
+        guard pack.name != events.current.pack else { return }
         let ask = NSAlert()
         ask.messageText = "Remove the \(pack.display_name ?? pack.name) pack?"
         ask.informativeText = "Its sounds are deleted from disk. You can install it again from here."
@@ -1171,36 +1620,9 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         if let error = store.remove(pack.name) {
             status.stringValue = "\(pack.name) not removed: \(error)"
         } else {
-            status.stringValue = "\(pack.name) removed"
-            table.reloadData()
-            updateButtons()
-            onRemoved()
+            events.forget(pack.name)
+            filter(selecting: pack.name)
         }
-    }
-
-    @objc private func installSelected() {
-        let row = table.selectedRow
-        guard !busy, row >= 0, row < shown.count else { return }
-        let pack = shown[row]
-        busy = true
-        installButton.isEnabled = false
-        // Says what it is about to fetch before it does.
-        status.stringValue = "\(pack.name): \(pack.sound_count.map { "\($0) sounds" } ?? "sounds")"
-            + (pack.total_size_bytes.map { ", \(bytes(UInt64($0)))" } ?? "") + " from GitHub…"
-        store.install(pack, progress: { [weak self] done, total in
-            self?.status.stringValue = "\(pack.name): \(done) of \(total)"
-        }, done: { [weak self] error in
-            guard let self = self else { return }
-            self.busy = false
-            self.installButton.isEnabled = true
-            if let error = error {
-                self.status.stringValue = "\(pack.name) not installed: \(error)"
-            } else {
-                self.status.stringValue = "\(pack.name) installed and chosen"
-                self.table.reloadData()
-                self.onInstalled(pack.name)
-            }
-        })
     }
 }
 
@@ -1708,21 +2130,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let selfCost = SelfCost()
     private let events = EventCenter()
     private let soundBar = NSStackView()
-    /// The speaker glyph the Sound column uses, as the switch for every session.
-    private let soundSwitch = NSButton(title: "", target: nil, action: nil)
-    private let volumeSlider = NSSlider(value: 0.35, minValue: 0, maxValue: 1, target: nil, action: nil)
-    private let packMenu = NSPopUpButton()
-    private let volumeLabel = NSTextField(labelWithString: "")
-    /// The events that can sound, in the order the checkboxes show them.
-    private static let soundEvents: [(key: String, title: String)] = [
-        ("task.complete", "done"), ("task.error", "error"), ("input.required", "needs you"),
-        ("resource.limit", "limit"), ("user.spam", "spam"),
-    ]
-    private var eventBoxes: [NSButton] = []
+    private lazy var soundControls = SoundControls(center: events)
+    /// The pack in use; a click opens the browser to hear and choose others.
+    private let packButton = NSButton(title: "", target: nil, action: nil)
     private let packStore = PackStore()
     private var packBrowser: PackBrowser?
-    private static let morePacks = "More packs…"
-    private var previewButtons: [NSButton] = []
     private let latest = LatestVersion()
     private var watcher: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
@@ -1918,188 +2330,50 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// Everything applies at once; a session can override the switch in the
     /// Sound column.
     private func buildSoundBar() {
-        let settings = events.current
         soundBar.orientation = .vertical
         soundBar.alignment = .trailing
         soundBar.spacing = 6
         soundBar.translatesAutoresizingMaskIntoConstraints = false
-
-        // The app's own colours throughout, not the system accent: a blue switch
-        // and blue boxes would be the only colour in the header that means nothing.
-        soundSwitch.isBordered = false
-        soundSwitch.target = self
-        soundSwitch.action = #selector(soundSwitched)
-        drawSoundSwitch()
-        volumeSlider.controlSize = .mini
-        volumeSlider.trackFillColor = Palette.dim
-        volumeSlider.floatValue = settings.volume
-        volumeSlider.target = self
-        volumeSlider.action = #selector(volumeChanged)
-        volumeSlider.isContinuous = false
-        volumeSlider.widthAnchor.constraint(equalToConstant: 80).isActive = true
-        volumeSlider.setAccessibilityLabel("Volume")
-        // The share, as the quota bars carry theirs; muted reads 0%, because
-        // that is what comes out.
-        volumeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        volumeLabel.alignment = .right
-        volumeLabel.translatesAutoresizingMaskIntoConstraints = false
-        volumeLabel.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        drawVolume()
-        packMenu.controlSize = .small
-        packMenu.isBordered = false
-        packMenu.font = NSFont.systemFont(ofSize: 11)
-        fillPackMenu()
-        packMenu.target = self
-        packMenu.action = #selector(packChosen)
-        packMenu.setAccessibilityLabel("Sound pack")
-        // The pack menu sits at the right edge, over the end of the checkbox
-        // row; the gap before it takes up the difference.
+        soundControls.report = { [weak self] line in self?.note(line) }
+        packButton.isBordered = false
+        packButton.target = self
+        packButton.action = #selector(openPacks)
+        packButton.toolTip = "Hear, choose and install sound packs"
+        drawPackButton()
+        // The switch changes the Sound column; a new pack changes the button.
+        NotificationCenter.default.addObserver(
+            forName: SoundControls.changed, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.drawPackButton()
+            self?.refreshTable()
+        }
+        // The pack sits at the right edge, over the end of the event row; the
+        // gap before it takes up the difference.
         let gap = NSView()
         gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let top = NSStackView(views: [soundSwitch, volumeSlider, volumeLabel, gap, packMenu])
+        let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
         top.spacing = 8
         top.distribution = .fill
-
-        // Text toggles rather than checkboxes: ● on, ○ off, in the palette.
-        eventBoxes = Self.soundEvents.map { event in
-            let box = NSButton(title: "", target: self, action: #selector(eventToggled))
-            box.isBordered = false
-            box.identifier = NSUserInterfaceItemIdentifier(event.key)
-            drawEventToggle(box, on: settings.categories[event.key] == true)
-            return box
-        }
-        // A ▸ beside each: its sounds one by one, in the pack's order.
-        previewButtons = Self.soundEvents.map { event in
-            // ▸ at the labels' own size sits at their text height; a smaller ▶
-            // rode high beside them.
-            let play = NSButton(title: "", target: self, action: #selector(previewEvent))
-            play.isBordered = false
-            play.attributedTitle = NSAttributedString(
-                string: "▸", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim])
-            play.identifier = NSUserInterfaceItemIdentifier(event.key)
-            play.toolTip = "Play the next \(event.title) sound"
-            play.setAccessibilityLabel("Preview \(event.title) sounds")
-            return play
-        }
-        let pairs = zip(eventBoxes, previewButtons).map { box, play -> NSView in
-            let pair = NSStackView(views: [box, play])
-            pair.spacing = 2
-            pair.alignment = .firstBaseline
-            return pair
-        }
-        let boxes = NSStackView(views: pairs)
-        boxes.spacing = 10
-        updatePreviewButtons()
         soundBar.addArrangedSubview(top)
-        soundBar.addArrangedSubview(boxes)
-        top.widthAnchor.constraint(equalTo: boxes.widthAnchor).isActive = true
+        soundBar.addArrangedSubview(soundControls.eventRow)
+        top.widthAnchor.constraint(equalTo: soundControls.eventRow.widthAnchor).isActive = true
     }
 
-    private func drawVolume() {
-        let settings = events.current
-        let percent = settings.enabled ? Int((settings.volume * 100).rounded()) : 0
-        volumeLabel.stringValue = "\(percent)%"
-        volumeLabel.textColor = percent == 0 ? Palette.dim : Palette.text
-        volumeLabel.setAccessibilityLabel("Volume \(percent) percent")
+    private func drawPackButton() {
+        let title = NSMutableAttributedString(
+            string: events.current.pack, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.text])
+        title.append(NSAttributedString(
+            string: " ›", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim]))
+        packButton.attributedTitle = title
+        packButton.setAccessibilityLabel("Sound pack \(events.current.pack), choose another")
     }
 
-    private func drawSoundSwitch() {
-        let on = events.current.enabled
-        soundSwitch.attributedTitle = NSAttributedString(
-            string: on ? "\u{F057E}" : "\u{F0581}",
-            attributes: [.font: barFont, .foregroundColor: on ? Palette.text : Palette.dim])
-        soundSwitch.toolTip = on ? "Sounds on — click to turn them off" : "Sounds off — click to turn them on"
-        soundSwitch.setAccessibilityLabel("Sounds for every session, \(on ? "on" : "off")")
-    }
-
-    private func drawEventToggle(_ box: NSButton, on: Bool) {
-        let title = Self.soundEvents.first { $0.key == box.identifier?.rawValue }?.title ?? ""
-        box.attributedTitle = NSAttributedString(
-            string: (on ? "● " : "○ ") + title,
-            attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
-        box.setAccessibilityLabel("\(title) sounds, \(on ? "on" : "off")")
-    }
-
-    @objc private func soundSwitched() {
-        events.update { $0.enabled.toggle() }
-        drawSoundSwitch()
-        drawVolume()
-        refreshTable()
-    }
-
-    @objc private func volumeChanged() {
-        events.update { $0.volume = volumeSlider.floatValue }
-        drawVolume()
-        // Dragged to nothing is muted: the switch says so too.
-        if volumeSlider.floatValue == 0, events.current.enabled {
-            events.update { $0.enabled = false }
-            drawSoundSwitch()
-            drawVolume()
-            refreshTable()
-        } else if volumeSlider.floatValue > 0, !events.current.enabled {
-            events.update { $0.enabled = true }
-            drawSoundSwitch()
-            drawVolume()
-            refreshTable()
-        }
-        events.preview()
-    }
-
-    /// The installed packs, then the way to more.
-    private func fillPackMenu() {
-        packMenu.removeAllItems()
-        packMenu.addItems(withTitles: events.packs)
-        packMenu.menu?.addItem(.separator())
-        packMenu.addItem(withTitle: Self.morePacks)
-        packMenu.selectItem(withTitle: events.current.pack)
-    }
-
-    @objc private func packChosen() {
-        guard let pack = packMenu.titleOfSelectedItem else { return }
-        if pack == Self.morePacks {
-            packMenu.selectItem(withTitle: events.current.pack)
-            if packBrowser == nil {
-                packBrowser = PackBrowser(
-                    store: packStore, current: { [weak self] in self?.events.current.pack ?? "" },
-                    onInstalled: { [weak self] name in
-                        guard let self = self else { return }
-                        self.events.update { $0.pack = name }
-                        self.events.reloadPack()
-                        self.fillPackMenu()
-                        self.updatePreviewButtons()
-                        self.events.preview()
-                    },
-                    onRemoved: { [weak self] in self?.fillPackMenu() })
-            }
-            packBrowser?.showWindow(nil)
+    @objc private func openPacks() {
+        if packBrowser == nil {
+            packBrowser = PackBrowser(store: packStore, events: events)
             packBrowser?.window?.center()
-            return
         }
-        events.update { $0.pack = pack }
-        updatePreviewButtons()
-        events.preview()
-    }
-
-    /// A pack without sounds for an event has nothing to preview there.
-    private func updatePreviewButtons() {
-        for play in previewButtons {
-            play.isEnabled = events.soundCount(play.identifier?.rawValue ?? "") > 0
-        }
-    }
-
-    @objc private func previewEvent(_ play: NSButton) {
-        guard let key = play.identifier?.rawValue,
-            let title = Self.soundEvents.first(where: { $0.key == key })?.title,
-            let place = events.previewNext(key)
-        else { return }
-        note("\(events.current.pack) · \(title) \(place.index) of \(place.count)")
-    }
-
-    @objc private func eventToggled(_ box: NSButton) {
-        guard let key = box.identifier?.rawValue else { return }
-        let on = events.current.categories[key] != true
-        events.update { $0.categories[key] = on }
-        drawEventToggle(box, on: on)
+        packBrowser?.present()
     }
 
     // MARK: Loading
