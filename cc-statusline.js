@@ -1101,6 +1101,8 @@ function liveSnapshot(columns) {
         file,
         updated_at: entry.updated_at,
         active_at: entry.last_message_at ?? entry.updated_at,
+        // Older spools lack the field, so a missing time alone proves nothing.
+        never_prompted: entry.last_message_at === null || entry.last_message_at === undefined,
         tty: entry.tty || null,
         pid: entry.pid || null,
         redraw: entry.redraw || null,
@@ -1156,8 +1158,12 @@ function liveSnapshot(columns) {
     for (const e of list) e.transcript = transcriptScan(e.summary.session_id, e.transcript_path, fresh);
   }
 
+  // A session that ended without ever having a prompt has nothing to show and
+  // nothing to resume: its spool goes as soon as it is found finished. Both
+  // tests, since a spool from before last_message_at was recorded has none.
+  const empty = new Set(ended.slice(0, LIVE_HISTORY_MAX).filter((e) => e.never_prompted && !e.transcript));
   // The oldest finished sessions fall off the end of the history.
-  for (const stale of ended.slice(LIVE_HISTORY_MAX)) {
+  for (const stale of [...empty, ...ended.slice(LIVE_HISTORY_MAX)]) {
     try {
       unlinkSync(stale.file);
     } catch {}
@@ -1166,7 +1172,7 @@ function liveSnapshot(columns) {
     } catch {}
   }
 
-  const strip = ({ file, transcript_path, ...rest }) => rest;
+  const strip = ({ file, transcript_path, never_prompted, ...rest }) => rest;
   // The Fable quota for the whole account, straight from the shared cache: a
   // session only reports it while it runs Fable, but the window shows it always.
   // Past its reset the reading is spent, and the quota is back to 0. Shown
@@ -1179,7 +1185,7 @@ function liveSnapshot(columns) {
     fable = { percent: over ? 0 : cached.fable.percent, resets_at: over ? null : resets, read_at: cached.fetched_at ?? null };
   }
   const health = Object.entries(readHealth()).map(([key, value]) => ({ key, ...value }));
-  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).map(strip), fable, health };
+  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).filter((e) => !empty.has(e)).map(strip), fable, health };
 }
 
 function main() {
