@@ -1651,6 +1651,7 @@ enum Palette {
     static let frame = NSColor(srgbRed: 0.259, green: 0.271, blue: 0.314, alpha: 1)
     static let yellow = NSColor(srgbRed: 0.898, green: 0.753, blue: 0.482, alpha: 1)
     static let red = NSColor(srgbRed: 0.878, green: 0.424, blue: 0.459, alpha: 1)
+    static let blue = NSColor(srgbRed: 0.494, green: 0.690, blue: 0.918, alpha: 1)
     /// Claude Code's own orange, for the ✻ it draws beside a pending agent.
     static let orange = NSColor(srgbRed: 215 / 255, green: 119 / 255, blue: 87 / 255, alpha: 1)
 
@@ -1961,6 +1962,9 @@ final class BarView: NSView {
     /// The tick drawn in white instead of cut out: the end of the current hour
     /// or day, the share a steady pace would have used by then.
     var markedTick: Int? { didSet { needsDisplay = true } }
+    /// A blue tick at this share of the bar: where the pace row's projection
+    /// lands by the reset. Nil, or past the end, draws none.
+    var projection: Double? { didSet { needsDisplay = true } }
 
     static let thickness: CGFloat = 4
 
@@ -1984,12 +1988,20 @@ final class BarView: NSView {
     /// part and the empty track alike.
     override func draw(_ dirtyRect: NSRect) {
         drawBar()
-        guard divisions > 1 else { return }
-        for i in 1..<divisions {
-            (i == markedTick ? Palette.text : Palette.background).setFill()
-            let x = (bounds.width * CGFloat(i) / CGFloat(divisions)).rounded()
-            // Only as tall as the bar itself, not the frame around it.
+        // Only as tall as the bar itself, not the frame around it.
+        func tick(_ x: CGFloat) {
             NSRect(x: x, y: (bounds.height - Self.thickness) / 2, width: 1, height: Self.thickness).fill()
+        }
+        if divisions > 1 {
+            for i in 1..<divisions {
+                (i == markedTick ? Palette.text : Palette.background).setFill()
+                tick((bounds.width * CGFloat(i) / CGFloat(divisions)).rounded())
+            }
+        }
+        // Drawn last, so it wins where it falls on an hour or day.
+        if let projection = projection, projection > 0, projection < 1 {
+            Palette.blue.setFill()
+            tick((bounds.width * CGFloat(projection)).rounded())
         }
     }
 }
@@ -3317,11 +3329,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let ghost = Palette.dim.withAlphaComponent(0.55)
         var projection = ""
         var projectionColour = ghost
+        var projected: Double? = nil
         // Too early in the window, a rate is mostly noise: a single prompt a
         // minute after the reset would read as a runaway pace.
         if elapsed >= 0.02 {
             let pace = percent / elapsed
             projection = "on pace for \(Int(pace.rounded()))%"
+            projected = pace / 100
             if pace >= 100 {
                 projectionColour = Palette.red.withAlphaComponent(0.75)
             } else if pace >= 85 {
@@ -3332,6 +3346,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let paceBar = bar(elapsed, ghost)
         remember(paceBar, title + " pace")
         paceBar.markedTick = marked
+        paceBar.projection = projected
         grid.addRow(with: [
             label("pace target", ghost, NSFont.systemFont(ofSize: 11)), paceBar,
             label(elapsedText, ghost, small), label(projection, projectionColour, small),
