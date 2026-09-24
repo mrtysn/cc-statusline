@@ -1508,10 +1508,6 @@ func bringITermForward(label: String) {
 
 /// A drawn progress bar. The terminal's ASCII bar earns its place in a row of
 /// text; in a window a real bar reads faster and takes less room.
-/// Whether to animate at all: with Reduce motion on, every transition here is an
-/// immediate change instead.
-var motionAllowed: Bool { !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
-
 final class BarView: NSView {
     var fraction: Double = 0 { didSet { shown = CGFloat(fraction) } }
     /// What is drawn: `fraction`, or a value on its way there.
@@ -1528,7 +1524,7 @@ final class BarView: NSView {
         super.viewDidMoveToWindow()
         guard window != nil, let from = glideFrom else { return }
         glideFrom = nil
-        guard motionAllowed, abs(from - fraction) > 0.001 else { return }
+        guard abs(from - fraction) > 0.001 else { return }
         shown = CGFloat(from)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.25
@@ -1621,7 +1617,6 @@ final class ClickableCell: NSView {
     /// The written confirmation in the header is the static cue, so skipping the
     /// flash under reduced motion loses nothing.
     func flash() {
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         wantsLayer = true
         layer?.backgroundColor = NSColor(srgbRed: 0.898, green: 0.753, blue: 0.482, alpha: 0.22).cgColor
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -1874,7 +1869,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         Column(key: "age", title: "Last Seen", width: 74),
         Column(key: "cwd", title: "Directory", width: 164),
         Column(key: "topic", title: "Doing", width: 300),
-        Column(key: "state", title: "State", width: 128),
+        Column(key: "state", title: "State", width: 112),
         // Beside the state: what a session is doing and how long its cache has
         // are read together.
         Column(key: "cache", title: "Cache", width: 140),
@@ -2384,10 +2379,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         hoveredRow = row
         for (index, level) in [(previous, CGFloat(0)), (row, CGFloat(1))] where index > 0 {
             guard let view = table.rowView(atRow: index, makeIfNecessary: false) as? SessionRowView else { continue }
-            guard motionAllowed else {
-                view.hover = level
-                continue
-            }
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.12
                 view.animator().hover = level
@@ -2411,7 +2402,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
         }
         lastState = seen
-        guard motionAllowed, !changed.isEmpty else { return }
+        guard !changed.isEmpty else { return }
         // After this pass's reload has made its row views.
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -2592,7 +2583,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // doing and how alive it is.
             // A working session's dot is drawn by an overlay that breathes;
             // the glyph stays, clear, to hold its place in the line.
-            let breathes = !past && motionAllowed && isWorking(session)
+            let breathes = !past && isWorking(session)
             let dot = mono(past ? "○  " : "●  ", breathes ? .clear : dotColour(session, past: past))
             // The caption lines up with the topic, not with the dot before it.
             captionIndent = ceil(dot.size().width)
@@ -2622,7 +2613,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             if !past, let running = session.transcript?.agents?.running, running > 0 {
                 // In the status line's orange and with its ✻: the one caption
                 // that means the session will carry on by itself.
-                bottom = "✻ waiting on \(running == 1 ? "1 agent" : "\(running) agents")"
+                bottom = "✻ \(running == 1 ? "1 agent" : "\(running) agents")"
                 captionColour = Palette.orange
             }
         case "tokens":
@@ -2915,7 +2906,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: key == "model" ? -3 : -4),
             field.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
         ])
-        if key == "topic", !past, motionAllowed, isWorking(session) {
+        if key == "topic", !past, isWorking(session) {
             // Over the clear glyph the text keeps, on the same baseline.
             let dot = breathingDot(dotColour(session, past: false))
             cell.addSubview(dot)
