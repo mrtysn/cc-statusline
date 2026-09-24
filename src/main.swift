@@ -1229,6 +1229,8 @@ enum Palette {
     static let frame = NSColor(srgbRed: 0.259, green: 0.271, blue: 0.314, alpha: 1)
     static let yellow = NSColor(srgbRed: 0.898, green: 0.753, blue: 0.482, alpha: 1)
     static let red = NSColor(srgbRed: 0.878, green: 0.424, blue: 0.459, alpha: 1)
+    /// Claude Code's own orange, for the ✻ it draws beside a pending agent.
+    static let orange = NSColor(srgbRed: 215 / 255, green: 119 / 255, blue: 87 / 255, alpha: 1)
 
     /// The status line's own thresholds: faint under 75, yellow from 75, red from 92.
     static func threshold(_ percent: Double?) -> NSColor {
@@ -1506,8 +1508,34 @@ func bringITermForward(label: String) {
 
 /// A drawn progress bar. The terminal's ASCII bar earns its place in a row of
 /// text; in a window a real bar reads faster and takes less room.
+/// Whether to animate at all: with Reduce motion on, every transition here is an
+/// immediate change instead.
+var motionAllowed: Bool { !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
 final class BarView: NSView {
-    var fraction: Double = 0 { didSet { needsDisplay = true } }
+    var fraction: Double = 0 { didSet { shown = CGFloat(fraction) } }
+    /// What is drawn: `fraction`, or a value on its way there.
+    @objc dynamic var shown: CGFloat = 0 { didSet { needsDisplay = true } }
+    /// What this bar's predecessor showed before a refresh rebuilt it. Once on
+    /// screen the bar eases from there, so a new reading moves rather than jumps.
+    var glideFrom: Double?
+
+    override class func defaultAnimation(forKey key: NSAnimatablePropertyKey) -> Any? {
+        key == "shown" ? CABasicAnimation() : super.defaultAnimation(forKey: key)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, let from = glideFrom else { return }
+        glideFrom = nil
+        guard motionAllowed, abs(from - fraction) > 0.001 else { return }
+        shown = CGFloat(from)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            animator().shown = CGFloat(fraction)
+        }
+    }
     var colour: NSColor = .white { didSet { needsDisplay = true } }
     /// Equal parts marked on the bar: 5 for a 5-hour window, 7 for a week, so
     /// each tick is an hour or a day. 0 draws none.
@@ -1524,7 +1552,7 @@ final class BarView: NSView {
         let radius = height / 2
         NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.10).setFill()
         NSBezierPath(roundedRect: track, xRadius: radius, yRadius: radius).fill()
-        let filled = max(0, min(1, fraction))
+        let filled = max(0, min(1, Double(shown)))
         guard filled > 0 else { return }
         let width = max(height, track.width * CGFloat(filled))
         colour.setFill()
@@ -1624,16 +1652,47 @@ final class SessionRowView: NSTableRowView {
         didSet { needsDisplay = true }
     }
 
+    /// Under the mouse, 0 to 1; animated in and out.
+    @objc dynamic var hover: CGFloat = 0 { didSet { needsDisplay = true } }
+    /// A state change, 1 when it lands and fading to 0.
+    @objc dynamic var pulse: CGFloat = 0 { didSet { needsDisplay = true } }
+    var pulseColour = Palette.text
+
+    override class func defaultAnimation(forKey key: NSAnimatablePropertyKey) -> Any? {
+        key == "hover" || key == "pulse" ? CABasicAnimation() : super.defaultAnimation(forKey: key)
+    }
+
+    /// Where hover, pulse and selection draw: inset from the table's edges and
+    /// rounded, and on the boundary row only the part below the line.
+    private var band: NSBezierPath {
+        let top = drawsBoundary ? Self.boundaryPadding : 0
+        let rect = NSRect(x: 4, y: top + 1, width: bounds.width - 8, height: bounds.height - top - 2)
+        return NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+    }
+
     /// The keyboard's place in the table. A 6% wash measured 1.17:1 against the
     /// background, which is no indicator at all; the bar on the leading edge
-    /// carries the contrast and the wash carries the row.
+    /// carries the contrast and the wash carries the row. Hover is a lighter
+    /// wash with no bar, so the two never read as the same thing.
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        let band = self.band
+        if pulse > 0 {
+            pulseColour.withAlphaComponent(0.16 * pulse).setFill()
+            band.fill()
+        }
+        let wash = (isSelected ? 0.10 : 0) + 0.04 * hover
+        if wash > 0 {
+            NSColor(srgbRed: 1, green: 1, blue: 1, alpha: wash).setFill()
+            band.fill()
+        }
         guard isSelected else { return }
-        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.10).setFill()
-        bounds.fill()
+        // The bar follows the band's rounded corners rather than poking out.
+        NSGraphicsContext.saveGraphicsState()
+        band.addClip()
         Palette.text.withAlphaComponent(0.8).setFill()
-        NSRect(x: 0, y: 0, width: 3, height: bounds.height).fill()
+        NSRect(x: band.bounds.minX, y: band.bounds.minY, width: 3, height: band.bounds.height).fill()
+        NSGraphicsContext.restoreGraphicsState()
     }
 }
 
@@ -1755,6 +1814,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         table.intercellSpacing = NSSize(width: 4, height: 0)
         table.columnAutoresizingStyle = .noColumnAutoresizing
         table.setAccessibilityLabel("Sessions")
+        // Hover follows the mouse, and the scroll under a still mouse.
+        table.addTrackingArea(NSTrackingArea(
+            rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil))
+        gridScroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: gridScroll.contentView, queue: .main
+        ) { [weak self] _ in self?.updateHover() }
         gridScroll.documentView = table
         gridScroll.hasVerticalScroller = true
         gridScroll.hasHorizontalScroller = false
@@ -2188,6 +2255,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// The contents each cell was last drawn with, and the rows they belong to.
     private var drawnIds: [String] = []
+    /// The table row under the mouse, or -1.
+    private var hoveredRow = -1
+    /// Each live session's state as last drawn, to pulse a row when it changes.
+    private var lastState: [String: String] = [:]
+    /// What each bar last showed, so its replacement glides on from there.
+    private var barMemory: [String: Double] = [:]
     private var drawn: [[String: CellContent]] = []
 
     private func shownContent(_ key: String, row: Int) -> CellContent {
@@ -2208,6 +2281,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let previous = drawn
         drawn = next
         drawnIds = ids
+        defer { pulseChangedStates() }
         guard same else {
             table.reloadData()
             return
@@ -2285,7 +2359,125 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // Live sessions always sort above finished ones; the line says where
         // that boundary is without spending a row on a heading.
         view.drawsBoundary = row > 0 && isBoundary(row - 1)
+        // A rebuilt row under a still mouse is already hovered: no fade in.
+        view.hover = row == hoveredRow ? 1 : 0
         return view
+    }
+
+    // MARK: Motion
+
+    override func mouseMoved(with event: NSEvent) { updateHover() }
+    override func mouseEntered(with event: NSEvent) { updateHover() }
+    override func mouseExited(with event: NSEvent) { setHover(-1) }
+
+    private func updateHover() {
+        guard let window = table.window else { return }
+        let point = table.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        let row = table.visibleRect.contains(point) ? table.row(at: point) : -1
+        // Row 0 is the tool's own row, which is not a session.
+        setHover(row > 0 ? row : -1)
+    }
+
+    private func setHover(_ row: Int) {
+        guard row != hoveredRow else { return }
+        let previous = hoveredRow
+        hoveredRow = row
+        for (index, level) in [(previous, CGFloat(0)), (row, CGFloat(1))] where index > 0 {
+            guard let view = table.rowView(atRow: index, makeIfNecessary: false) as? SessionRowView else { continue }
+            guard motionAllowed else {
+                view.hover = level
+                continue
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                view.animator().hover = level
+            }
+        }
+    }
+
+    /// A live row whose state just changed tints once and fades, so the eye
+    /// finds what moved among many sessions: yellow when it now waits on you.
+    /// A running tool's timer is not a change; `Bash 3m` to `Bash 4m` is still Bash.
+    private func pulseChangedStates() {
+        var seen: [String: String] = [:]
+        var changed: [(row: Int, needsYou: Bool)] = []
+        for (index, entry) in rows.enumerated() where !entry.past {
+            guard let id = entry.session.summary.session_id else { continue }
+            let (word, colour) = stateWords(entry.session, past: false)
+            let state = word.replacingOccurrences(of: #" \d+(\.\d+)?[smhd]$"#, with: "", options: .regularExpression)
+            seen[id] = state
+            if let before = lastState[id], before != state {
+                changed.append((index + 1, colour == Palette.yellow || word == "your turn"))
+            }
+        }
+        lastState = seen
+        guard motionAllowed, !changed.isEmpty else { return }
+        // After this pass's reload has made its row views.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let visible = self.table.rows(in: self.table.visibleRect)
+            for (row, needsYou) in changed where NSLocationInRange(row, visible) {
+                guard let view = self.table.rowView(atRow: row, makeIfNecessary: true) as? SessionRowView else { continue }
+                view.pulseColour = needsYou ? Palette.yellow : Palette.text
+                view.pulse = 1
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 1.0
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    view.animator().pulse = 0
+                }
+            }
+        }
+    }
+
+    /// The cache cell's two lines, 12 and 11 point, as the eye measures them:
+    /// cap height of the first to baseline of the second. `offset` is how far
+    /// that span's centre sits below the centre of the whole text block.
+    static let cacheTextSpan: (height: CGFloat, offset: CGFloat) = {
+        let first = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        let second = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        let lineOne = first.ascender - first.descender + first.leading
+        let lineTwo = second.ascender - second.descender + second.leading
+        let capTop = first.ascender - first.capHeight
+        let baseline = lineOne + second.ascender
+        // A pixel past each end: measured on screen, the figures' antialiasing
+        // reaches one row beyond the metrics.
+        return ((baseline - capTop).rounded() + 2, ((capTop + baseline) / 2 - (lineOne + lineTwo) / 2).rounded())
+    }()
+
+    /// Hands a rebuilt bar the value its predecessor showed, so it glides on.
+    private func remember(_ bar: BarView, _ key: String) {
+        bar.glideFrom = barMemory[key]
+        barMemory[key] = bar.fraction
+    }
+
+    /// Working or running a tool, and not waiting on anyone.
+    private func isWorking(_ session: Session) -> Bool {
+        guard let state = session.transcript?.state, state == "thinking" || state == "tool",
+            session.peer_status != "waiting"
+        else { return false }
+        return stateWords(session, past: false).1 != Palette.yellow
+    }
+
+    /// The dot of a working session, breathing between full and 60% on a
+    /// 2-second cycle. Every such dot shares one clock, so they breathe
+    /// together and a rebuilt cell picks up mid-breath rather than restarting.
+    private func breathingDot(_ colour: NSColor) -> NSTextField {
+        let dot = NSTextField(labelWithString: "●")
+        dot.font = barFont
+        dot.textColor = colour
+        dot.wantsLayer = true
+        dot.setAccessibilityElement(false)
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        let breath = CABasicAnimation(keyPath: "opacity")
+        breath.fromValue = 1
+        breath.toValue = 0.6
+        breath.duration = 1
+        breath.autoreverses = true
+        breath.repeatCount = .infinity
+        breath.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        breath.beginTime = CACurrentMediaTime() - fmod(CACurrentMediaTime(), 2)
+        dot.layer?.add(breath, forKey: "breath")
+        return dot
     }
 
     /// What ⌘C and ⌘↩ act on, and what a click selects.
@@ -2398,11 +2590,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         case "topic":
             // The dot leads the topic: the two together say what the session is
             // doing and how alive it is.
-            let dot = mono(past ? "○  " : "●  ", dotColour(session, past: past))
+            // A working session's dot is drawn by an overlay that breathes;
+            // the glyph stays, clear, to hold its place in the line.
+            let breathes = !past && motionAllowed && isWorking(session)
+            let dot = mono(past ? "○  " : "●  ", breathes ? .clear : dotColour(session, past: past))
             // The caption lines up with the topic, not with the dot before it.
             captionIndent = ceil(dot.size().width)
             let title = NSMutableAttributedString(attributedString: dot)
-            title.append(prose(s.topic ?? "—", (s.topic_is_new ?? false) ? Palette.yellow : Palette.text))
+            // New for a minute after it changes, as of the last redraw: a session
+            // that ended inside that minute never redraws to say it is not.
+            let fresh = !past && (s.topic_is_new ?? false)
+            title.append(prose(s.topic ?? "—", fresh ? Palette.yellow : Palette.text))
             top = title
             // Claude Code's own name for the session, under the topic ours derives.
             bottom = s.session_name ?? ""
@@ -2412,12 +2610,20 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // a background agent still out. Your turn and a pending agent are
             // both true at once: the session picks up again when it reports back.
             let line = NSMutableAttributedString(attributedString: prose(word, colour))
-            if let mode = session.transcript?.mode { line.append(prose(" · \(mode)", Palette.dim)) }
+            // Not after a bare dash, where it would read as the state itself.
+            // Only a mode other than auto, the usual one: the exception is what
+            // is worth reading. Not after a bare dash either, where it would read
+            // as the state itself.
+            if let mode = session.transcript?.mode, mode != "auto", word != "—" {
+                line.append(prose(" · \(mode == "default" ? "manual" : mode)", Palette.dim))
+            }
             top = line
             bottom = ""
             if !past, let running = session.transcript?.agents?.running, running > 0 {
-                bottom = "waiting on \(running == 1 ? "1 agent" : "\(running) agents")"
-                captionColour = Palette.text
+                // In the status line's orange and with its ✻: the one caption
+                // that means the session will carry on by itself.
+                bottom = "✻ waiting on \(running == 1 ? "1 agent" : "\(running) agents")"
+                captionColour = Palette.orange
             }
         case "tokens":
             top = mono(session.transcript?.tokens.map { tokens($0.total) } ?? "—", Palette.text)
@@ -2575,7 +2781,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let s = session.summary
         let c = shownContent(key, row: row)
         let drop = c.drop
-        if key == "context" { return progressCell(c.percent, past: past, drop: drop) }
+        if key == "context" { return progressCell(c.percent, past: past, drop: drop, key: s.session_id) }
         let heat = c.heat
         let alignment = c.alignment
         let field = NSTextField(labelWithString: "")
@@ -2593,16 +2799,34 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // above or below it.
             let stripe = NSView()
             stripe.wantsLayer = true
-            stripe.layer?.backgroundColor = (past ? heat.withAlphaComponent(0.4) : heat).cgColor
-            stripe.layer?.cornerRadius = 2
+            // A finished session is a small square rather than the stripe. Its
+            // cache lives on the server, not in the process, so while it is warm
+            // a resume still reads it: the square keeps the heat colour until
+            // then, and turns grey once there is nothing left to save.
+            let warm = !past || cacheLeft(s.cache) > 0
+            stripe.layer?.backgroundColor = (warm ? heat : Palette.dim.withAlphaComponent(0.6)).cgColor
+            stripe.layer?.cornerRadius = past ? 1.5 : 2
             stripe.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(stripe)
             NSLayoutConstraint.activate([
                 stripe.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
                 stripe.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
-                stripe.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5 + drop * 2),
-                stripe.bottomAnchor.constraint(equalTo: cell.bottomAnchor, constant: -5),
             ])
+            if past {
+                // A square as wide as the stripe, centred where the stripe would be.
+                NSLayoutConstraint.activate([
+                    stripe.heightAnchor.constraint(equalTo: stripe.widthAnchor),
+                    stripe.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
+                ])
+            } else {
+                // As tall as the cache words beside it read: from the top of the
+                // first line's figures to the baseline of the second.
+                let span = Self.cacheTextSpan
+                NSLayoutConstraint.activate([
+                    stripe.heightAnchor.constraint(equalToConstant: span.height),
+                    stripe.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop + span.offset),
+                ])
+            }
         }
         // VoiceOver reads the cell, not the two lines inside it, so each one
         // says what it holds and what clicking it does.
@@ -2691,6 +2915,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: key == "model" ? -3 : -4),
             field.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
         ])
+        if key == "topic", !past, motionAllowed, isWorking(session) {
+            // Over the clear glyph the text keeps, on the same baseline.
+            let dot = breathingDot(dotColour(session, past: false))
+            cell.addSubview(dot)
+            NSLayoutConstraint.activate([
+                dot.leadingAnchor.constraint(equalTo: field.leadingAnchor),
+                dot.firstBaselineAnchor.constraint(equalTo: field.firstBaselineAnchor),
+            ])
+        }
         return cell
     }
 
@@ -2807,7 +3040,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             if current < units { marked = current }
         }
         grid.addRow(with: [NSView(), label(position, Palette.dim, small)])
-        grid.addRow(with: [name, bar(percent / 100, colour), share, note])
+        let used = bar(percent / 100, colour)
+        remember(used, title + " used")
+        grid.addRow(with: [name, used, share, note])
 
         // The pace row needs to know where in the window we are, which only the
         // reset time says.
@@ -2830,6 +3065,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         let elapsedText = String(format: "%.0f%%", elapsed * 100)
         let paceBar = bar(elapsed, ghost)
+        remember(paceBar, title + " pace")
         paceBar.markedTick = marked
         grid.addRow(with: [
             label("pace target", ghost, NSFont.systemFont(ofSize: 11)), paceBar,
@@ -2951,13 +3187,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     /// "▓▓▓░░ 52%": the bar, then the number it stands for.
-    private func progressCell(_ percent: Double?, past: Bool, drop: CGFloat) -> NSView {
+    private func progressCell(_ percent: Double?, past: Bool, drop: CGFloat, key: String?) -> NSView {
         let cell = ClickableCell()
         cell.setAccessibilityLabel(
             "Context window \(percent.map { "\(Int($0.rounded())) percent used" } ?? "unknown")")
         let bar = BarView()
         let value = percent ?? 0
         bar.fraction = value / 100
+        if let key = key { remember(bar, "context " + key) }
         let colour = Palette.threshold(percent)
         bar.colour = past ? colour.withAlphaComponent(0.72) : colour
         bar.translatesAutoresizingMaskIntoConstraints = false
@@ -3128,7 +3365,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             case "other": return ("closed", Palette.text)
             // No SessionEnd at all: the process was killed outright.
             case "crashed": return ("crashed", Palette.yellow)
-            default: return ("ended", Palette.dim)
+            // Ended before SessionEnd was recorded, or for a reason this does
+            // not know: no word, as a word would read as a fourth way to end.
+            default: return ("—", Palette.dim)
             }
         }
         // Claude Code's own record beats anything read from the transcript: a
