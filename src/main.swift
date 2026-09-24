@@ -37,6 +37,22 @@ let cacheDir: URL = {
 let spoolDir = cacheDir.appendingPathComponent("live")
 let logURL = home.appendingPathComponent("Library/Logs/agent-bar-hopping.log")
 
+/// system-one's per-session shadow log (agents-shared/notebook/2026-09-24-system-one-
+/// decision-model-integration.md, section 9): one JSONL file per session, read for
+/// the Verdicts view. Resolved the same way cc-statusline.js resolves it.
+let systemOneShadowDir: URL = {
+    if let v = ProcessInfo.processInfo.environment["SYSTEM_ONE_STATE_DIR"], !v.isEmpty {
+        return URL(fileURLWithPath: (v as NSString).expandingTildeInPath).appendingPathComponent("shadow")
+    }
+    return xdgDir("XDG_STATE_HOME", fallback: ".local/state").appendingPathComponent("system-one").appendingPathComponent("shadow")
+}()
+
+func systemOneShadowFile(for sessionId: String) -> URL? {
+    let safe = sessionId.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+    guard !safe.isEmpty else { return nil }
+    return systemOneShadowDir.appendingPathComponent("\(safe).jsonl")
+}
+
 /// The checkout this bundle was built from; bundle.sh writes it into Info.plist.
 let repoDir: URL = {
     if let p = Bundle.main.object(forInfoDictionaryKey: "CCStatuslineRepo") as? String, !p.isEmpty {
@@ -540,6 +556,56 @@ let vorbisDecodes: Bool = {
     guard AudioFormatGetProperty(kAudioFormatProperty_DecodeFormatIDs, 0, nil, &size, &ids) == noErr else { return false }
     return ids.contains(0x766F_7262)  // 'vorb'
 }()
+
+// MARK: - Display settings (system-one verdict row)
+
+/// display.json in the support directory, beside sounds.json: what the status
+/// line draws beyond the segments Claude Code's own input carries. Written
+/// with the default (off) when absent; the status line script reads it on
+/// every redraw the same way it reads sounds.json and the usage cache.
+struct DisplaySettings: Codable {
+    var verdictRow = false
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        verdictRow = try c.decodeIfPresent(Bool.self, forKey: .verdictRow) ?? false
+    }
+}
+
+/// Owns display.json: the app's single writer, same pattern as sounds.json.
+final class DisplayStore {
+    private(set) var settings = DisplaySettings()
+    private let file = supportDir.appendingPathComponent("display.json")
+
+    init() {
+        load()
+    }
+
+    private func load() {
+        if let data = try? Data(contentsOf: file),
+            let s = try? JSONDecoder().decode(DisplaySettings.self, from: data)
+        {
+            settings = s
+        }
+        save()
+    }
+
+    func update(_ change: (inout DisplaySettings) -> Void) {
+        change(&settings)
+        save()
+    }
+
+    private func save() {
+        try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        // Atomic: the status line script reads this file on every redraw and
+        // must never see half of it.
+        try? encoder.encode(settings).write(to: file, options: .atomic)
+    }
+}
 
 /// Turns Claude Code's hook events into sounds, and remembers the one thing the
 /// transcript cannot show: a permission prompt waiting on the user.
@@ -2137,6 +2203,211 @@ final class SessionRowView: NSTableRowView {
     }
 }
 
+// MARK: - Verdicts (per-session system-one log)
+
+/// One line of a session's shadow log, parsed for the Verdicts view.
+private struct VerdictRow {
+    let time: String
+    let excerpt: String
+    /// Keyed by the question name (irreversible, foreign_process,
+    /// leaves_machine, network_install); nil when the log line lacks it.
+    let scores: [String: Double]
+    let fired: Set<String>
+}
+
+/// The on-demand view of one session's system-one shadow log, opened from its
+/// Directory cell's right-click menu: no permanent column, just a read of the
+/// file on open and again on a 2-second timer while the window stays up.
+final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
+    private let sessionId: String
+    private let table = NSTableView()
+    private let status = NSTextField(labelWithString: "")
+    private var rows: [VerdictRow] = []
+    private var timer: Timer?
+    /// Size and mtime of the log at the last parse: a tick that finds them
+    /// unchanged does nothing.
+    private var seen: (size: UInt64, modified: Date)?
+    /// How much of the log's tail is read: a shadow log grows without bound
+    /// over a long session, and the view shows its recent calls, not all of it.
+    private static let tailBytes: UInt64 = 512 * 1024
+    private static let maxRows = 500
+    /// Told to the opener so it can drop its reference once the window closes.
+    var onClose: (() -> Void)?
+
+    private static let order: [(label: String, key: String)] = [
+        ("Irr", "irreversible"), ("For", "foreign_process"), ("Net", "leaves_machine"), ("Ins", "network_install"),
+    ]
+
+    init(sessionId: String) {
+        self.sessionId = sessionId
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 420),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered, defer: false)
+        window.title = "Verdicts \u{2014} \(sessionId.prefix(8))"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.contentMinSize = NSSize(width: 480, height: 240)
+        super.init(window: window)
+        window.delegate = self
+        build()
+        reload()
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.reload() }
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        content.wantsLayer = true
+        content.layer?.backgroundColor = Palette.background.cgColor
+
+        status.textColor = Palette.dim
+        status.font = NSFont.systemFont(ofSize: 11)
+        status.translatesAutoresizingMaskIntoConstraints = false
+        status.lineBreakMode = .byTruncatingMiddle
+
+        let columns: [(String, String, CGFloat)] = [
+            ("time", "Time", 150), ("cmd", "Command", 340), ("irr", "Irr", 46), ("for", "For", 46),
+            ("net", "Net", 46), ("ins", "Ins", 46), ("fired", "Fired", 110),
+        ]
+        for (key, title, width) in columns {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
+            column.title = title
+            column.width = width
+            table.addTableColumn(column)
+        }
+        table.dataSource = self
+        table.delegate = self
+        table.backgroundColor = Palette.background
+        table.gridColor = Palette.frame
+        table.gridStyleMask = [.solidHorizontalGridLineMask]
+        table.usesAlternatingRowBackgroundColors = false
+        table.rowHeight = 18
+        table.intercellSpacing = NSSize(width: 6, height: 0)
+
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        content.addSubview(status)
+        content.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            status.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
+    }
+
+    /// The command excerpt, first 80 characters: the Bash hook's own `state`
+    /// field ("cwd: ...\ncommand:\n<cmd>") with the cwd line dropped, or
+    /// another caller's already-80-character `state_excerpt`.
+    private static func excerpt(of entry: [String: Any]) -> String {
+        if let state = entry["state"] as? String {
+            let body = state.range(of: "command:\n").map { String(state[$0.upperBound...]) } ?? state
+            return String(body.prefix(80)).replacingOccurrences(of: "\n", with: "\u{23CE}")
+        }
+        if let e = entry["state_excerpt"] as? String { return String(e.prefix(80)) }
+        return ""
+    }
+
+    private func reload() {
+        guard let file = systemOneShadowFile(for: sessionId) else {
+            status.stringValue = "No session id"
+            rows = []
+            table.reloadData()
+            return
+        }
+        guard let attrs = try? fm.attributesOfItem(atPath: file.path),
+            let size = attrs[.size] as? UInt64, let modified = attrs[.modificationDate] as? Date
+        else {
+            status.stringValue = "No log yet \u{2014} \(file.path)"
+            rows = []
+            seen = nil
+            table.reloadData()
+            return
+        }
+        if let seen, seen.size == size, seen.modified == modified { return }
+        // The last tailBytes only, seeking past the rest; the first line of a
+        // cut tail is partial and dropped, and a last line still being
+        // appended fails to parse and is skipped the same way.
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return }
+        defer { try? handle.close() }
+        let cut = size > Self.tailBytes
+        if cut { try? handle.seek(toOffset: size - Self.tailBytes) }
+        guard let data = try? handle.readToEnd() else { return }
+        seen = (size, modified)
+        var lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
+        if cut, !lines.isEmpty { lines.removeFirst() }
+        var parsed: [VerdictRow] = []
+        for line in lines.suffix(Self.maxRows) {
+            guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
+            let answers = obj["answers"] as? [String: Any] ?? [:]
+            var scores: [String: Double] = [:]
+            for (_, key) in Self.order {
+                if let a = answers[key] as? [String: Any], let v = a["noul"] as? Double { scores[key] = v }
+            }
+            let fired = Set((obj["fired"] as? [[String: Any]])?.compactMap { $0["q"] as? String } ?? [])
+            parsed.append(VerdictRow(time: (obj["ts"] as? String) ?? "", excerpt: Self.excerpt(of: obj), scores: scores, fired: fired))
+        }
+        rows = parsed.reversed()
+        status.stringValue = "\(sessionId)  \u{00B7}  \(rows.count) call(s)\(cut ? ", most recent" : "")  \u{00B7}  \(file.path)"
+        table.reloadData()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let key = tableColumn?.identifier.rawValue, row < rows.count else { return nil }
+        let r = rows[row]
+        var colour = Palette.text
+        let text: String
+        switch key {
+        case "time": text = r.time
+        case "cmd": text = r.excerpt
+        case "fired":
+            text = r.fired.isEmpty ? "" : r.fired.joined(separator: ",")
+            colour = r.fired.isEmpty ? Palette.dim : Palette.yellow
+        default:
+            if let entry = Self.order.first(where: { $0.label.lowercased() == key }) {
+                if let v = r.scores[entry.key] {
+                    text = String(format: "%.2f", v)
+                    colour = r.fired.contains(entry.key) ? Palette.yellow : Palette.dim
+                } else {
+                    text = "--"
+                    colour = Palette.dim
+                }
+            } else {
+                text = ""
+            }
+        }
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        field.textColor = colour
+        field.lineBreakMode = .byTruncatingTail
+        let cell = NSView()
+        cell.addSubview(field)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+            field.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -2),
+            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        timer?.invalidate()
+        timer = nil
+        onClose?()
+    }
+}
+
 // MARK: - Window
 
 final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
@@ -2160,6 +2431,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let packStore = PackStore()
     private var packBrowser: PackBrowser?
     private let latest = LatestVersion()
+    /// display.json: the verdict row toggle beside the sound controls, and the
+    /// on-demand Verdicts view opened from a session's Directory cell.
+    private let displayStore = DisplayStore()
+    private let verdictsToggle = NSButton(title: "", target: nil, action: nil)
+    private var verdictsWindows: [String: VerdictsWindow] = [:]
     private var watcher: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
     private var sessionsWatcher: DispatchSourceFileSystemObject?
@@ -2364,6 +2640,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         packButton.action = #selector(openPacks)
         packButton.toolTip = "Hear, choose and install sound packs"
         drawPackButton()
+        verdictsToggle.isBordered = false
+        verdictsToggle.target = self
+        verdictsToggle.action = #selector(verdictsToggled)
+        drawVerdictsToggle()
         // The switch changes the Sound column; a new pack changes the button.
         NotificationCenter.default.addObserver(
             forName: SoundControls.changed, object: nil, queue: .main
@@ -2372,15 +2652,36 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             self?.refreshTable()
         }
         // The pack sits at the right edge, over the end of the event row; the
-        // gap before it takes up the difference.
+        // gap before it takes up the difference. The verdicts toggle sits just
+        // left of it, beside the sound controls.
         let gap = NSView()
         gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
+        let top = NSStackView(views: [soundControls.volumeRow, gap, verdictsToggle, packButton])
         top.spacing = 8
         top.distribution = .fill
         soundBar.addArrangedSubview(top)
         soundBar.addArrangedSubview(soundControls.eventRow)
         top.widthAnchor.constraint(equalTo: soundControls.eventRow.widthAnchor).isActive = true
+    }
+
+    /// system-one's show-mode verdict row (irr/for/net/ins) on the status line:
+    /// a text toggle in the ● on / ○ off style the event boxes use, bound to
+    /// display.json so the status line script picks the change up on its next
+    /// redraw.
+    private func drawVerdictsToggle() {
+        let on = displayStore.settings.verdictRow
+        verdictsToggle.attributedTitle = NSAttributedString(
+            string: (on ? "● " : "○ ") + "verdicts",
+            attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
+        verdictsToggle.toolTip =
+            "system-one's four gate scores as a fourth status line row (irr/for/net/ins), "
+            + (on ? "on — click to turn off" : "off — click to turn on")
+        verdictsToggle.setAccessibilityLabel("Verdict row on the status line, \(on ? "on" : "off")")
+    }
+
+    @objc private func verdictsToggled() {
+        displayStore.update { $0.verdictRow.toggle() }
+        drawVerdictsToggle()
     }
 
     private func drawPackButton() {
@@ -2390,6 +2691,23 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             string: " ›", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim]))
         packButton.attributedTitle = title
         packButton.setAccessibilityLabel("Sound pack \(events.current.pack), choose another")
+    }
+
+    /// The per-session Verdicts view, from a session's Directory cell menu: an
+    /// on-demand read of its shadow log, newest first, no permanent column.
+    /// One window per session id; asking again just brings it forward.
+    private func openVerdicts(sessionId: String) {
+        if let existing = verdictsWindows[sessionId] {
+            existing.showWindow(nil)
+            existing.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = VerdictsWindow(sessionId: sessionId)
+        verdictsWindows[sessionId] = window
+        window.onClose = { [weak self] in self?.verdictsWindows[sessionId] = nil }
+        window.window?.center()
+        window.showWindow(nil)
+        window.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func openPacks() {
@@ -3206,6 +3524,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             menu.addItem(ActionItem("Copy Path", enabled: path != nil) { path.map(copy) })
             menu.addItem(ActionItem("Copy Session Name", enabled: name != nil) { name.map(copy) })
+            menu.addItem(.separator())
+            let sid = s.session_id
+            menu.addItem(ActionItem("Verdicts", enabled: sid != nil) { [weak self] in
+                sid.map { self?.openVerdicts(sessionId: $0) }
+            })
             if past {
                 menu.addItem(.separator())
                 menu.addItem(ActionItem("Resume Session", enabled: session.transcript != nil) { [weak self] in self?.resume(session) })

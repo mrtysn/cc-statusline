@@ -28,6 +28,16 @@ const { render, summarize, segments, cleanTopic, isFable, TOPIC_MAX_CHARS } = re
 // The Fable weekly quota is not in the statusline input; it comes from the
 // account usage endpoint, cached once for every session on the machine.
 const CACHE_DIR = process.env.CC_STATUSLINE_CACHE_DIR || join(homedir(), '.cache', 'cc-statusline');
+// The app's own files (sounds.json lives here too): where it writes display.json,
+// the one setting this script reads back on every redraw.
+const APP_SUPPORT_DIR = join(homedir(), 'Library', 'Application Support', 'Agent Bar Hopping');
+const DISPLAY_FILE = join(APP_SUPPORT_DIR, 'display.json');
+// system-one's per-session shadow log (agents-shared/notebook/2026-09-24-system-one-decision-model-integration.md,
+// section 9): one JSONL file per session, read for the show-mode verdict row.
+const SYSTEM_ONE_STATE_DIR =
+  process.env.SYSTEM_ONE_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'system-one');
+const SYSTEM_ONE_SHADOW_DIR = join(SYSTEM_ONE_STATE_DIR, 'shadow');
+const SYSTEM_ONE_GATE_QUESTIONS = ['irreversible', 'foreign_process', 'leaves_machine', 'network_install'];
 const USAGE_FILE = join(CACHE_DIR, 'usage.json');
 const LOCK_FILE = join(CACHE_DIR, 'refresh.lock');
 const ERROR_LOG = join(CACHE_DIR, 'error.log');
@@ -206,6 +216,84 @@ function readUsageCache() {
   } catch {
     return null;
   }
+}
+
+// display.json: the app's own settings file, read the same way sounds.json and
+// the usage cache are — a small JSON file, on every redraw, no caching beyond
+// that. Missing means the row is off (the app writes the file with a default on
+// first launch, same as sounds.json).
+function readVerdictDisplay() {
+  try {
+    return JSON.parse(readFileSync(DISPLAY_FILE, 'utf8'))?.verdictRow === true;
+  } catch {
+    return false;
+  }
+}
+
+// The last lines of a JSONL file without reading the whole thing: a shadow log
+// can grow to hundreds of megabytes over a long session, and only the last
+// verdict is ever drawn. A chunk grows from the end until it holds three lines
+// (or reaches the file's size): the first may be cut mid-line by the chunk
+// boundary, so the last two are whole, and the reader can fall back from a
+// last line the hook is still appending to the one before it.
+function readLastLines(file) {
+  let size;
+  try {
+    size = statSync(file).size;
+  } catch {
+    return [];
+  }
+  if (!size) return [];
+  let chunk = 16384;
+  let fd;
+  try {
+    fd = openSync(file, 'r');
+    for (;;) {
+      const want = Math.min(chunk, size);
+      const buf = Buffer.alloc(want);
+      readSync(fd, buf, 0, want, size - want);
+      const lines = buf.toString('utf8').split('\n').filter((l) => l.trim());
+      if (lines.length >= 3 || want >= size) return lines.slice(want >= size ? 0 : 1).slice(-2);
+      chunk *= 4;
+    }
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+// The Bash hook's per-session shadow log, last line: the four gate scores
+// (answers.<q>.noul) and which of them fired. Missing file, unparsable line, or
+// no session id all read as no verdict, same as every other reader here. A
+// last line that does not parse is one the hook is still writing: the line
+// before it stands in for that redraw.
+function readVerdict(sessionId) {
+  if (!sessionId) return null;
+  const safe = String(sessionId).replace(/[^\w-]/g, '');
+  if (!safe) return null;
+  const file = join(SYSTEM_ONE_SHADOW_DIR, `${safe}.jsonl`);
+  if (!existsSync(file)) return null;
+  let entry = null;
+  for (const line of readLastLines(file).reverse()) {
+    try {
+      entry = JSON.parse(line);
+      break;
+    } catch {}
+  }
+  if (!entry || typeof entry !== 'object') return null;
+  const answers = entry.answers || {};
+  const scores = {};
+  for (const q of SYSTEM_ONE_GATE_QUESTIONS) {
+    const v = answers[q]?.noul;
+    scores[q] = typeof v === 'number' ? v : null;
+  }
+  const fired = Array.isArray(entry.fired) ? entry.fired.map((f) => f?.q).filter(Boolean) : [];
+  return { scores, fired };
 }
 
 function logError(message) {
@@ -1215,6 +1303,11 @@ function main() {
   checkInput(input);
   const lastAt = lastMessageAt(input.transcript_path);
   const repo = cachedGit(cwd, previous, lastAt);
+  // system-one's show-mode verdict row: only read when the app's toggle is on,
+  // so a session that never turned it on pays nothing beyond the one cheap
+  // display.json read. Kept in args (words, not the drawn row) the same way
+  // topic and git are, so the live view carries it without a separate file.
+  const verdict = readVerdictDisplay() ? readVerdict(input.session_id) : null;
   const args = {
     input,
     cwd,
@@ -1224,6 +1317,7 @@ function main() {
     peer: peerName(terminal.pid, input.session_id),
     git: repo.info,
     home: homedir(),
+    verdict,
   };
 
   const out = render({
