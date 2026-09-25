@@ -4824,8 +4824,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return left > 0 ? left : -1
     }
 
-    /// A session's dots down the middle of their narrow column, as many as fit
-    /// the row: the heat stripe's neighbour in spirit, a mark to scan down for.
+    /// A session's dots down their narrow column from the top line, as many as
+    /// fit the row: the heat stripe's neighbour in spirit, a mark to scan down for.
     private func dotsCell(_ dots: [TagColour], past: Bool, drop: CGFloat) -> NSView {
         let cell = NSView()
         let stack = NSStackView()
@@ -4844,9 +4844,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             stack.addArrangedSubview(view)
         }
         cell.addSubview(stack)
+        // The first dot on the top line, level with the state dot before the
+        // topic: the cell's two lines are centred as a block, so the top line's
+        // middle is half a caption line above the cell's.
+        let caption = NSLayoutManager().defaultLineHeight(for: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular))
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: cell.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
+            stack.topAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop - caption / 2 - 3.5),
         ])
         cell.setAccessibilityLabel(dots.isEmpty ? "No dots" : dots.map { "\($0.name) dot" }.joined(separator: ", "))
         return cell
