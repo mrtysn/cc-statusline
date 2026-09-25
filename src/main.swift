@@ -3271,12 +3271,16 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         intro.font = NSFont.systemFont(ofSize: 12)
         intro.textColor = .secondaryLabelColor
 
-        for (key, title, width) in [("tag", "Tag", 150.0), ("count", "Folders", 56.0), ("kind", "", 70.0)] {
+        // Two columns, the tag with "automatic" after it where git sets it, so
+        // the list is exactly as wide as what it holds and nothing is cut off.
+        for (key, title, width) in [("tag", "Tag", 190.0), ("count", "Folders", 52.0)] {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
             column.title = title
             column.width = CGFloat(width)
+            if key == "count" { column.headerCell.alignment = .right }
             tagTable.addTableColumn(column)
         }
+        tagTable.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         let folderColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("folder"))
         folderColumn.resizingMask = .autoresizingMask
         folderTable.addTableColumn(folderColumn)
@@ -3373,7 +3377,12 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             tagScroll.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 12),
             tagScroll.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
-            tagScroll.widthAnchor.constraint(equalToConstant: 300),
+            // As wide as the columns, their spacing and the scroller: the list
+            // shows every column whole.
+            tagScroll.widthAnchor.constraint(equalToConstant:
+                tagTable.tableColumns.reduce(0) { $0 + $1.width }
+                + tagTable.intercellSpacing.width * CGFloat(tagTable.tableColumns.count)
+                + NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) + 4),
             tagScroll.bottomAnchor.constraint(equalTo: done.topAnchor, constant: -12),
             detail.topAnchor.constraint(equalTo: tagScroll.topAnchor),
             detail.leadingAnchor.constraint(equalTo: tagScroll.trailingAnchor, constant: 20),
@@ -3607,6 +3616,11 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 string: "● ", attributes: [.font: font, .foregroundColor: colour ?? Palette.frame])
             text.append(NSAttributedString(
                 string: names[row], attributes: [.font: font, .foregroundColor: colour ?? NSColor.secondaryLabelColor]))
+            if info.automatic {
+                text.append(NSAttributedString(
+                    string: "  automatic",
+                    attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.tertiaryLabelColor]))
+            }
             field.attributedStringValue = text
             field.toolTip = info.color.map { "#" + $0 } ?? "No colour"
         case "count":
@@ -3614,9 +3628,7 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             field.alignment = .right
             field.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         default:
-            field.stringValue = info.automatic ? "automatic" : ""
-            field.font = NSFont.systemFont(ofSize: 11)
-            field.textColor = .secondaryLabelColor
+            return nil
         }
         return field
     }
@@ -3642,9 +3654,13 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             ? (name == "container" ? "local-repos-list decides which folders are containers"
                 : "Set by local-repos-list from git; a manual mine, fork or third-party replaces it")
             : "Take \(name) off \(folder)"
-        let cell = NSStackView(views: [label, remove])
+        // The name takes the room, so every button lines up at the right edge.
+        let gap = NSView()
+        gap.setContentHuggingPriority(.init(1), for: .horizontal)
+        let cell = NSStackView(views: [label, gap, remove])
         cell.spacing = 8
-        cell.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
+        cell.distribution = .fill
+        cell.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 6)
         return cell
     }
 
