@@ -660,24 +660,27 @@ struct Tag: Codable, Equatable {
     var color: NSColor { TagColour(name: "", hex: hex).color }
 }
 
-/// Everything under one directory gets these marks: the directory a session
-/// was launched in, or any folder below it. The most specific rule applies.
-struct TagRule: Codable, Equatable {
-    /// Absolute, without a trailing slash.
-    var dir: String
-    var dots: [String] = []
+/// A folder as local-repos-list reports it: its tags, and the colours of
+/// those that have one.
+struct RepoEntry: Codable, Equatable {
+    var path: String
     var tags: [String] = []
+    var colors: [String: String] = [:]
 
-    init(dir: String) { self.dir = dir }
+    init(path: String, tags: [String], colors: [String: String]) {
+        self.path = path
+        self.tags = tags
+        self.colors = colors
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        dir = try c.decode(String.self, forKey: .dir)
-        dots = try c.decodeIfPresent([String].self, forKey: .dots) ?? []
+        path = try c.decode(String.self, forKey: .path)
         tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+        colors = try c.decodeIfPresent([String: String].self, forKey: .colors) ?? [:]
     }
 
-    func covers(_ path: String) -> Bool { path == dir || path.hasPrefix(dir == "/" ? "/" : dir + "/") }
+    func covers(_ dir: String) -> Bool { dir == path || dir.hasPrefix(path + "/") }
 }
 
 struct TagFile: Codable {
@@ -688,7 +691,9 @@ struct TagFile: Codable {
     var sessions: [String: [String]] = [:]
     /// Session id to the preset colour dots set on it by hand, by hex.
     var dots: [String: [String]] = [:]
-    var rules: [TagRule] = []
+    /// local-repos-list's folders, copied in by the app so the status line
+    /// reads them from this one file instead of running the tool per redraw.
+    var repos: [RepoEntry] = []
 
     init() {}
 
@@ -697,7 +702,7 @@ struct TagFile: Codable {
         tags = try c.decodeIfPresent([Tag].self, forKey: .tags) ?? []
         sessions = Self.lists(c, CodingKeys.sessions)
         dots = Self.lists(c, CodingKeys.dots)
-        rules = try c.decodeIfPresent([TagRule].self, forKey: .rules) ?? []
+        repos = (try? c.decodeIfPresent([RepoEntry].self, forKey: .repos)) ?? []
     }
 
     /// A list per session, or a single value from before a session could
@@ -709,7 +714,15 @@ struct TagFile: Codable {
     }
 }
 
-/// What the list is narrowed to: one preset dot, or one named tag.
+/// One mark on a session: a name, and a colour unless it has none.
+struct Mark: Equatable {
+    let name: String
+    let hex: String?
+
+    var color: NSColor { hex.map { TagColour(name: "", hex: $0).color } ?? Palette.dim }
+}
+
+/// What the list is narrowed to: one colour of dot, or one tag by name.
 enum TagFilter: Equatable {
     case dot(String)
     case tag(String)
@@ -728,7 +741,6 @@ final class TagStore {
     }
 
     var tags: [Tag] { file.tags }
-    var rules: [TagRule] { file.rules }
 
     // MARK: By hand
 
@@ -749,7 +761,7 @@ final class TagStore {
         save()
     }
 
-    /// Every dot and tag set by hand; a rule's marks stay.
+    /// Every dot and tag set by hand; the repo's tags stay.
     func clear(_ sessionId: String) {
         file.dots[sessionId] = nil
         file.sessions[sessionId] = nil
@@ -768,55 +780,55 @@ final class TagStore {
         save()
     }
 
-    /// Gone from every session and rule that had it.
+    /// Gone from every session that had it.
     func delete(_ name: String) {
         file.tags.removeAll { $0.name == name }
         file.sessions = file.sessions.compactMapValues { names in
             let kept = names.filter { $0 != name }
             return kept.isEmpty ? nil : kept
         }
-        for i in file.rules.indices { file.rules[i].tags.removeAll { $0 == name } }
         save()
     }
 
-    // MARK: Rules
+    // MARK: local-repos-list
 
-    /// The most specific rule over a launch directory, `~` or absolute.
-    func rule(for projectDir: String?) -> TagRule? {
+    /// Saved only when they changed, so an unchanged refresh writes nothing.
+    func setRepos(_ repos: [RepoEntry]) {
+        guard repos != file.repos else { return }
+        file.repos = repos
+        save()
+    }
+
+    /// The most specific folder over a launch directory, `~` or absolute: a
+    /// repo nested in a container beats the container.
+    func repo(for projectDir: String?) -> RepoEntry? {
         guard let dir = projectDir.map({ ($0 as NSString).expandingTildeInPath }) else { return nil }
-        return file.rules.filter { $0.covers(dir) }.max { $0.dir.count < $1.dir.count }
+        return file.repos.filter { $0.covers(dir) }.max { $0.path.count < $1.path.count }
     }
 
-    /// A rule for this directory, or the one it already has.
-    func addRule(_ dir: String) -> Int {
-        let clean = dir.count > 1 && dir.hasSuffix("/") ? String(dir.dropLast()) : dir
-        if let i = file.rules.firstIndex(where: { $0.dir == clean }) { return i }
-        file.rules.append(TagRule(dir: clean))
-        save()
-        return file.rules.count - 1
-    }
-
-    func updateRule(_ index: Int, _ change: (inout TagRule) -> Void) {
-        guard file.rules.indices.contains(index) else { return }
-        change(&file.rules[index])
-        save()
-    }
-
-    func removeRule(_ index: Int) {
-        guard file.rules.indices.contains(index) else { return }
-        file.rules.remove(at: index)
-        save()
-    }
+    /// Every tag local-repos-list uses, for the filter.
+    var repoTags: [String] { Array(Set(file.repos.flatMap(\.tags))).sorted() }
 
     // MARK: What a session shows
 
-    /// Its dots and tags, by hand and from its directory's rule together, in
-    /// the preset order and the order the tags were made.
-    func marks(_ sessionId: String?, _ projectDir: String?) -> (dots: [TagColour], tags: [Tag]) {
-        let rule = rule(for: projectDir)
-        let hexes = Set((sessionId.map(manualDots) ?? []) + (rule?.dots ?? []))
-        let names = Set((sessionId.map(manualTags) ?? []) + (rule?.tags ?? []))
-        return (TagColour.all.filter { hexes.contains($0.hex) }, file.tags.filter { names.contains($0.name) })
+    /// Its dots and tags: the preset dots and named tags set by hand, then its
+    /// repo's tags, each of those with a colour also a dot. A colour shows as
+    /// one dot however many marks share it.
+    func marks(_ sessionId: String?, _ projectDir: String?) -> (dots: [Mark], tags: [Mark]) {
+        let manualHexes = Set(sessionId.map(manualDots) ?? [])
+        let names = Set(sessionId.map(manualTags) ?? [])
+        var dots = TagColour.all.filter { manualHexes.contains($0.hex) }.map { Mark(name: $0.name, hex: $0.hex) }
+        var tags = file.tags.filter { names.contains($0.name) }.map { Mark(name: $0.name, hex: $0.hex) }
+        if let repo = repo(for: projectDir) {
+            for name in repo.tags {
+                let hex = repo.colors[name]
+                tags.append(Mark(name: name, hex: hex))
+                if let hex = hex { dots.append(Mark(name: name, hex: hex)) }
+            }
+        }
+        var seen = Set<String>()
+        dots = dots.filter { seen.insert($0.hex ?? "").inserted }
+        return (dots, tags)
     }
 
     /// Whether a session passes the list's filter: any of its marks will do.
@@ -835,6 +847,75 @@ final class TagStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // Atomic: the status line script must never read half of it.
         try? encoder.encode(file).write(to: url, options: .atomic)
+    }
+}
+
+/// Reads local-repos-list's folders and tags into the tag store: at launch,
+/// whenever its overrides file changes, and every few minutes for folders
+/// cloned or removed. The dev root is $DEV_ROOT, else ~/dev, as
+/// local-repos-list's own GUI takes it.
+final class RepoTags {
+    private let store: TagStore
+    var onChange: (() -> Void)?
+    private var overridesStamp: Date?
+    private var lastRun: Date = .distantPast
+    private var running = false
+    private static let refreshSeconds: Double = 300
+
+    init(store: TagStore) { self.store = store }
+
+    private var overridesFile: URL {
+        xdgDir("XDG_CONFIG_HOME", fallback: ".config").appendingPathComponent("local-repos-list/overrides.toml")
+    }
+
+    /// Cheap enough for every reload: one stat, and the tool only when due.
+    func refreshIfDue() {
+        let stamp = (try? fm.attributesOfItem(atPath: overridesFile.path))?[.modificationDate] as? Date
+        guard !running, stamp != overridesStamp || Date().timeIntervalSince(lastRun) > Self.refreshSeconds else { return }
+        running = true
+        overridesStamp = stamp
+        lastRun = Date()
+        let root = ProcessInfo.processInfo.environment["DEV_ROOT"].map { ($0 as NSString).expandingTildeInPath }
+            ?? home.appendingPathComponent("dev").path
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let repos = Self.read(root: root)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.running = false
+                guard let repos = repos else { return }
+                let before = self.store.file.repos
+                self.store.setRepos(repos)
+                if repos != before { self.onChange?() }
+            }
+        }
+    }
+
+    /// `local-repos-list --root <root> --json`, found on the same PATH the
+    /// status line script gets; nil when the tool is missing or fails, which
+    /// keeps what was read last.
+    private static func read(root: String) -> [RepoEntry]? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        task.arguments = ["local-repos-list", "--root", root, "--json"]
+        task.environment = scriptProcess(URL(fileURLWithPath: "/usr/bin/true"), []).environment
+        let out = Pipe()
+        task.standardOutput = out
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch {
+            log("local-repos-list: \(error.localizedDescription)")
+            return nil
+        }
+        let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else {
+            log("local-repos-list exited \(task.terminationStatus)")
+            return nil
+        }
+        guard let list = try? JSONDecoder().decode([RepoEntry].self, from: data) else {
+            log("local-repos-list: output not understood")
+            return nil
+        }
+        return list
     }
 }
 
@@ -2769,12 +2850,6 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
 // MARK: - Window
 
-/// A path with the home directory as `~`, for showing.
-func tildePath(_ path: String) -> String {
-    let home = NSHomeDirectory()
-    return path == home ? "~" : path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
-}
-
 /// Asks for a name and a colour and makes the tag; a name that already exists
 /// takes the new colour. Hands the name on once it is made.
 func promptNewTag(store: TagStore, on window: NSWindow, note: String, then: @escaping (String) -> Void) {
@@ -2805,293 +2880,6 @@ func promptNewTag(store: TagStore, on window: NSWindow, note: String, then: @esc
         store.create(name, hex: TagColour.all[max(0, colours.indexOfSelectedItem)].hex)
         then(name)
     }
-}
-
-/// Tag Rules: each rule gives every session launched in a directory, or below
-/// it, a set of dots and tags on top of any set by hand. A list of rules, and
-/// under it the selected rule's directory, dots and tags; every change is saved
-/// as it is made.
-final class TagRulesWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private let store: TagStore
-    var onChange: (() -> Void)?
-    private let table = NSTableView()
-    private let addRemove = NSSegmentedControl(
-        labels: ["+", "−"], trackingMode: .momentary, target: nil, action: nil)
-    private let dirLabel = NSTextField(labelWithString: "")
-    private let chooseButton = NSButton(title: "Change…", target: nil, action: nil)
-    private let dotRow = NSStackView()
-    private let tagList = NSStackView()
-    private let detail = NSStackView()
-    private let hint = NSTextField(wrappingLabelWithString: "")
-
-    init(store: TagStore) {
-        self.store = store
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 460),
-            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
-        window.title = "Tag Rules"
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.contentMinSize = NSSize(width: 480, height: 380)
-        super.init(window: window)
-        build()
-        table.reloadData()
-        if !store.rules.isEmpty { table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
-        drawDetail()
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    private var selectedIndex: Int? {
-        let row = table.selectedRow
-        return row >= 0 && row < store.rules.count ? row : nil
-    }
-
-    private func build() {
-        guard let content = window?.contentView else { return }
-        let intro = NSTextField(wrappingLabelWithString:
-            "Every session launched in a directory, or anywhere under it, gets that rule's dots and tags, "
-            + "beside any set by hand. Where rules nest, the most specific one applies.")
-        intro.font = NSFont.systemFont(ofSize: 12)
-        intro.textColor = .secondaryLabelColor
-
-        for (key, title, width) in [("dir", "Directory", 300.0), ("marks", "Marks", 180.0)] {
-            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
-            column.title = title
-            column.width = CGFloat(width)
-            table.addTableColumn(column)
-        }
-        table.dataSource = self
-        table.delegate = self
-        table.rowHeight = 22
-        table.usesAlternatingRowBackgroundColors = true
-        let scroll = NSScrollView()
-        scroll.documentView = table
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
-
-        addRemove.target = self
-        addRemove.action = #selector(addOrRemove)
-        addRemove.setToolTip("Add a rule for a directory", forSegment: 0)
-        addRemove.setToolTip("Remove the selected rule", forSegment: 1)
-
-        chooseButton.target = self
-        chooseButton.action = #selector(changeDirectory)
-        dirLabel.lineBreakMode = .byTruncatingMiddle
-        dirLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        let dirRow = NSStackView(views: [dirLabel, chooseButton])
-        dirRow.spacing = 8
-
-        dotRow.spacing = 6
-        tagList.orientation = .vertical
-        tagList.alignment = .leading
-        tagList.spacing = 4
-        let newTag = NSButton(title: "New Tag…", target: self, action: #selector(makeTag))
-        newTag.controlSize = .small
-
-        let dotsTitle = NSTextField(labelWithString: "Dots")
-        let tagsTitle = NSTextField(labelWithString: "Tags")
-        for label in [dotsTitle, tagsTitle] { label.font = NSFont.systemFont(ofSize: 11); label.textColor = .secondaryLabelColor }
-        detail.orientation = .vertical
-        detail.alignment = .leading
-        detail.spacing = 8
-        for view in [dirRow, dotsTitle, dotRow, tagsTitle, tagList, newTag] { detail.addArrangedSubview(view) }
-        detail.setCustomSpacing(14, after: dirRow)
-        detail.setCustomSpacing(14, after: dotRow)
-
-        hint.font = NSFont.systemFont(ofSize: 12)
-        hint.textColor = .secondaryLabelColor
-        hint.stringValue = "Add a rule with +, then pick its dots and tags."
-
-        let done = NSButton(title: "Done", target: self, action: #selector(finish))
-        done.keyEquivalent = "\r"
-
-        for view in [intro, scroll, addRemove, detail, hint, done] as [NSView] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(view)
-        }
-        NSLayoutConstraint.activate([
-            intro.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
-            intro.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            scroll.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 12),
-            scroll.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
-            addRemove.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 6),
-            addRemove.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
-            detail.topAnchor.constraint(equalTo: addRemove.bottomAnchor, constant: 16),
-            detail.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
-            detail.trailingAnchor.constraint(lessThanOrEqualTo: intro.trailingAnchor),
-            hint.topAnchor.constraint(equalTo: addRemove.bottomAnchor, constant: 16),
-            hint.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
-            hint.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
-            done.topAnchor.constraint(greaterThanOrEqualTo: detail.bottomAnchor, constant: 16),
-            done.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
-            done.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
-            dirLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 380),
-        ])
-    }
-
-    /// The selected rule's directory, dots and tags; nothing selected, a hint.
-    private func drawDetail() {
-        guard let index = selectedIndex else {
-            detail.isHidden = true
-            hint.isHidden = false
-            hint.stringValue = store.rules.isEmpty
-                ? "Add a rule with +, then pick its dots and tags." : "Select a rule to edit it."
-            addRemove.setEnabled(false, forSegment: 1)
-            return
-        }
-        let rule = store.rules[index]
-        detail.isHidden = false
-        hint.isHidden = true
-        addRemove.setEnabled(true, forSegment: 1)
-        dirLabel.stringValue = tildePath(rule.dir)
-        dirLabel.toolTip = rule.dir
-        dotRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        for (i, colour) in TagColour.all.enumerated() {
-            let button = NSButton(checkboxWithTitle: "", target: self, action: #selector(dotToggled(_:)))
-            button.image = tagDot(colour.color)
-            button.imagePosition = .imageTrailing
-            button.tag = i
-            button.state = rule.dots.contains(colour.hex) ? .on : .off
-            button.toolTip = colour.name
-            button.setAccessibilityLabel("\(colour.name) dot")
-            dotRow.addArrangedSubview(button)
-        }
-        tagList.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        if store.tags.isEmpty {
-            let none = NSTextField(labelWithString: "No named tags yet.")
-            none.textColor = .secondaryLabelColor
-            tagList.addArrangedSubview(none)
-        }
-        for (i, tag) in store.tags.enumerated() {
-            let button = NSButton(checkboxWithTitle: tag.name, target: self, action: #selector(tagToggled(_:)))
-            button.image = tagDot(tag.color)
-            button.imagePosition = .imageLeading
-            button.tag = i
-            button.state = rule.tags.contains(tag.name) ? .on : .off
-            tagList.addArrangedSubview(button)
-        }
-    }
-
-    private func changed(reselect index: Int?) {
-        table.reloadData()
-        if let index = index { table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false) }
-        drawDetail()
-        onChange?()
-    }
-
-    /// A folder picker as a sheet over this one; the folder comes back.
-    private func pickDirectory(_ done: @escaping (String) -> Void) {
-        guard let window = window else { return }
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        panel.message = "Sessions launched in this directory, or under it, get the rule's marks."
-        if let index = selectedIndex { panel.directoryURL = URL(fileURLWithPath: store.rules[index].dir) }
-        panel.beginSheetModal(for: window) { response in
-            guard response == .OK, let url = panel.url else { return }
-            done(url.path)
-        }
-    }
-
-    @objc private func addOrRemove() {
-        if addRemove.selectedSegment == 0 {
-            pickDirectory { [weak self] dir in
-                guard let self = self else { return }
-                self.changed(reselect: self.store.addRule(dir))
-            }
-        } else if let index = selectedIndex {
-            store.removeRule(index)
-            changed(reselect: store.rules.isEmpty ? nil : min(index, store.rules.count - 1))
-        }
-    }
-
-    @objc private func changeDirectory() {
-        guard let index = selectedIndex else { return }
-        pickDirectory { [weak self] dir in
-            guard let self = self else { return }
-            let clean = dir.count > 1 && dir.hasSuffix("/") ? String(dir.dropLast()) : dir
-            // Another rule already has that directory: go to it rather than make two.
-            if let other = self.store.rules.firstIndex(where: { $0.dir == clean }), other != index {
-                self.changed(reselect: other)
-                return
-            }
-            self.store.updateRule(index) { $0.dir = clean }
-            self.changed(reselect: index)
-        }
-    }
-
-    @objc private func dotToggled(_ sender: NSButton) {
-        guard let index = selectedIndex, TagColour.all.indices.contains(sender.tag) else { return }
-        let hex = TagColour.all[sender.tag].hex
-        store.updateRule(index) { rule in
-            if sender.state == .on { if !rule.dots.contains(hex) { rule.dots.append(hex) } } else { rule.dots.removeAll { $0 == hex } }
-        }
-        changed(reselect: index)
-    }
-
-    @objc private func tagToggled(_ sender: NSButton) {
-        guard let index = selectedIndex, store.tags.indices.contains(sender.tag) else { return }
-        let name = store.tags[sender.tag].name
-        store.updateRule(index) { rule in
-            if sender.state == .on { if !rule.tags.contains(name) { rule.tags.append(name) } } else { rule.tags.removeAll { $0 == name } }
-        }
-        changed(reselect: index)
-    }
-
-    /// A new tag, ticked on the selected rule.
-    @objc private func makeTag() {
-        guard let window = window else { return }
-        let index = selectedIndex
-        promptNewTag(store: store, on: window, note: "It goes on this rule, and can be put on sessions and other rules.") {
-            [weak self] name in
-            guard let self = self else { return }
-            if let index = index { self.store.updateRule(index) { if !$0.tags.contains(name) { $0.tags.append(name) } } }
-            self.changed(reselect: index)
-        }
-    }
-
-    @objc private func finish() {
-        guard let window = window else { return }
-        window.sheetParent?.endSheet(window)
-    }
-
-    // MARK: Table
-
-    func numberOfRows(in tableView: NSTableView) -> Int { store.rules.count }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < store.rules.count else { return nil }
-        let rule = store.rules[row]
-        let field = NSTextField(labelWithString: "")
-        field.lineBreakMode = .byTruncatingMiddle
-        if tableColumn?.identifier.rawValue == "dir" {
-            field.stringValue = tildePath(rule.dir)
-            field.toolTip = rule.dir
-        } else {
-            let text = NSMutableAttributedString()
-            let font = NSFont.systemFont(ofSize: 12)
-            for colour in TagColour.all where rule.dots.contains(colour.hex) {
-                text.append(NSAttributedString(string: "●", attributes: [.font: font, .foregroundColor: colour.color]))
-            }
-            for tag in store.tags where rule.tags.contains(tag.name) {
-                text.append(NSAttributedString(
-                    string: (text.length > 0 ? "  " : "") + tag.name, attributes: [.font: font, .foregroundColor: tag.color]))
-            }
-            if text.length == 0 {
-                text.append(NSAttributedString(
-                    string: "nothing yet", attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]))
-            }
-            field.attributedStringValue = text
-        }
-        return field
-    }
-
-    func tableViewSelectionDidChange(_ notification: Notification) { drawDetail() }
 }
 
 final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation,
@@ -3128,9 +2916,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// The filter behind each popup entry, in order; nil for "All sessions"
     /// and for separators.
     private var filterChoices: [TagFilter?] = []
-    private var tagRules: TagRulesWindow?
-    private let rulesButton = NSButton(title: "", target: nil, action: nil)
-    /// The tag filter, Tag Rules and the verdicts toggle: what the list and the
+    /// local-repos-list's tags for the folders sessions are launched in.
+    private lazy var repoTags = RepoTags(store: tagStore)
+    /// The tag filter and the verdicts toggle: what the list and the
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -3174,6 +2962,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         startWatching()
         events.onChange = { [weak self] in self?.refreshTable() }
+        repoTags.onChange = { [weak self] in self?.tagsChanged() }
         latest.onChange = { [weak self] in self?.refreshTable(full: true) }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             refreshUsageOnce()
@@ -3376,14 +3165,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         filterPopup.action = #selector(filterChanged)
         filterPopup.toolTip = "Show only the sessions with one tag"
         drawFilterPopup()
-        rulesButton.isBordered = false
-        rulesButton.attributedTitle = NSAttributedString(
-            string: "rules", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim])
-        rulesButton.target = self
-        rulesButton.action = #selector(openTagRules)
-        rulesButton.toolTip = "Tag Rules: dots and tags for every session launched under a directory"
         let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
-        listControls.setViews([filterPopup, rulesButton, verdictsToggle], in: .leading)
+        listControls.setViews([filterPopup, verdictsToggle], in: .leading)
         listControls.spacing = 12
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
@@ -3425,7 +3208,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// "All sessions", then one entry per tag with its dot. A filter on a tag
     /// that has since been deleted falls back to all.
     private func drawFilterPopup() {
-        if case .tag(let name)? = tagFilter, !tagStore.tags.contains(where: { $0.name == name }) { tagFilter = nil }
+        if case .tag(let name)? = tagFilter, !tagStore.tags.contains(where: { $0.name == name }),
+            !tagStore.repoTags.contains(name)
+        {
+            tagFilter = nil
+        }
         filterPopup.removeAllItems()
         filterChoices = []
         let menu = filterPopup.menu ?? NSMenu()
@@ -3443,6 +3230,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             menu.addItem(.separator())
             filterChoices.append(nil)
             for tag in tagStore.tags { add(tag.name, tagDot(tag.color), .tag(tag.name)) }
+        }
+        // local-repos-list's tags, each with its colour when it has one.
+        let own = Set(tagStore.tags.map(\.name))
+        let repoTags = tagStore.repoTags.filter { !own.contains($0) }
+        if !repoTags.isEmpty {
+            menu.addItem(.separator())
+            filterChoices.append(nil)
+            let colours = tagStore.file.repos.reduce(into: [String: String]()) { $0.merge($1.colors) { a, _ in a } }
+            for name in repoTags {
+                add(name, colours[name].map { tagDot(TagColour(name: "", hex: $0).color) }, .tag(name))
+            }
         }
         filterPopup.selectItem(at: filterChoices.firstIndex { $0 == tagFilter && $0 != nil } ?? 0)
     }
@@ -3568,6 +3366,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         self.loads = loads
         events.prune(keeping: Set(snapshot.live.compactMap { $0.summary.session_id }))
+        repoTags.refreshIfDue()
         let keep = selected?.session.summary.session_id
         let ended = { (s: Session) in reused.contains(s.summary.session_id ?? "") }
         let live = snapshot.live.filter { !ended($0) }
@@ -4019,15 +3818,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     /// The preset dots, then the named tags, each an on/off toggle for this
-    /// session. One that comes from the directory's rule shows as mixed: it
-    /// stays while the rule does, whatever is set here.
+    /// session; then, greyed, the tags its folder has in local-repos-list,
+    /// which are changed there.
     private func tagMenu(for sessionId: String, projectDir: String?) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
-        let rule = tagStore.rule(for: projectDir)
         let dots = tagStore.manualDots(sessionId)
         let names = tagStore.manualTags(sessionId)
-        func state(_ manual: Bool, _ ruled: Bool) -> NSControl.StateValue { manual ? .on : ruled ? .mixed : .off }
         for colour in TagColour.all {
             let hex = colour.hex
             let item = ActionItem(colour.name) { [weak self] in
@@ -4035,8 +3832,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 self?.tagsChanged()
             }
             item.image = tagDot(colour.color)
-            item.state = state(dots.contains(hex), rule?.dots.contains(hex) == true)
-            if rule?.dots.contains(hex) == true { item.toolTip = "From the rule for \(tildePath(rule!.dir))" }
+            item.state = dots.contains(hex) ? .on : .off
             menu.addItem(item)
         }
         if !tagStore.tags.isEmpty { menu.addItem(.separator()) }
@@ -4047,8 +3843,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 self?.tagsChanged()
             }
             item.image = tagDot(tag.color)
-            item.state = state(names.contains(name), rule?.tags.contains(name) == true)
-            if rule?.tags.contains(name) == true { item.toolTip = "From the rule for \(tildePath(rule!.dir))" }
+            item.state = names.contains(name) ? .on : .off
             menu.addItem(item)
         }
         menu.addItem(.separator())
@@ -4075,8 +3870,20 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             delete.submenu = sub
             menu.addItem(delete)
         }
-        menu.addItem(.separator())
-        menu.addItem(ActionItem("Tag Rules…") { [weak self] in self?.openTagRules() })
+        if let repo = tagStore.repo(for: projectDir), !repo.tags.isEmpty {
+            menu.addItem(.separator())
+            let header = NSMenuItem(title: "From local-repos-list", action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            for name in repo.tags {
+                let item = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                item.indentationLevel = 1
+                if let hex = repo.colors[name] { item.image = tagDot(TagColour(name: "", hex: hex).color) }
+                item.toolTip = "\(repo.path) is tagged \(name) in local-repos-list; change it there"
+                menu.addItem(item)
+            }
+        }
         return menu
     }
 
@@ -4089,15 +3896,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             if !self.tagStore.manualTags(sessionId).contains(name) { self.tagStore.toggleTag(name, for: sessionId) }
             self.tagsChanged()
         }
-    }
-
-    /// Rules that tag sessions by their launch directory, as a sheet over the list.
-    @objc func openTagRules() {
-        guard let window = window, window.attachedSheet == nil else { return }
-        let rules = TagRulesWindow(store: tagStore)
-        rules.onChange = { [weak self] in self?.tagsChanged() }
-        tagRules = rules
-        window.beginSheet(rules.window!) { [weak self] _ in self?.tagRules = nil }
     }
 
     // MARK: Restarting in place
@@ -4295,14 +4093,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             top = prose(s.cwd ?? "—", Palette.text)
             // The name other sessions message this one by; the terminal it runs
             // in is in the tooltip. A finished session has no name, so its
-            // caption falls back to the terminal. The named tags come first,
-            // each in its own colour.
+            // caption falls back to the terminal. The tags come first, each in
+            // its colour when it has one.
             let name = session.peer_name ?? session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
             var parts: [String] = []
             var at = 0
             for tag in marks.tags {
-                highlights.append((NSRange(location: at, length: (tag.name as NSString).length),
-                    past ? tag.color.withAlphaComponent(0.6) : tag.color))
+                if tag.hex != nil {
+                    highlights.append((NSRange(location: at, length: (tag.name as NSString).length),
+                        past ? tag.color.withAlphaComponent(0.6) : tag.color))
+                }
                 parts.append(tag.name)
                 at += (tag.name as NSString).length + 3
             }
@@ -4757,8 +4557,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // Tagged sessions together, by tag, above the untagged.
             case "cwd": return (0, (s.cwd ?? "~").lowercased())
             case "dots":
-                let first = tagStore.marks(s.session_id, s.project_dir).dots.first
-                return (first.flatMap { d in TagColour.all.firstIndex { $0.hex == d.hex } }.map(Double.init) ?? 99, "")
+                // Preset colours in their order, other colours after them.
+                guard let first = tagStore.marks(s.session_id, s.project_dir).dots.first else { return (99, "") }
+                return (TagColour.all.firstIndex { $0.hex == first.hex }.map(Double.init) ?? 50, first.hex ?? "")
             case "git": return (0, (s.git?.branch ?? "~").lowercased())
             case "model": return (modelRank(s.model), (s.model ?? "").lowercased())
             case "effort": return (effortRank(s.effort), s.effort ?? "")
@@ -4826,7 +4627,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// A session's dots down their narrow column from the top line, as many as
     /// fit the row: the heat stripe's neighbour in spirit, a mark to scan down for.
-    private func dotsCell(_ dots: [TagColour], past: Bool, drop: CGFloat) -> NSView {
+    private func dotsCell(_ dots: [Mark], past: Bool, drop: CGFloat) -> NSView {
         let cell = NSView()
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -5177,7 +4978,6 @@ func buildMenu() {
         keyEquivalent: "\r")
     showItem.keyEquivalentModifierMask = [.command]
     sessionMenu.addItem(.separator())
-    sessionMenu.addItem(withTitle: "Tag Rules…", action: #selector(SessionsWindow.openTagRules), keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "Restart Outdated Sessions…", action: #selector(SessionsWindow.restartOutdatedSessions),
         keyEquivalent: "")

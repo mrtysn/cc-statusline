@@ -33,9 +33,10 @@ const CACHE_DIR = process.env.CC_STATUSLINE_CACHE_DIR || join(homedir(), '.cache
 const APP_SUPPORT_DIR = join(homedir(), 'Library', 'Application Support', 'Agent Bar Hopping');
 const DISPLAY_FILE = join(APP_SUPPORT_DIR, 'display.json');
 // The app's session tags: { tags: [{ name, hex }], sessions: { <id>: [name] },
-// dots: { <id>: [hex] }, rules: [{ dir, dots: [hex], tags: [name] }] }. A
-// session shows what was set on it by hand plus what the most specific rule
-// over its launch directory adds.
+// dots: { <id>: [hex] }, repos: [{ path, tags: [name], colors: { name: hex } }] }.
+// A session shows what was set on it by hand plus the local-repos-list tags
+// of the most specific folder over its launch directory, which the app copies
+// into repos.
 const TAGS_FILE = join(APP_SUPPORT_DIR, 'tags.json');
 // The app's preset dots, in its order: TagColour.all in src/main.swift.
 const PRESET_DOTS = ['E06C75', 'D19A66', 'E5C07B', '98C379', '61AFEF', 'C678DD', '7D828F'];
@@ -234,22 +235,32 @@ function readUsageCache() {
 // This session's dots and tags from the app's tags.json, read on every redraw
 // like display.json. Missing file, unknown session or malformed entries: none.
 // A single value per session is the format from before a session had several.
+// Dots are the preset ones set by hand, then the colours of the repo's tags,
+// one dot per colour; tags keep their colour, or none (hex null).
 function readTag(sessionId, projectDir) {
-  const isHex = (v) => typeof v === 'string' && /^[0-9a-fA-F]{6}$/.test(v);
+  const isHex = (v) => typeof v === 'string' && /^#?[0-9a-fA-F]{6}$/.test(v);
+  const bare = (v) => v.replace(/^#/, '').toUpperCase();
   const list = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);
   try {
     const file = JSON.parse(readFileSync(TAGS_FILE, 'utf8'));
     const dir = typeof projectDir === 'string' ? projectDir.replace(/\/+$/, '') || '/' : null;
-    const rule = dir
-      ? list(file?.rules)
-          .filter((r) => typeof r?.dir === 'string' && (dir === r.dir || dir.startsWith(r.dir === '/' ? '/' : r.dir + '/')))
-          .sort((x, y) => y.dir.length - x.dir.length)[0]
+    const repo = dir
+      ? list(file?.repos)
+          .filter((r) => typeof r?.path === 'string' && (dir === r.path || dir.startsWith(r.path + '/')))
+          .sort((x, y) => y.path.length - x.path.length)[0]
       : null;
-    const hexes = new Set([...list(sessionId && file?.dots?.[sessionId]), ...list(rule?.dots)].filter(isHex));
-    const names = new Set([...list(sessionId && file?.sessions?.[sessionId]), ...list(rule?.tags)]);
-    // In the app's orders: the preset dots as listed, the tags as made.
-    const dots = PRESET_DOTS.filter((hex) => hexes.has(hex));
-    const tags = list(file?.tags).filter((t) => names.has(t?.name) && isHex(t?.hex)).map((t) => ({ name: t.name, hex: t.hex }));
+    const manualDots = new Set(list(sessionId && file?.dots?.[sessionId]).filter(isHex).map(bare));
+    const names = new Set(list(sessionId && file?.sessions?.[sessionId]));
+    const tags = list(file?.tags)
+      .filter((t) => names.has(t?.name) && isHex(t?.hex))
+      .map((t) => ({ name: t.name, hex: bare(t.hex) }));
+    const dots = PRESET_DOTS.filter((hex) => manualDots.has(hex));
+    for (const name of list(repo?.tags)) {
+      if (typeof name !== 'string') continue;
+      const hex = isHex(repo.colors?.[name]) ? bare(repo.colors[name]) : null;
+      tags.push({ name, hex });
+      if (hex && !dots.includes(hex)) dots.push(hex);
+    }
     return dots.length || tags.length ? { dots, tags } : null;
   } catch {
     return null;
