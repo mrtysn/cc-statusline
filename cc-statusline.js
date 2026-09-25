@@ -32,7 +32,8 @@ const CACHE_DIR = process.env.CC_STATUSLINE_CACHE_DIR || join(homedir(), '.cache
 // the one setting this script reads back on every redraw.
 const APP_SUPPORT_DIR = join(homedir(), 'Library', 'Application Support', 'Agent Bar Hopping');
 const DISPLAY_FILE = join(APP_SUPPORT_DIR, 'display.json');
-// The app's session tags: { tags: [{ name, hex }], sessions: { <id>: name } }.
+// The app's session tags: { tags: [{ name, hex }], sessions: { <id>: name },
+// dots: { <id>: hex } }; a session can have a preset dot, a named tag, or both.
 const TAGS_FILE = join(APP_SUPPORT_DIR, 'tags.json');
 // system-one's per-session shadow log (agents-shared/notebook/2026-09-24-system-one-decision-model-integration.md,
 // section 9): one JSONL file per session, read for the show-mode verdict row.
@@ -226,16 +227,18 @@ function readUsageCache() {
 // to draw ('bash' | 'prompt' | 'stop'); empty (the default) means off, even
 // when verdictRow is on -- a session that never picked a hook draws nothing,
 // so the Bash hook's scores no longer reach the row by default.
-// This session's tag from the app's tags.json, read on every redraw like
-// display.json. Missing file, unknown session or a malformed entry: no tag.
+// This session's dot and tag from the app's tags.json, read on every redraw
+// like display.json. Missing file, unknown session or a malformed entry: none.
 function readTag(sessionId) {
   if (!sessionId) return null;
+  const isHex = (v) => typeof v === 'string' && /^[0-9a-fA-F]{6}$/.test(v);
   try {
     const file = JSON.parse(readFileSync(TAGS_FILE, 'utf8'));
+    const dot = file?.dots?.[sessionId];
     const name = file?.sessions?.[sessionId];
-    const tag = typeof name === 'string' && (file.tags || []).find((t) => t?.name === name);
-    if (!tag || !/^[0-9a-fA-F]{6}$/.test(tag.hex || '')) return null;
-    return { name: tag.name, hex: tag.hex };
+    const tag = typeof name === 'string' && (file.tags || []).find((t) => t?.name === name && isHex(t.hex));
+    if (!isHex(dot) && !tag) return null;
+    return { dot: isHex(dot) ? dot : null, name: tag ? tag.name : null, hex: tag ? tag.hex : null };
   } catch {
     return null;
   }

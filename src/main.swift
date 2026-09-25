@@ -665,6 +665,9 @@ struct TagFile: Codable {
     /// Session id to tag name. Keyed by id because `claude --resume` keeps it:
     /// a session restarted after an update is still tagged.
     var sessions: [String: String] = [:]
+    /// Session id to one of the preset colour dots, by its hex: a mark that
+    /// needs no name, beside or instead of a named tag.
+    var dots: [String: String] = [:]
 
     init() {}
 
@@ -672,7 +675,14 @@ struct TagFile: Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         tags = try c.decodeIfPresent([Tag].self, forKey: .tags) ?? []
         sessions = try c.decodeIfPresent([String: String].self, forKey: .sessions) ?? [:]
+        dots = try c.decodeIfPresent([String: String].self, forKey: .dots) ?? [:]
     }
+}
+
+/// What the session list is narrowed to: one preset dot, or one named tag.
+enum TagFilter: Equatable {
+    case dot(String)
+    case tag(String)
 }
 
 /// Owns tags.json beside display.json: the app is its single writer, and the
@@ -697,6 +707,26 @@ final class TagStore {
     func set(_ name: String?, for sessionId: String) {
         file.sessions[sessionId] = name
         save()
+    }
+
+    /// The session's preset dot, if it has one still in the preset set.
+    func dot(for sessionId: String?) -> TagColour? {
+        guard let id = sessionId, let hex = file.dots[id] else { return nil }
+        return TagColour.all.first { $0.hex == hex }
+    }
+
+    func setDot(_ hex: String?, for sessionId: String) {
+        file.dots[sessionId] = hex
+        save()
+    }
+
+    /// Whether a session passes the list's filter.
+    func matches(_ filter: TagFilter?, _ sessionId: String?) -> Bool {
+        switch filter {
+        case nil: return true
+        case .dot(let hex)?: return dot(for: sessionId)?.hex == hex
+        case .tag(let name)?: return tag(for: sessionId)?.name == name
+        }
     }
 
     /// A new tag, or the existing one of that name recoloured.
@@ -2685,8 +2715,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let verdictsToggle = NSButton(title: "", target: nil, action: nil)
     /// tags.json: the labels put on sessions from their right-click menu.
     private let tagStore = TagStore()
-    /// Shows only the sessions with one tag; nil shows every session.
-    private var tagFilter: String?
+    /// Shows only the sessions with one dot or tag; nil shows every session.
+    private var tagFilter: TagFilter?
+    /// The filter behind each popup entry, in order; nil for "All sessions"
+    /// and for separators.
+    private var filterChoices: [TagFilter?] = []
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// Every session in the last snapshot; `rows` is what the filter lets through.
     private var allRows: [(session: Session, past: Bool)] = []
@@ -2963,29 +2996,49 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// "All sessions", then one entry per tag with its dot. A filter on a tag
     /// that has since been deleted falls back to all.
     private func drawFilterPopup() {
-        if let f = tagFilter, !tagStore.tags.contains(where: { $0.name == f }) { tagFilter = nil }
+        if case .tag(let name)? = tagFilter, !tagStore.tags.contains(where: { $0.name == name }) { tagFilter = nil }
         filterPopup.removeAllItems()
-        filterPopup.addItem(withTitle: "All sessions")
-        for tag in tagStore.tags {
-            filterPopup.addItem(withTitle: tag.name)
-            filterPopup.lastItem?.image = tagDot(tag.color)
+        filterChoices = []
+        let menu = filterPopup.menu ?? NSMenu()
+        func add(_ title: String, _ image: NSImage?, _ choice: TagFilter?) {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.image = image
+            menu.addItem(item)
+            filterChoices.append(choice)
         }
-        filterPopup.selectItem(at: tagFilter.flatMap { f in tagStore.tags.firstIndex { $0.name == f } }.map { $0 + 1 } ?? 0)
-        filterPopup.isHidden = tagStore.tags.isEmpty
+        add("All sessions", nil, nil)
+        menu.addItem(.separator())
+        filterChoices.append(nil)
+        for colour in TagColour.all { add(colour.name, tagDot(colour.color), .dot(colour.hex)) }
+        if !tagStore.tags.isEmpty {
+            menu.addItem(.separator())
+            filterChoices.append(nil)
+            for tag in tagStore.tags { add(tag.name, tagDot(tag.color), .tag(tag.name)) }
+        }
+        filterPopup.selectItem(at: filterChoices.firstIndex { $0 == tagFilter && $0 != nil } ?? 0)
     }
 
     @objc private func filterChanged() {
         let index = filterPopup.indexOfSelectedItem
-        tagFilter = index > 0 && index - 1 < tagStore.tags.count ? tagStore.tags[index - 1].name : nil
+        tagFilter = index >= 0 && index < filterChoices.count ? filterChoices[index] : nil
         applyFilter()
+    }
+
+    /// The filter in words, for the empty list.
+    private var filterWords: String {
+        switch tagFilter {
+        case .dot(let hex)?: return "the \(TagColour.all.first { $0.hex == hex }?.name.lowercased() ?? "") dot"
+        case .tag(let name)?: return "the tag \(name)"
+        case nil: return "that tag"
+        }
     }
 
     /// Rows from the last snapshot through the tag filter, sorted and drawn.
     private func applyFilter() {
         let keep = selected?.session.summary.session_id
-        rows = allRows.filter { tagFilter == nil || tagStore.tag(for: $0.session.summary.session_id)?.name == tagFilter }
+        rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id) }
         emptyLabel.stringValue = allRows.isEmpty
-            ? "No session has drawn a status line yet." : "No session has the tag \(tagFilter ?? "")."
+            ? "No session has drawn a status line yet." : "No session has \(filterWords)."
         emptyLabel.isHidden = !rows.isEmpty
         sortRows()
         refreshTable(full: true)
@@ -3091,14 +3144,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let live = snapshot.live.filter { !ended($0) }
         let past = snapshot.live.filter(ended) + snapshot.history
         allRows = live.map { ($0, false) } + past.map { ($0, true) }
-        rows = allRows.filter { tagFilter == nil || tagStore.tag(for: $0.session.summary.session_id)?.name == tagFilter }
+        rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id) }
         counts = "\(live.count) live · \(past.count) finished"
         toolCost = (cost, footprint)
         healthIssues = snapshot.health ?? []
         latest.refreshIfDue()
         if noteToken == nil { statusLabel.stringValue = counts }
         emptyLabel.stringValue = allRows.isEmpty
-            ? "No session has drawn a status line yet." : "No session has the tag \(tagFilter ?? "")."
+            ? "No session has drawn a status line yet." : "No session has \(filterWords)."
         emptyLabel.isHidden = !rows.isEmpty
         drawQuotaBar(snapshot)
         sortRows()
@@ -3541,6 +3594,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private func tagMenu(for sessionId: String) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
+        // The preset dots first: one click, nothing to name.
+        let currentDot = tagStore.dot(for: sessionId)?.hex
+        for colour in TagColour.all {
+            let hex = colour.hex
+            let item = ActionItem(colour.name) { [weak self] in
+                self?.tagStore.setDot(hex, for: sessionId)
+                self?.tagsChanged()
+            }
+            item.image = tagDot(colour.color)
+            item.state = hex == currentDot ? .on : .off
+            menu.addItem(item)
+        }
+        if currentDot != nil {
+            menu.addItem(ActionItem("No Dot") { [weak self] in
+                self?.tagStore.setDot(nil, for: sessionId)
+                self?.tagsChanged()
+            })
+        }
+        menu.addItem(.separator())
         let current = tagStore.tag(for: sessionId)?.name
         for tag in tagStore.tags {
             let name = tag.name
@@ -3744,13 +3816,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // Claude Code's own name for the session, under the topic ours derives.
             bottom = s.session_name ?? ""
         case "tag":
-            if let tag = tagStore.tag(for: s.session_id) {
-                let line = NSMutableAttributedString(attributedString: mono("●  ", tag.color))
-                line.append(prose(tag.name, tag.color))
-                top = line
-            } else {
-                top = NSAttributedString(string: "")
-            }
+            // The dot in its colour, then the named tag in its own.
+            let line = NSMutableAttributedString()
+            if let dot = tagStore.dot(for: s.session_id) { line.append(mono("●  ", dot.color)) }
+            if let tag = tagStore.tag(for: s.session_id) { line.append(prose(tag.name, tag.color)) }
+            top = line
             bottom = ""
         case "state":
             let (word, colour) = stateWords(session, past: past)
@@ -4258,7 +4328,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             switch key {
             case "topic": return (0, (s.topic ?? "~").lowercased())
             // Tagged sessions together, by tag, above the untagged.
-            case "tag": return tagStore.tag(for: s.session_id).map { (0, $0.name.lowercased()) } ?? (1, "")
+            case "tag":
+                let dot = tagStore.dot(for: s.session_id).flatMap { d in TagColour.all.firstIndex { $0.hex == d.hex } }
+                let name = tagStore.tag(for: s.session_id)?.name.lowercased()
+                if dot == nil && name == nil { return (Double(TagColour.all.count + 1), "") }
+                return (Double(dot ?? TagColour.all.count), name ?? "~")
             case "cwd": return (0, (s.cwd ?? "~").lowercased())
             case "git": return (0, (s.git?.branch ?? "~").lowercased())
             case "model": return (modelRank(s.model), (s.model ?? "").lowercased())
@@ -4381,7 +4455,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let age = "\(ago(session.active_at ?? session.updated_at)) ago"
         switch key {
         case "tag":
-            return tagStore.tag(for: s.session_id).map { "Tag \($0.name)" } ?? "No tag"
+            let words = [
+                tagStore.dot(for: s.session_id).map { "\($0.name) dot" },
+                tagStore.tag(for: s.session_id).map { "tag \($0.name)" },
+            ].compactMap { $0 }
+            return words.isEmpty ? "No tag" : words.joined(separator: ", ")
         case "topic":
             return "\(past ? "Finished" : "Live") session, \(s.topic ?? "no topic")"
                 + (s.session_name.map { ", named \($0)" } ?? "")
