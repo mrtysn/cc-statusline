@@ -4846,11 +4846,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         cell.addSubview(stack)
         // The first dot on the top line, level with the state dot before the
         // topic: the cell's two lines are centred as a block, so the top line's
-        // middle is half a caption line above the cell's.
+        // middle is half a caption line above the cell's. The ● glyph sits a
+        // point below its line's middle, measured against the state dot.
         let caption = NSLayoutManager().defaultLineHeight(for: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular))
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: cell.centerXAnchor),
-            stack.topAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop - caption / 2 - 3.5),
+            stack.topAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop - caption / 2 - 3.5 + 1),
         ])
         cell.setAccessibilityLabel(dots.isEmpty ? "No dots" : dots.map { "\($0.name) dot" }.joined(separator: ", "))
         return cell
