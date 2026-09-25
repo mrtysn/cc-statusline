@@ -64,9 +64,11 @@ let repoDir: URL = {
 func log(_ message: String) {
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
     guard let data = line.data(using: .utf8) else { return }
+    // The throwing calls, not seekToEndOfFile() and write(_:): those raise an
+    // Objective-C exception on a full disk, which Swift cannot catch.
     if let handle = try? FileHandle(forWritingTo: logURL) {
-        handle.seekToEndOfFile()
-        handle.write(data)
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
         try? handle.close()
     } else {
         try? data.write(to: logURL)
@@ -317,7 +319,7 @@ func refreshUsageOnce() {
 }
 
 private func finishSnapshot(_ task: Process, _ pipe: Pipe) -> Snapshot? {
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
     task.waitUntilExit()
     guard task.terminationStatus == 0 else {
         let hint = task.terminationStatus == 127 ? " (node not found on PATH)" : ""
@@ -893,7 +895,8 @@ final class EventCenter {
     /// device is not held open between them.
     func playFile(_ url: URL) {
         guard let file = try? AVAudioFile(forReading: url),
-            let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
+            let frames = AVAudioFrameCount(exactly: file.length),
+            let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames),
             (try? file.read(into: buffer)) != nil
         else { return log("cannot decode \(url.lastPathComponent)") }
         player.stop()
@@ -1984,8 +1987,8 @@ func runScript(_ script: String, label: String) -> String {
         log("\(label): \(error.localizedDescription)")
         return ""
     }
-    let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let stdout = String(data: (try? out.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8) ?? ""
+    let stderr = String(data: (try? err.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8) ?? ""
     task.waitUntilExit()
     let result = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     log("\(label): exit \(task.terminationStatus) out=\(result) err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
