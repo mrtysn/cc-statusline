@@ -3290,6 +3290,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let columns: [Column] = [
         Column(key: "age", title: "Last Seen", width: 74),
         Column(key: "cwd", title: "Directory", width: 164),
+        // Beside the directory, as the heat stripe sits beside the cache: the
+        // session's dots, stacked, without a title.
+        Column(key: "dots", title: "", width: 12),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "state", title: "State", width: 112),
         // Beside the state: what a session is doing and how long its cache has
@@ -4227,6 +4230,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             top = title
             // Claude Code's own name for the session, under the topic ours derives.
             bottom = s.session_name ?? ""
+        case "dots":
+            let line = NSMutableAttributedString()
+            for dot in tagStore.marks(s.session_id, s.project_dir).dots { line.append(mono("●", dot.color)) }
+            top = line
+            bottom = ""
         case "state":
             let (word, colour) = stateWords(session, past: past)
             // The state and the permission mode share the top line; under them,
@@ -4281,19 +4289,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             bottom = ""
         case "cwd":
-            // The dots lead the path, where the eye already goes to tell sessions
-            // apart; the caption lines up with the path, not the dots.
+            // The dots have their own column beside this one, so every path
+            // starts at the same place whether or not its session has any.
             let marks = tagStore.marks(s.session_id, s.project_dir)
-            let line = NSMutableAttributedString()
-            if !marks.dots.isEmpty {
-                let dots = NSMutableAttributedString()
-                for dot in marks.dots { dots.append(mono("●", dot.color)) }
-                dots.append(mono("  ", Palette.text))
-                captionIndent = ceil(dots.size().width)
-                line.append(dots)
-            }
-            line.append(prose(s.cwd ?? "—", Palette.text))
-            top = line
+            top = prose(s.cwd ?? "—", Palette.text)
             // The name other sessions message this one by; the terminal it runs
             // in is in the tooltip. A finished session has no name, so its
             // caption falls back to the terminal. The named tags come first,
@@ -4427,6 +4426,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let c = shownContent(key, row: row)
         let drop = c.drop
         if key == "context" { return progressCell(c.percent, past: past, drop: drop, key: s.session_id) }
+        if key == "dots" { return dotsCell(tagStore.marks(s.session_id, s.project_dir).dots, past: past, drop: drop) }
         let heat = c.heat
         let alignment = c.alignment
         let field = NSTextField(labelWithString: "")
@@ -4756,6 +4756,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             case "topic": return (0, (s.topic ?? "~").lowercased())
             // Tagged sessions together, by tag, above the untagged.
             case "cwd": return (0, (s.cwd ?? "~").lowercased())
+            case "dots":
+                let first = tagStore.marks(s.session_id, s.project_dir).dots.first
+                return (first.flatMap { d in TagColour.all.firstIndex { $0.hex == d.hex } }.map(Double.init) ?? 99, "")
             case "git": return (0, (s.git?.branch ?? "~").lowercased())
             case "model": return (modelRank(s.model), (s.model ?? "").lowercased())
             case "effort": return (effortRank(s.effort), s.effort ?? "")
@@ -4819,6 +4822,34 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // flag from the last redraw.
         let left = expires / 1000 - Date().timeIntervalSince1970
         return left > 0 ? left : -1
+    }
+
+    /// A session's dots down the middle of their narrow column, as many as fit
+    /// the row: the heat stripe's neighbour in spirit, a mark to scan down for.
+    private func dotsCell(_ dots: [TagColour], past: Bool, drop: CGFloat) -> NSView {
+        let cell = NSView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 3
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for dot in dots.prefix(4) {
+            let view = NSView()
+            view.wantsLayer = true
+            view.layer?.backgroundColor = (past ? dot.color.withAlphaComponent(0.6) : dot.color).cgColor
+            view.layer?.cornerRadius = 3.5
+            view.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                view.widthAnchor.constraint(equalToConstant: 7), view.heightAnchor.constraint(equalToConstant: 7),
+            ])
+            stack.addArrangedSubview(view)
+        }
+        cell.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: cell.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
+        ])
+        cell.setAccessibilityLabel(dots.isEmpty ? "No dots" : dots.map { "\($0.name) dot" }.joined(separator: ", "))
+        return cell
     }
 
     /// "▓▓▓░░ 52%": the bar, then the number it stands for.
