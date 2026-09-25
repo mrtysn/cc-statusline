@@ -673,6 +673,15 @@ struct RepoEntry: Codable, Equatable {
     var auto_tag: String?
     var container: Bool = false
 
+    init(name: String, path: String, tags: [String], colors: [String: String], auto_tag: String?, container: Bool) {
+        self.name = name
+        self.path = path
+        self.tags = tags
+        self.colors = colors
+        self.auto_tag = auto_tag
+        self.container = container
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
@@ -690,6 +699,119 @@ struct RepoEntry: Codable, Equatable {
     func isAutomatic(_ tag: String) -> Bool { tag == auto_tag || (tag == "container" && container) }
 
     func covers(_ dir: String) -> Bool { dir == path || dir.hasPrefix(path + "/") }
+}
+
+/// What local-repos-list's `api snapshot` prints, and every `api` change
+/// prints once it is written: each folder under the dev root, and each tag
+/// with its colour and the folders carrying it. A colour belongs to the tag,
+/// so the folders carry none of their own.
+struct RepoSnapshot: Decodable, Equatable {
+    struct Folder: Decodable, Equatable {
+        var name: String
+        var path: String
+        var tags: [String]
+        var auto_tag: String?
+        var container: Bool
+
+        init(name: String, path: String, tags: [String], auto_tag: String?, container: Bool) {
+            self.name = name
+            self.path = path
+            self.tags = tags
+            self.auto_tag = auto_tag
+            self.container = container
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            name = try c.decode(String.self, forKey: .name)
+            path = try c.decode(String.self, forKey: .path)
+            tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+            auto_tag = try c.decodeIfPresent(String.self, forKey: .auto_tag)
+            container = try c.decodeIfPresent(Bool.self, forKey: .container) ?? false
+        }
+
+        private enum CodingKeys: String, CodingKey { case name, path, tags, auto_tag, container }
+
+        /// On this folder because git or the tree says so: untag cannot take it off.
+        func isAutomatic(_ tag: String) -> Bool { tag == auto_tag || (tag == "container" && container) }
+    }
+
+    struct TagInfo: Decodable, Equatable {
+        /// The bare upper-case digits, as the app keeps colours; nil for none.
+        var color: String?
+        var folders: [String]
+        /// Set by local-repos-list itself (mine, fork, third-party, container)
+        /// on the folders git or the tree decides; it can still be set by hand.
+        var automatic: Bool
+
+        init(color: String?, folders: [String], automatic: Bool) {
+            self.color = color
+            self.folders = folders
+            self.automatic = automatic
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            color = try c.decodeIfPresent(String.self, forKey: .color)
+                .map { $0.replacingOccurrences(of: "#", with: "").uppercased() }
+            folders = try c.decodeIfPresent([String].self, forKey: .folders) ?? []
+            automatic = try c.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
+        }
+
+        private enum CodingKeys: String, CodingKey { case color, folders, automatic }
+    }
+
+    var root: String
+    /// The file local-repos-list keeps tags in; its directory is what the app watches.
+    var overrides: String?
+    var folders: [Folder]
+    var tags: [String: TagInfo]
+
+    init(root: String, overrides: String?, folders: [Folder], tags: [String: TagInfo]) {
+        self.root = root
+        self.overrides = overrides
+        self.folders = folders
+        self.tags = tags
+    }
+
+    /// From an older local-repos-list's `--json` list, which has no `api`: the
+    /// tag map is put together from the folders' own colours.
+    init(root: String, overrides: String?, entries: [RepoEntry]) {
+        var tags: [String: TagInfo] = [:]
+        for entry in entries {
+            for name in entry.tags {
+                var info = tags[name] ?? TagInfo(color: nil, folders: [], automatic: false)
+                info.color = info.color ?? entry.colors[name]
+                info.folders.append(entry.name)
+                info.automatic = info.automatic || entry.isAutomatic(name)
+                tags[name] = info
+            }
+        }
+        self.init(
+            root: root, overrides: overrides,
+            folders: entries.map {
+                Folder(name: $0.name, path: $0.path, tags: $0.tags, auto_tag: $0.auto_tag, container: $0.container)
+            },
+            tags: tags)
+    }
+
+    private enum CodingKeys: String, CodingKey { case root, overrides, folders, tags }
+
+    /// The folders as tags.json keeps them for the status line, each with the
+    /// colours of its tags.
+    var entries: [RepoEntry] {
+        folders.map { folder in
+            RepoEntry(
+                name: folder.name, path: folder.path, tags: folder.tags,
+                colors: folder.tags.reduce(into: [String: String]()) { $0[$1] = tags[$1]?.color },
+                auto_tag: folder.auto_tag, container: folder.container)
+        }
+    }
+
+    func folder(named name: String) -> Folder? { folders.first { $0.name == name } }
+
+    /// Every tag, alphabetically.
+    var tagNames: [String] { tags.keys.sorted() }
 }
 
 struct TagFile: Codable {
@@ -865,77 +987,249 @@ final class TagStore {
     }
 }
 
-/// Reads local-repos-list's folders and tags into the tag store: at launch,
-/// whenever its overrides file changes, and every few minutes for folders
-/// cloned or removed. The dev root is $DEV_ROOT, else ~/dev, as
-/// local-repos-list's own GUI takes it.
+/// Reads local-repos-list's folders and tags into the tag store through its
+/// versioned `api`: at launch, within a moment of its overrides file changing
+/// (whoever changed it), and every few minutes for folders cloned or removed.
+/// Every change goes through the same `api` and prints the snapshot it left,
+/// which is applied as it comes, so nothing is read twice. The dev root is
+/// $DEV_ROOT, else ~/dev, as local-repos-list's own GUI takes it.
 final class RepoTags {
     private let store: TagStore
+    /// Called on the main queue whenever the snapshot changes.
     var onChange: (() -> Void)?
-    private var overridesStamp: Date?
-    private var lastRun: Date = .distantPast
-    private var running = false
+    /// What local-repos-list said last; nil until it has answered once.
+    private(set) var snapshot: RepoSnapshot?
+    /// Whether this local-repos-list has the `api` commands: nil until asked.
+    /// Without them the app reads its older `--json` list and changes tags
+    /// through its older commands, and says so in the log once.
+    private(set) var hasAPI: Bool?
+    /// One run at a time, in order: a snapshot applied is never older than
+    /// one applied before it.
+    private let queue = DispatchQueue(label: "agent-bar-hopping.local-repos-list", qos: .utility)
+    private var watcher: DispatchSourceFileSystemObject?
+    private var watchedDir: String?
+    private var pendingRead: DispatchWorkItem?
+    private var timer: Timer?
     private static let refreshSeconds: Double = 300
+    /// local-repos-list writes its file once but the directory fires more than once.
+    private static let settleSeconds: Double = 0.3
 
     init(store: TagStore) { self.store = store }
 
-    private var overridesFile: URL {
-        xdgDir("XDG_CONFIG_HOME", fallback: ".config").appendingPathComponent("local-repos-list/overrides.toml")
+    /// Where an older local-repos-list keeps its overrides, for the watch
+    /// when no snapshot names the file.
+    private var defaultOverrides: String {
+        xdgDir("XDG_CONFIG_HOME", fallback: ".config").appendingPathComponent("local-repos-list/overrides.toml").path
     }
 
-    private let root = ProcessInfo.processInfo.environment["DEV_ROOT"].map { ($0 as NSString).expandingTildeInPath }
+    let root = ProcessInfo.processInfo.environment["DEV_ROOT"].map { ($0 as NSString).expandingTildeInPath }
         ?? home.appendingPathComponent("dev").path
 
-    /// Cheap enough for every reload: one stat, and the tool only when due.
-    func refreshIfDue() {
-        let stamp = (try? fm.attributesOfItem(atPath: overridesFile.path))?[.modificationDate] as? Date
-        guard !running, stamp != overridesStamp || Date().timeIntervalSince(lastRun) > Self.refreshSeconds else { return }
-        running = true
-        overridesStamp = stamp
-        lastRun = Date()
+    /// The first read, then one every few minutes; the watch starts with the
+    /// first snapshot, which names the file.
+    func start() {
+        read()
+        timer = Timer.scheduledTimer(withTimeInterval: Self.refreshSeconds, repeats: true) { [weak self] _ in
+            self?.read()
+        }
+    }
+
+    /// Everything again, off the main thread; applied when it changed.
+    func read() {
         let root = self.root
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let repos = Self.read(root: root)
+        let fallback = defaultOverrides
+        queue.async { [weak self] in
+            let (snapshot, api) = Self.fetch(root: root, overrides: fallback)
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.running = false
-                guard let repos = repos else { return }
-                let before = self.store.file.repos
-                self.store.setRepos(repos)
-                if repos != before { self.onChange?() }
-            }
-        }
-    }
-
-    /// Changes local-repos-list through its own commands, so its overrides
-    /// file stays the one place folder tags and colours live; reads it all
-    /// back once the change is written. `done` gets the error, if any.
-    func edit(_ arguments: [String], done: @escaping (String?) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let (status, _, err) = Self.run(arguments)
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if status != 0 {
-                    let message = err.trimmingCharacters(in: .whitespacesAndNewlines)
-                    log("local-repos-list \(arguments.joined(separator: " ")): \(message)")
-                    done(message.isEmpty ? "local-repos-list failed" : message)
-                    return
+                self.noteAPI(api)
+                if let snapshot = snapshot {
+                    self.apply(snapshot)
+                } else {
+                    // A file local-repos-list cannot read yet is still watched, so its fix is seen.
+                    self.watch(self.snapshot?.overrides ?? fallback)
                 }
-                self.overridesStamp = nil
-                self.refreshIfDue()
-                done(nil)
             }
         }
     }
 
-    /// Adds or takes off a tag on the folder a session was launched in.
-    func setTag(_ tag: String, on repo: RepoEntry, _ on: Bool, done: @escaping (String?) -> Void) {
-        edit([on ? "tag" : "untag", repo.name, tag, "--root", root], done: done)
+    /// A snapshot from local-repos-list: into tags.json when it differs, and
+    /// the watch moved if the file moved.
+    private func apply(_ snapshot: RepoSnapshot) {
+        watch(snapshot.overrides ?? defaultOverrides)
+        guard snapshot != self.snapshot else { return }
+        self.snapshot = snapshot
+        store.setRepos(snapshot.entries)
+        onChange?()
+    }
+
+    private func noteAPI(_ api: Bool?) {
+        guard let api = api, api != hasAPI else { return }
+        if !api { log("local-repos-list has no api command; reading its --json list and using its older commands") }
+        hasAPI = api
+    }
+
+    // MARK: Watching
+
+    /// local-repos-list replaces its overrides file by renaming a new one over
+    /// it, which a watch on the file itself would lose, so the watch is on its
+    /// directory. A directory that does not exist yet is watched from the first
+    /// read after it appears; until then the periodic read stands in.
+    private func watch(_ overrides: String) {
+        let dir = (overrides as NSString).deletingLastPathComponent
+        guard watcher == nil || watchedDir != dir else { return }
+        watcher?.cancel()
+        watcher = nil
+        watchedDir = nil
+        let fd = open(dir, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .rename, .delete], queue: .main)
+        source.setEventHandler { [weak self, weak source] in
+            guard let self = self, let source = source else { return }
+            // The directory itself moved or went: watch it afresh once it is back.
+            if !source.data.isDisjoint(with: [.rename, .delete]) {
+                source.cancel()
+                self.watcher = nil
+            }
+            self.scheduleRead()
+        }
+        source.setCancelHandler { Darwin.close(fd) }
+        source.resume()
+        watcher = source
+        watchedDir = dir
+    }
+
+    private func scheduleRead() {
+        pendingRead?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.read() }
+        pendingRead = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleSeconds, execute: work)
+    }
+
+    // MARK: Changing
+
+    /// Adds or takes off a tag on a folder, by the name local-repos-list gives it.
+    func setTag(_ tag: String, on folder: String, _ on: Bool, done: @escaping (String?) -> Void) {
+        let verb = on ? "tag" : "untag"
+        change([verb, folder, tag], legacy: [verb, folder, tag, "--root", root], done: done)
     }
 
     /// A tag's colour, for every folder carrying it; nil clears it.
     func setColor(_ tag: String, _ hex: String?, done: @escaping (String?) -> Void) {
-        edit(["color", tag] + (hex.map { ["#" + $0] } ?? ["--clear"]), done: done)
+        let colour = hex.map { ["#" + $0] } ?? ["--clear"]
+        change(["color", tag] + colour, legacy: ["color", tag] + colour, done: done)
+    }
+
+    /// A tag off every folder, and its colour gone; git's own tags stay where git puts them.
+    func deleteTag(_ tag: String, done: @escaping (String?) -> Void) {
+        change(["delete-tag", tag], legacy: nil, done: done)
+    }
+
+    /// Changes local-repos-list through its own commands, so its overrides
+    /// file stays the one place folder tags and colours live, and applies the
+    /// snapshot the change prints. An older local-repos-list gets its older
+    /// command, where there is one, and is read again after it. `done` gets
+    /// the error, if any.
+    private func change(_ arguments: [String], legacy: [String]?, done: @escaping (String?) -> Void) {
+        let root = self.root
+        let fallback = defaultOverrides
+        queue.async(qos: .userInitiated) { [weak self] in
+            let finish = { (snapshot: RepoSnapshot?, api: Bool?, error: String?) in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.noteAPI(api)
+                    if let snapshot = snapshot { self.apply(snapshot) }
+                    if let error = error { log("local-repos-list \(arguments.joined(separator: " ")): \(error)") }
+                    done(error)
+                }
+            }
+            switch Self.reply(Self.run(["api"] + arguments + ["--root", root])) {
+            case .snapshot(let snapshot):
+                finish(snapshot, true, nil)
+            case .failed(let message):
+                finish(nil, true, message)
+            case .noAPI:
+                guard let legacy = legacy else {
+                    return finish(nil, false, "This needs a newer local-repos-list, with its api commands")
+                }
+                let (status, _, err) = Self.run(legacy)
+                let message = err.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard status == 0 else { return finish(nil, false, message.isEmpty ? "local-repos-list failed" : message) }
+                finish(Self.readList(root: root, overrides: fallback), false, nil)
+            }
+        }
+    }
+
+    /// The address of local-repos-list's own page with a folder selected. The
+    /// tool starts its server when none is running, which can take seconds, so
+    /// this runs off the main thread; `done` gets the address or an error.
+    func guiURL(project: String, done: @escaping (URL?, String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (status, data, err) = Self.run(["api", "gui-url", "--project", project])
+            let answer = try? JSONDecoder().decode(GuiAnswer.self, from: data)
+            let url = answer?.url.flatMap(URL.init(string:))
+            var error: String?
+            if url == nil {
+                let message = err.trimmingCharacters(in: .whitespacesAndNewlines)
+                error = answer?.error
+                    ?? (answer == nil && status != 0 ? "This needs a newer local-repos-list, with its api commands" : nil)
+                    ?? (message.isEmpty ? "local-repos-list gave no address" : message)
+                log("local-repos-list api gui-url: \(error ?? "")")
+            }
+            DispatchQueue.main.async { done(url, error) }
+        }
+    }
+
+    // MARK: Running the tool
+
+    private struct GuiAnswer: Decodable {
+        var url: String?
+        var error: String?
+    }
+
+    /// Only the envelope: whether this is the `api` answering, and with an error.
+    private struct Envelope: Decodable {
+        var api: Int
+        var error: String?
+    }
+
+    private enum Reply {
+        case snapshot(RepoSnapshot)
+        case failed(String)
+        /// Not the `api` answering: a local-repos-list from before it.
+        case noAPI
+    }
+
+    /// What an `api` command printed. Its answers are JSON with an `api` key,
+    /// errors included; anything else is an older tool rejecting the command.
+    private static func reply(_ result: (Int32, Data, String)) -> Reply {
+        let (status, data, _) = result
+        guard let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
+            return status == 0 ? .failed("local-repos-list: output not understood") : .noAPI
+        }
+        if let error = envelope.error { return .failed(error) }
+        guard let snapshot = try? JSONDecoder().decode(RepoSnapshot.self, from: data) else {
+            return .failed("local-repos-list: snapshot not understood")
+        }
+        return .snapshot(snapshot)
+    }
+
+    /// `api snapshot`, else an older tool's `--json` list: the snapshot, or nil
+    /// to keep what was read last; and whether the `api` answered, nil when
+    /// the tool could not be asked at all.
+    private static func fetch(root: String, overrides: String) -> (RepoSnapshot?, Bool?) {
+        switch reply(run(["api", "snapshot", "--root", root])) {
+        case .snapshot(let snapshot):
+            return (snapshot, true)
+        case .failed(let message):
+            log("local-repos-list api snapshot: \(message)")
+            return (nil, true)
+        case .noAPI:
+            // Neither answering means no local-repos-list at all, not an old one.
+            let list = readList(root: root, overrides: overrides)
+            return (list, list == nil ? nil : false)
+        }
     }
 
     /// `local-repos-list <arguments>`, found on the same PATH the status line
@@ -958,9 +1252,9 @@ final class RepoTags {
         return (task.terminationStatus, data, message)
     }
 
-    /// `local-repos-list --root <root> --json`; nil when the tool is missing
-    /// or fails, which keeps what was read last.
-    private static func read(root: String) -> [RepoEntry]? {
+    /// An older local-repos-list's `--root <root> --json`; nil when the tool
+    /// is missing or fails, which keeps what was read last.
+    private static func readList(root: String, overrides: String) -> RepoSnapshot? {
         let (status, data, message) = run(["--root", root, "--json"])
         guard status == 0 else {
             log("local-repos-list exited \(status): \(message.trimmingCharacters(in: .whitespacesAndNewlines))")
@@ -970,7 +1264,7 @@ final class RepoTags {
             log("local-repos-list: output not understood")
             return nil
         }
-        return list
+        return RepoSnapshot(root: root, overrides: overrides, entries: list)
     }
 }
 
@@ -2903,6 +3197,466 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 }
 
+/// A tag's colour as a swatch to click: ringed when it is the one in use.
+func colourSwatch(_ color: NSColor, ringed: Bool) -> NSImage {
+    NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+        color.setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: 3, dy: 3)).fill()
+        if ringed {
+            Palette.text.setStroke()
+            let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.75, dy: 0.75))
+            ring.lineWidth = 1.5
+            ring.stroke()
+        }
+        return true
+    }
+}
+
+/// Repo Tags: every tag local-repos-list keeps, as a sheet over the list. The
+/// tags down the left, each with its colour and how many folders carry it;
+/// the selected one's colour and folders on the right. Every change goes
+/// straight to local-repos-list, and the sheet redraws from the snapshot the
+/// change prints, or from the next read when something else changed the file.
+final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    private let repoTags: RepoTags
+    /// The folder a new tag goes on unless another is chosen: the one the
+    /// session it was opened from was launched in.
+    private let folder: String?
+    private let tagTable = NSTableView()
+    private let folderTable = NSTableView()
+    private let newButton = NSButton(title: "New Tag…", target: nil, action: nil)
+    private let deleteButton = NSButton(title: "Delete Tag", target: nil, action: nil)
+    private let detail = NSView()
+    private let nameLabel = NSTextField(labelWithString: "")
+    private let kindLabel = NSTextField(wrappingLabelWithString: "")
+    private let dotRow = NSStackView()
+    private let hexField = NSTextField()
+    private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
+    private let foldersTitle = NSTextField(labelWithString: "")
+    private let addPopup = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let hint = NSTextField(wrappingLabelWithString: "")
+    /// Why the last change did not take, until the next one.
+    private let status = NSTextField(labelWithString: "")
+    /// The tag table's rows, and the folder table's for the selected tag.
+    private var names: [String] = []
+    private var folders: [String] = []
+    /// Kept by name, so a redraw from a new snapshot keeps it selected.
+    private var selectedTag: String?
+    /// Set while the tables are reloaded, when a selection change is not the user's.
+    private var redrawing = false
+
+    init(repoTags: RepoTags, folder: String?) {
+        self.repoTags = repoTags
+        self.folder = folder
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.title = "Repo Tags"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.contentMinSize = NSSize(width: 580, height: 400)
+        super.init(window: window)
+        build()
+        redraw()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private var snapshot: RepoSnapshot? { repoTags.snapshot }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        let intro = NSTextField(wrappingLabelWithString:
+            "The tags local-repos-list keeps for the folders under \((repoTags.root as NSString).abbreviatingWithTildeInPath). "
+            + "Every change is saved there at once, so every tool that reads it sees it.")
+        intro.font = NSFont.systemFont(ofSize: 12)
+        intro.textColor = .secondaryLabelColor
+
+        for (key, title, width) in [("tag", "Tag", 150.0), ("count", "Folders", 56.0), ("kind", "", 70.0)] {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
+            column.title = title
+            column.width = CGFloat(width)
+            tagTable.addTableColumn(column)
+        }
+        let folderColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("folder"))
+        folderColumn.resizingMask = .autoresizingMask
+        folderTable.addTableColumn(folderColumn)
+        folderTable.headerView = nil
+        folderTable.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        for table in [tagTable, folderTable] {
+            table.dataSource = self
+            table.delegate = self
+            table.rowHeight = 24
+            table.usesAlternatingRowBackgroundColors = true
+        }
+        folderTable.allowsEmptySelection = true
+        folderTable.selectionHighlightStyle = .none
+        let tagScroll = NSScrollView()
+        let folderScroll = NSScrollView()
+        for (scroll, table) in [(tagScroll, tagTable), (folderScroll, folderTable)] {
+            scroll.documentView = table
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+        }
+
+        newButton.target = self
+        newButton.action = #selector(makeTag)
+        newButton.toolTip = "A new tag, put on a folder, with a colour if you like"
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteTag)
+        let tagButtons = NSStackView(views: [newButton, deleteButton])
+        tagButtons.spacing = 8
+
+        nameLabel.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        kindLabel.font = NSFont.systemFont(ofSize: 11)
+        kindLabel.textColor = .secondaryLabelColor
+        dotRow.spacing = 2
+        hexField.placeholderString = "#RRGGBB"
+        hexField.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        hexField.target = self
+        hexField.action = #selector(hexEntered)
+        hexField.toolTip = "Any colour as #RRGGBB; Return sets it"
+        clearButton.controlSize = .small
+        clearButton.target = self
+        clearButton.action = #selector(clearColour)
+        clearButton.toolTip = "No colour: the tag shows faint"
+        let colourRow = NSStackView(views: [dotRow, hexField, clearButton])
+        colourRow.spacing = 10
+        foldersTitle.font = NSFont.systemFont(ofSize: 11)
+        foldersTitle.textColor = .secondaryLabelColor
+        addPopup.controlSize = .small
+        addPopup.target = self
+        addPopup.action = #selector(addFolder)
+
+        for view in [nameLabel, kindLabel, colourRow, foldersTitle, folderScroll, addPopup] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            detail.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            nameLabel.topAnchor.constraint(equalTo: detail.topAnchor),
+            nameLabel.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: detail.trailingAnchor),
+            kindLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
+            kindLabel.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            kindLabel.trailingAnchor.constraint(equalTo: detail.trailingAnchor),
+            colourRow.topAnchor.constraint(equalTo: kindLabel.bottomAnchor, constant: 12),
+            colourRow.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            colourRow.trailingAnchor.constraint(lessThanOrEqualTo: detail.trailingAnchor),
+            hexField.widthAnchor.constraint(equalToConstant: 84),
+            foldersTitle.topAnchor.constraint(equalTo: colourRow.bottomAnchor, constant: 16),
+            foldersTitle.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            folderScroll.topAnchor.constraint(equalTo: foldersTitle.bottomAnchor, constant: 6),
+            folderScroll.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            folderScroll.trailingAnchor.constraint(equalTo: detail.trailingAnchor),
+            addPopup.topAnchor.constraint(equalTo: folderScroll.bottomAnchor, constant: 8),
+            addPopup.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            addPopup.bottomAnchor.constraint(equalTo: detail.bottomAnchor),
+        ])
+
+        hint.font = NSFont.systemFont(ofSize: 12)
+        hint.textColor = .secondaryLabelColor
+        status.font = NSFont.systemFont(ofSize: 11)
+        status.textColor = Palette.yellow
+        status.lineBreakMode = .byTruncatingTail
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let done = NSButton(title: "Done", target: self, action: #selector(finish))
+        // Escape, not Return: Return belongs to the colour field.
+        done.keyEquivalent = "\u{1b}"
+
+        for view in [intro, tagScroll, tagButtons, detail, hint, status, done] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            intro.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            intro.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            tagScroll.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 12),
+            tagScroll.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            tagScroll.widthAnchor.constraint(equalToConstant: 300),
+            tagScroll.bottomAnchor.constraint(equalTo: done.topAnchor, constant: -12),
+            detail.topAnchor.constraint(equalTo: tagScroll.topAnchor),
+            detail.leadingAnchor.constraint(equalTo: tagScroll.trailingAnchor, constant: 20),
+            detail.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            detail.bottomAnchor.constraint(equalTo: tagScroll.bottomAnchor),
+            hint.topAnchor.constraint(equalTo: detail.topAnchor),
+            hint.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            hint.trailingAnchor.constraint(equalTo: detail.trailingAnchor),
+            tagButtons.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            tagButtons.centerYAnchor.constraint(equalTo: done.centerYAnchor),
+            status.leadingAnchor.constraint(equalTo: tagButtons.trailingAnchor, constant: 16),
+            status.centerYAnchor.constraint(equalTo: done.centerYAnchor),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: done.leadingAnchor, constant: -12),
+            done.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            done.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+        ])
+    }
+
+    /// Everything again from the latest snapshot, keeping the selected tag
+    /// while it still exists.
+    func redraw() {
+        names = snapshot?.tagNames ?? []
+        if let name = selectedTag, !names.contains(name) { selectedTag = nil }
+        redrawing = true
+        tagTable.reloadData()
+        let row = selectedTag.flatMap { names.firstIndex(of: $0) }
+        tagTable.selectRowIndexes(row.map { IndexSet(integer: $0) } ?? IndexSet(), byExtendingSelection: false)
+        redrawing = false
+        drawDetail()
+    }
+
+    /// The selected tag's colour and folders; nothing selected, a hint.
+    private func drawDetail() {
+        guard let snapshot = snapshot, let name = selectedTag, let info = snapshot.tags[name] else {
+            detail.isHidden = true
+            hint.isHidden = false
+            hint.stringValue = snapshot == nil
+                ? "local-repos-list has not answered yet. Is it installed and on the PATH?"
+                : names.isEmpty ? "No tags yet. Make one with New Tag…" : "Select a tag to change its colour and folders."
+            deleteButton.isEnabled = false
+            folders = []
+            folderTable.reloadData()
+            return
+        }
+        detail.isHidden = false
+        hint.isHidden = true
+        deleteButton.isEnabled = name != "container"
+        deleteButton.toolTip = name == "container"
+            ? "local-repos-list puts container on every folder that holds repos; it cannot be deleted"
+            : "Take \(name) off every folder in local-repos-list"
+        nameLabel.stringValue = name
+        nameLabel.textColor = info.color.map { TagColour(name: "", hex: $0).color } ?? Palette.text
+        kindLabel.stringValue = !info.automatic ? ""
+            : name == "container" ? "Automatic: on every folder that holds repos."
+            : "Automatic: git puts it on a folder with no mine, fork or third-party set by hand. It can be set by hand too."
+
+        dotRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for (i, colour) in TagColour.all.enumerated() {
+            let current = info.color == colour.hex
+            let button = NSButton(
+                image: colourSwatch(colour.color, ringed: current), target: self, action: #selector(presetChosen(_:)))
+            button.isBordered = false
+            button.tag = i
+            button.toolTip = colour.name + (current ? " (in use)" : "")
+            button.setAccessibilityLabel("\(colour.name)\(current ? ", in use" : "")")
+            dotRow.addArrangedSubview(button)
+        }
+        // Not while it is being typed in: a redraw from outside would take the text away.
+        if hexField.currentEditor() == nil { hexField.stringValue = info.color.map { "#" + $0 } ?? "" }
+        clearButton.isEnabled = info.color != nil
+
+        folders = info.folders
+        foldersTitle.stringValue = folders.isEmpty
+            ? "On no folder: the tag stays only while it has a colour"
+            : "On \(folders.count) folder\(folders.count == 1 ? "" : "s")"
+        folderTable.reloadData()
+
+        addPopup.removeAllItems()
+        addPopup.addItem(withTitle: "Add Folder…")
+        let carrying = Set(folders)
+        for folder in snapshot.folders where !carrying.contains(folder.name) { addPopup.addItem(withTitle: folder.name) }
+        addPopup.isEnabled = name != "container" && addPopup.numberOfItems > 1
+        addPopup.toolTip = name == "container"
+            ? "local-repos-list decides which folders are containers" : "Tag one more folder \(name)"
+    }
+
+    /// Runs one change; a failure shows beside the buttons until the next.
+    private func change(_ run: (@escaping (String?) -> Void) -> Void) {
+        status.stringValue = ""
+        run { [weak self] error in self?.status.stringValue = error ?? "" }
+    }
+
+    @objc private func presetChosen(_ sender: NSButton) {
+        guard let name = selectedTag, TagColour.all.indices.contains(sender.tag) else { return }
+        let hex = TagColour.all[sender.tag].hex
+        change { repoTags.setColor(name, hex, done: $0) }
+    }
+
+    @objc private func hexEntered() {
+        guard let name = selectedTag else { return }
+        let text = hexField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hex = text.replacingOccurrences(of: "#", with: "").uppercased()
+        guard hex != (snapshot?.tags[name]?.color ?? "") else { return }
+        guard hex.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil else {
+            status.stringValue = text.isEmpty ? "" : "Not a colour: \(text)"
+            return
+        }
+        window?.makeFirstResponder(nil)
+        change { repoTags.setColor(name, hex, done: $0) }
+    }
+
+    @objc private func clearColour() {
+        guard let name = selectedTag else { return }
+        change { repoTags.setColor(name, nil, done: $0) }
+    }
+
+    @objc private func addFolder() {
+        guard let name = selectedTag, addPopup.indexOfSelectedItem > 0,
+            let folder = addPopup.titleOfSelectedItem
+        else { return }
+        change { repoTags.setTag(name, on: folder, true, done: $0) }
+    }
+
+    @objc private func removeFolder(_ sender: NSButton) {
+        guard let name = selectedTag, folders.indices.contains(sender.tag) else { return }
+        let folder = folders[sender.tag]
+        change { repoTags.setTag(name, on: folder, false, done: $0) }
+    }
+
+    /// A name, a colour or none, and the first folder: a tag exists in
+    /// local-repos-list only while a folder carries it or it has a colour, so
+    /// it starts on one.
+    @objc private func makeTag() {
+        guard let window = window, let snapshot = snapshot, !snapshot.folders.isEmpty else {
+            status.stringValue = "local-repos-list has no folders to tag"
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "New Tag"
+        alert.informativeText = "It starts on one folder and can then be put on any other. "
+            + "Lowercase letters, digits and dashes."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 64, width: 260, height: 24))
+        field.placeholderString = "Name"
+        let colours = NSPopUpButton(frame: NSRect(x: 0, y: 32, width: 260, height: 26), pullsDown: false)
+        colours.addItem(withTitle: "No Colour")
+        for colour in TagColour.all {
+            colours.addItem(withTitle: colour.name)
+            colours.lastItem?.image = tagDot(colour.color)
+        }
+        // The first colour no tag has yet, so a new tag stands out by default.
+        let used = Set(snapshot.tags.values.compactMap(\.color))
+        colours.selectItem(at: (TagColour.all.firstIndex { !used.contains($0.hex) } ?? -1) + 1)
+        let folderPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 260, height: 26), pullsDown: false)
+        for entry in snapshot.folders { folderPopup.addItem(withTitle: entry.name) }
+        if let folder = folder { folderPopup.selectItem(withTitle: folder) }
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 90))
+        for view in [field, colours, folderPopup] as [NSView] { box.addSubview(view) }
+        alert.accessoryView = box
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self = self, response == .alertFirstButtonReturn,
+                let folder = folderPopup.titleOfSelectedItem
+            else { return }
+            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !name.isEmpty else { return }
+            guard name.range(of: "^[a-z0-9][a-z0-9-]*$", options: .regularExpression) != nil, name != "container" else {
+                self.status.stringValue = "Not a tag local-repos-list takes: \(name)"
+                return
+            }
+            let hex = colours.indexOfSelectedItem > 0 ? TagColour.all[colours.indexOfSelectedItem - 1].hex : nil
+            let repoTags = self.repoTags
+            self.change { done in
+                repoTags.setTag(name, on: folder, true) { [weak self] error in
+                    if error == nil {
+                        self?.selectedTag = name
+                        self?.redraw()
+                    }
+                    guard error == nil, let hex = hex else { return done(error) }
+                    repoTags.setColor(name, hex, done: done)
+                }
+            }
+        }
+    }
+
+    /// After a confirmation naming what goes: every folder loses it but those
+    /// git gives it, and its colour goes with it.
+    @objc private func deleteTag() {
+        guard let window = window, let snapshot = snapshot, let name = selectedTag, name != "container",
+            let info = snapshot.tags[name]
+        else { return }
+        let kept = info.folders.filter { snapshot.folder(named: $0)?.isAutomatic(name) ?? false }.count
+        let losing = info.folders.count - kept
+        let alert = NSAlert()
+        alert.messageText = "Delete the tag \(name)?"
+        var detail = "It comes off \(losing) folder\(losing == 1 ? "" : "s") in local-repos-list"
+        detail += info.color != nil ? ", and its colour goes." : "."
+        if kept > 0 { detail += " The \(kept) folder\(kept == 1 ? "" : "s") git gives it keep\(kept == 1 ? "s" : "") it." }
+        alert.informativeText = detail
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self = self, response == .alertFirstButtonReturn else { return }
+            self.change { self.repoTags.deleteTag(name, done: $0) }
+        }
+    }
+
+    @objc private func finish() {
+        guard let window = window else { return }
+        window.sheetParent?.endSheet(window)
+    }
+
+    // MARK: Tables
+
+    func numberOfRows(in tableView: NSTableView) -> Int { tableView === tagTable ? names.count : folders.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        tableView === tagTable ? tagCell(tableColumn?.identifier.rawValue ?? "", row) : folderCell(row)
+    }
+
+    private func tagCell(_ key: String, _ row: Int) -> NSView? {
+        guard row < names.count, let info = snapshot?.tags[names[row]] else { return nil }
+        let field = NSTextField(labelWithString: "")
+        field.lineBreakMode = .byTruncatingTail
+        let font = NSFont.systemFont(ofSize: 12)
+        switch key {
+        case "tag":
+            let colour = info.color.map { TagColour(name: "", hex: $0).color }
+            let text = NSMutableAttributedString(
+                string: "● ", attributes: [.font: font, .foregroundColor: colour ?? Palette.frame])
+            text.append(NSAttributedString(
+                string: names[row], attributes: [.font: font, .foregroundColor: colour ?? NSColor.secondaryLabelColor]))
+            field.attributedStringValue = text
+            field.toolTip = info.color.map { "#" + $0 } ?? "No colour"
+        case "count":
+            field.stringValue = "\(info.folders.count)"
+            field.alignment = .right
+            field.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        default:
+            field.stringValue = info.automatic ? "automatic" : ""
+            field.font = NSFont.systemFont(ofSize: 11)
+            field.textColor = .secondaryLabelColor
+        }
+        return field
+    }
+
+    /// A folder carrying the selected tag, and a button to take it off unless
+    /// git put it there.
+    private func folderCell(_ row: Int) -> NSView? {
+        guard row < folders.count, let name = selectedTag else { return nil }
+        let folder = folders[row]
+        let label = NSTextField(labelWithString: folder)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.toolTip = snapshot?.folder(named: folder)?.path
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let automatic = snapshot?.folder(named: folder)?.isAutomatic(name) ?? false
+        let remove = NSButton(title: automatic ? "automatic" : "Remove", target: self, action: #selector(removeFolder(_:)))
+        remove.controlSize = .small
+        remove.bezelStyle = .rounded
+        remove.font = NSFont.systemFont(ofSize: 11)
+        remove.tag = row
+        remove.isEnabled = !automatic
+        remove.toolTip = automatic
+            ? (name == "container" ? "local-repos-list decides which folders are containers"
+                : "Set by local-repos-list from git; a manual mine, fork or third-party replaces it")
+            : "Take \(name) off \(folder)"
+        let cell = NSStackView(views: [label, remove])
+        cell.spacing = 8
+        cell.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !redrawing, (notification.object as? NSTableView) === tagTable else { return }
+        let row = tagTable.selectedRow
+        selectedTag = row >= 0 && row < names.count ? names[row] : nil
+        status.stringValue = ""
+        drawDetail()
+    }
+}
+
 // MARK: - Window
 
 /// Asks for a name and a colour and makes the tag; a name that already exists
@@ -2973,6 +3727,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var filterChoices: [TagFilter?] = []
     /// local-repos-list's tags for the folders sessions are launched in.
     private lazy var repoTags = RepoTags(store: tagStore)
+    /// Repo Tags, while it is open as a sheet over the list.
+    private var repoTagsSheet: RepoTagsWindow?
+    /// Opens Repo Tags, beside the filter it feeds.
+    private let repoTagsButton = NSButton(title: "", target: nil, action: nil)
     /// The tag filter and the verdicts toggle: what the list and the
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
@@ -3017,7 +3775,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         startWatching()
         events.onChange = { [weak self] in self?.refreshTable() }
-        repoTags.onChange = { [weak self] in self?.tagsChanged() }
+        repoTags.onChange = { [weak self] in
+            self?.tagsChanged()
+            self?.repoTagsSheet?.redraw()
+        }
+        repoTags.start()
         latest.onChange = { [weak self] in self?.refreshTable(full: true) }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             refreshUsageOnce()
@@ -3220,8 +3982,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         filterPopup.action = #selector(filterChanged)
         filterPopup.toolTip = "Show only the sessions with one tag"
         drawFilterPopup()
+        repoTagsButton.isBordered = false
+        repoTagsButton.attributedTitle = NSAttributedString(
+            string: "repo tags", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim])
+        repoTagsButton.target = self
+        repoTagsButton.action = #selector(openRepoTags)
+        repoTagsButton.toolTip = "Repo Tags: every tag in local-repos-list, its colour and its folders"
         let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
-        listControls.setViews([filterPopup, verdictsToggle], in: .leading)
+        listControls.setViews([filterPopup, repoTagsButton, verdictsToggle], in: .leading)
         listControls.spacing = 12
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
@@ -3421,7 +4189,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         self.loads = loads
         events.prune(keeping: Set(snapshot.live.compactMap { $0.summary.session_id }))
-        repoTags.refreshIfDue()
         let keep = selected?.session.summary.session_id
         let ended = { (s: Session) in reused.contains(s.summary.session_id ?? "") }
         let live = snapshot.live.filter { !ended($0) }
@@ -3860,6 +4627,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         menu.addItem(ActionItem("Verdicts", enabled: sid != nil) { [weak self] in
             sid.map { self?.openVerdicts(sessionId: $0) }
         })
+        let launchDir = s.project_dir.map { ($0 as NSString).expandingTildeInPath }
+        let gui = ActionItem("Open in local-repos-list", enabled: launchDir != nil) { [weak self] in
+            launchDir.map { self?.openInRepoList($0) }
+        }
+        gui.toolTip = "local-repos-list's own page in the browser, with this session's folder selected"
+        menu.addItem(gui)
         menu.addItem(.separator())
         if past {
             menu.addItem(ActionItem("Resume Session", enabled: session.transcript != nil) { [weak self] in self?.resume(session) })
@@ -3925,7 +4698,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             delete.submenu = sub
             menu.addItem(delete)
         }
-        if let repo = tagStore.repo(for: projectDir) { addRepoItems(to: menu, repo) }
+        let repo = tagStore.repo(for: projectDir)
+        if let repo = repo { addRepoItems(to: menu, repo) }
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Repo Tags…") { [weak self] in self?.showRepoTags(folder: repo?.name) })
         return menu
     }
 
@@ -3944,7 +4720,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         for name in repo.tags + others {
             let has = repo.tags.contains(name)
             let item = ActionItem(name, enabled: !repo.isAutomatic(name)) { [weak self] in
-                self?.repoTags.setTag(name, on: repo, !has, done: done)
+                self?.repoTags.setTag(name, on: repo.name, !has, done: done)
             }
             item.state = has ? .on : .off
             item.indentationLevel = 1
@@ -4025,7 +4801,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 self?.note("Not a tag local-repos-list takes: \(name)")
                 return
             }
-            self?.repoTags.setTag(name, on: repo, true) { error in if let error = error { self?.note(error) } }
+            self?.repoTags.setTag(name, on: repo.name, true) { error in if let error = error { self?.note(error) } }
         }
     }
 
@@ -4050,6 +4826,32 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             guard let self = self else { return }
             if !self.tagStore.manualTags(sessionId).contains(name) { self.tagStore.toggleTag(name, for: sessionId) }
             self.tagsChanged()
+        }
+    }
+
+    // MARK: local-repos-list
+
+    /// Repo Tags from the Session menu or the header: a new tag offers the
+    /// selected session's folder first.
+    @objc func openRepoTags() {
+        showRepoTags(folder: tagStore.repo(for: selected?.session.summary.project_dir)?.name)
+    }
+
+    /// Every local-repos-list tag, as a sheet over the list; `folder` is the
+    /// one a new tag goes on unless another is chosen.
+    func showRepoTags(folder: String?) {
+        guard let window = window, window.attachedSheet == nil else { return }
+        let sheet = RepoTagsWindow(repoTags: repoTags, folder: folder)
+        repoTagsSheet = sheet
+        window.beginSheet(sheet.window!) { [weak self] _ in self?.repoTagsSheet = nil }
+    }
+
+    /// local-repos-list's own page in the browser, on a session's folder. The
+    /// tool starts its server if it has to, which can take a few seconds.
+    private func openInRepoList(_ dir: String) {
+        note("Opening local-repos-list")
+        repoTags.guiURL(project: dir) { [weak self] url, error in
+            if let url = url { NSWorkspace.shared.open(url) } else { self?.note(error ?? "local-repos-list gave no address") }
         }
     }
 
@@ -5136,6 +5938,8 @@ func buildMenu() {
     sessionMenu.addItem(
         withTitle: "Restart Outdated Sessions…", action: #selector(SessionsWindow.restartOutdatedSessions),
         keyEquivalent: "")
+    sessionMenu.addItem(.separator())
+    sessionMenu.addItem(withTitle: "Repo Tags…", action: #selector(SessionsWindow.openRepoTags), keyEquivalent: "")
     sessionItem.submenu = sessionMenu
     main.addItem(sessionItem)
 
