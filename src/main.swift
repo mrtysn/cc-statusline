@@ -649,6 +649,16 @@ final class EventCenter {
         source.setCancelHandler { Darwin.close(fd) }
         source.resume()
         watcher = source
+        // A device change (wake, a display's audio coming and going) stops the
+        // engine behind our back; drop the sound in flight rather than play into it.
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.playCount += 1
+            self.player.stop()
+            self.engine.stop()
+        }
         drain()
     }
 
@@ -901,6 +911,9 @@ final class EventCenter {
                 self.engine.stop()
             }
         }
+        // play() on a stopped engine raises an Objective-C exception Swift cannot
+        // catch, and a device change can stop it between start() and here.
+        guard engine.isRunning else { return log("audio engine stopped before play") }
         player.play()
     }
 }
