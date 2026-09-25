@@ -3911,10 +3911,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     // the same for every session, so they live in the bar above the table.
     private let columns: [Column] = [
         Column(key: "age", title: "Last Seen", width: 74),
-        Column(key: "cwd", title: "Directory", width: 164),
         // Beside the directory, as the heat stripe sits beside the cache: the
         // session's dots, stacked, without a title.
         Column(key: "dots", title: "", width: 12),
+        Column(key: "cwd", title: "Directory", width: 164),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "state", title: "State", width: 112),
         // Beside the state: what a session is doing and how long its cache has
