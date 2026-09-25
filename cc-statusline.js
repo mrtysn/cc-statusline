@@ -955,7 +955,7 @@ function recordSessionEnd(event) {
 //   interrupted  the user stopped the turn
 // Subagents' own traffic is not in the session's transcript, so their tokens
 // are not in the totals; the count is of Agent calls the session made.
-const SCAN_VERSION = 2;
+const SCAN_VERSION = 3;
 const ASKING_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
 const AGENT_TOOLS = new Set(['Agent', 'Task']);
 
@@ -969,6 +969,9 @@ function freshScan(path) {
     last: null,
     mode: null,
     agents: { total: 0, running: [] },
+    // Lines read and how many were user or assistant messages, over the whole
+    // transcript, for the check that the format still has messages at all.
+    seen: { lines: 0, typed: 0 },
   };
 }
 
@@ -1056,11 +1059,16 @@ function tallyEntry(tally, entry) {
 }
 
 // Each expectation is judged only on a chunk big enough to judge it, so a
-// two-line append proves nothing either way.
-function judgeTranscript(t) {
+// two-line append proves nothing either way. Whether there are messages at all
+// is judged on the whole transcript read so far: Claude Code writes bursts of
+// twenty and more bookkeeping lines (attachments, queue operations, titles,
+// modes) around a turn, and a chunk can hold nothing else.
+function judgeTranscript(t, seen) {
   if (t.lines >= 20) {
     checkFormat('transcript/json', t.broken / t.lines <= 0.1, `transcript: ${t.broken} of ${t.lines} lines are not JSON`, null, t.version);
-    checkFormat('transcript/types', t.typed > 0, `transcript: ${t.lines} lines, none of type user or assistant`, null, t.version);
+  }
+  if (seen.lines >= 20) {
+    checkFormat('transcript/types', seen.typed > 0, `transcript: ${seen.lines} lines, none of type user or assistant`, null, t.version);
   }
   if (t.assistant >= 5) {
     checkFormat('transcript/usage', t.usage > 0, 'transcript: assistant messages carry no message.usage', null, t.version);
@@ -1118,7 +1126,9 @@ function transcriptScan(sessionId, transcriptPath, fresh) {
             scanEntry(scan, entry);
           } catch {}
         }
-        judgeTranscript(tally);
+        scan.seen.lines += tally.lines;
+        scan.seen.typed += tally.typed;
+        judgeTranscript(tally, scan.seen);
         if (end > 0) {
           scan.offset += end;
           mkdirSync(SCAN_DIR, { recursive: true });
