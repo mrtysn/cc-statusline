@@ -663,22 +663,31 @@ struct Tag: Codable, Equatable {
 /// A folder as local-repos-list reports it: its tags, and the colours of
 /// those that have one.
 struct RepoEntry: Codable, Equatable {
+    /// What local-repos-list calls the folder, and takes in its tag commands:
+    /// its name under the dev root, or a relative path for a nested repo.
+    var name: String = ""
     var path: String
     var tags: [String] = []
     var colors: [String: String] = [:]
-
-    init(path: String, tags: [String], colors: [String: String]) {
-        self.path = path
-        self.tags = tags
-        self.colors = colors
-    }
+    /// The tag git decides (mine, fork, third-party), which untag cannot take off.
+    var auto_tag: String?
+    var container: Bool = false
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         path = try c.decode(String.self, forKey: .path)
         tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
-        colors = try c.decodeIfPresent([String: String].self, forKey: .colors) ?? [:]
+        // local-repos-list writes "#RRGGBB"; the app's colours are the bare digits.
+        colors = (try c.decodeIfPresent([String: String].self, forKey: .colors) ?? [:])
+            .mapValues { $0.replacingOccurrences(of: "#", with: "").uppercased() }
+        auto_tag = try c.decodeIfPresent(String.self, forKey: .auto_tag)
+        container = try c.decodeIfPresent(Bool.self, forKey: .container) ?? false
     }
+
+    /// Set by local-repos-list itself: the git-derived tag while no manual
+    /// ownership tag replaces it, and "container".
+    func isAutomatic(_ tag: String) -> Bool { tag == auto_tag || (tag == "container" && container) }
 
     func covers(_ dir: String) -> Bool { dir == path || dir.hasPrefix(path + "/") }
 }
@@ -809,6 +818,12 @@ final class TagStore {
     /// Every tag local-repos-list uses, for the filter.
     var repoTags: [String] { Array(Set(file.repos.flatMap(\.tags))).sorted() }
 
+    /// Each local-repos-list tag's colour: a colour belongs to the tag, so any
+    /// folder carrying it says what it is.
+    var repoColours: [String: String] {
+        file.repos.reduce(into: [String: String]()) { $0.merge($1.colors) { a, _ in a } }
+    }
+
     // MARK: What a session shows
 
     /// Its dots and tags: the preset dots and named tags set by hand, then its
@@ -868,6 +883,9 @@ final class RepoTags {
         xdgDir("XDG_CONFIG_HOME", fallback: ".config").appendingPathComponent("local-repos-list/overrides.toml")
     }
 
+    private let root = ProcessInfo.processInfo.environment["DEV_ROOT"].map { ($0 as NSString).expandingTildeInPath }
+        ?? home.appendingPathComponent("dev").path
+
     /// Cheap enough for every reload: one stat, and the tool only when due.
     func refreshIfDue() {
         let stamp = (try? fm.attributesOfItem(atPath: overridesFile.path))?[.modificationDate] as? Date
@@ -875,8 +893,7 @@ final class RepoTags {
         running = true
         overridesStamp = stamp
         lastRun = Date()
-        let root = ProcessInfo.processInfo.environment["DEV_ROOT"].map { ($0 as NSString).expandingTildeInPath }
-            ?? home.appendingPathComponent("dev").path
+        let root = self.root
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let repos = Self.read(root: root)
             DispatchQueue.main.async {
@@ -890,25 +907,63 @@ final class RepoTags {
         }
     }
 
-    /// `local-repos-list --root <root> --json`, found on the same PATH the
-    /// status line script gets; nil when the tool is missing or fails, which
-    /// keeps what was read last.
-    private static func read(root: String) -> [RepoEntry]? {
+    /// Changes local-repos-list through its own commands, so its overrides
+    /// file stays the one place folder tags and colours live; reads it all
+    /// back once the change is written. `done` gets the error, if any.
+    func edit(_ arguments: [String], done: @escaping (String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let (status, _, err) = Self.run(arguments)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if status != 0 {
+                    let message = err.trimmingCharacters(in: .whitespacesAndNewlines)
+                    log("local-repos-list \(arguments.joined(separator: " ")): \(message)")
+                    done(message.isEmpty ? "local-repos-list failed" : message)
+                    return
+                }
+                self.overridesStamp = nil
+                self.refreshIfDue()
+                done(nil)
+            }
+        }
+    }
+
+    /// Adds or takes off a tag on the folder a session was launched in.
+    func setTag(_ tag: String, on repo: RepoEntry, _ on: Bool, done: @escaping (String?) -> Void) {
+        edit([on ? "tag" : "untag", repo.name, tag, "--root", root], done: done)
+    }
+
+    /// A tag's colour, for every folder carrying it; nil clears it.
+    func setColor(_ tag: String, _ hex: String?, done: @escaping (String?) -> Void) {
+        edit(["color", tag] + (hex.map { ["#" + $0] } ?? ["--clear"]), done: done)
+    }
+
+    /// `local-repos-list <arguments>`, found on the same PATH the status line
+    /// script gets: its exit status, output and error output.
+    private static func run(_ arguments: [String]) -> (Int32, Data, String) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        task.arguments = ["local-repos-list", "--root", root, "--json"]
+        task.arguments = ["local-repos-list"] + arguments
         task.environment = scriptProcess(URL(fileURLWithPath: "/usr/bin/true"), []).environment
         let out = Pipe()
+        let err = Pipe()
         task.standardOutput = out
-        task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch {
-            log("local-repos-list: \(error.localizedDescription)")
-            return nil
-        }
+        task.standardError = err
+        do { try task.run() } catch { return (-1, Data(), error.localizedDescription) }
+        // Error output first would stall a tool writing a full pipe of output,
+        // so the output is read to its end before it.
         let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
+        let message = String(decoding: (try? err.fileHandleForReading.readToEnd()) ?? Data(), as: UTF8.self)
         task.waitUntilExit()
-        guard task.terminationStatus == 0 else {
-            log("local-repos-list exited \(task.terminationStatus)")
+        return (task.terminationStatus, data, message)
+    }
+
+    /// `local-repos-list --root <root> --json`; nil when the tool is missing
+    /// or fails, which keeps what was read last.
+    private static func read(root: String) -> [RepoEntry]? {
+        let (status, data, message) = run(["--root", root, "--json"])
+        guard status == 0 else {
+            log("local-repos-list exited \(status): \(message.trimmingCharacters(in: .whitespacesAndNewlines))")
             return nil
         }
         guard let list = try? JSONDecoder().decode([RepoEntry].self, from: data) else {
@@ -3870,21 +3925,121 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             delete.submenu = sub
             menu.addItem(delete)
         }
-        if let repo = tagStore.repo(for: projectDir), !repo.tags.isEmpty {
-            menu.addItem(.separator())
-            let header = NSMenuItem(title: "From local-repos-list", action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
-            for name in repo.tags {
-                let item = NSMenuItem(title: name, action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                item.indentationLevel = 1
-                if let hex = repo.colors[name] { item.image = tagDot(TagColour(name: "", hex: hex).color) }
-                item.toolTip = "\(repo.path) is tagged \(name) in local-repos-list; change it there"
-                menu.addItem(item)
+        if let repo = tagStore.repo(for: projectDir) { addRepoItems(to: menu, repo) }
+        return menu
+    }
+
+    /// The launch folder's tags in local-repos-list, changed through its own
+    /// commands: every tag in use as a toggle for this folder (the ones git
+    /// decides stay on), a new one, and each tag's colour, which every folder
+    /// carrying it shares.
+    private func addRepoItems(to menu: NSMenu, _ repo: RepoEntry) {
+        menu.addItem(.separator())
+        let header = NSMenuItem(title: "\(repo.name) in local-repos-list", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        let colours = tagStore.repoColours
+        let done = { [weak self] (error: String?) in if let error = error { self?.note(error) } }
+        let others = tagStore.repoTags.filter { !repo.tags.contains($0) && $0 != "container" }
+        for name in repo.tags + others {
+            let has = repo.tags.contains(name)
+            let item = ActionItem(name, enabled: !repo.isAutomatic(name)) { [weak self] in
+                self?.repoTags.setTag(name, on: repo, !has, done: done)
             }
+            item.state = has ? .on : .off
+            item.indentationLevel = 1
+            if let hex = colours[name] { item.image = tagDot(TagColour(name: "", hex: hex).color) }
+            item.toolTip = repo.isAutomatic(name)
+                ? "Set by local-repos-list from git; a manual mine, fork or third-party replaces it"
+                : "\(has ? "Take \(name) off" : "Tag") \(repo.name) in local-repos-list"
+            menu.addItem(item)
+        }
+        let add = ActionItem("Add Tag to Folder…") { [weak self] in self?.addRepoTag(repo) }
+        add.indentationLevel = 1
+        menu.addItem(add)
+        guard !repo.tags.isEmpty else { return }
+        let colourItem = NSMenuItem(title: "Tag Colours", action: nil, keyEquivalent: "")
+        colourItem.indentationLevel = 1
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        for name in repo.tags {
+            let item = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+            if let hex = colours[name] { item.image = tagDot(TagColour(name: "", hex: hex).color) }
+            item.submenu = colourMenu(for: name, current: colours[name], done: done)
+            sub.addItem(item)
+        }
+        colourItem.submenu = sub
+        menu.addItem(colourItem)
+    }
+
+    /// The preset colours, any other by its hex, or none, for one tag.
+    private func colourMenu(for tag: String, current: String?, done: @escaping (String?) -> Void) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for colour in TagColour.all {
+            let hex = colour.hex
+            let item = ActionItem(colour.name) { [weak self] in self?.repoTags.setColor(tag, hex, done: done) }
+            item.image = tagDot(colour.color)
+            item.state = current?.uppercased() == hex ? .on : .off
+            menu.addItem(item)
+        }
+        let custom = current.flatMap { c in TagColour.all.contains { $0.hex == c.uppercased() } ? nil : c }
+        let other = ActionItem(custom.map { "Other (#\($0))…" } ?? "Other…") { [weak self] in
+            self?.askHex(for: tag, current: current, done: done)
+        }
+        other.state = custom != nil ? .on : .off
+        menu.addItem(.separator())
+        menu.addItem(other)
+        if current != nil {
+            menu.addItem(ActionItem("No Colour") { [weak self] in self?.repoTags.setColor(tag, nil, done: done) })
         }
         return menu
+    }
+
+    /// A text field for one line of input, as a sheet; nil when cancelled.
+    private func ask(_ title: String, _ detail: String, placeholder: String, value: String = "",
+                     then: @escaping (String) -> Void) {
+        guard let window = window else { return }
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = placeholder
+        field.stringValue = value
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            then(field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    private func addRepoTag(_ repo: RepoEntry) {
+        ask("Tag \(repo.name)", "Added in local-repos-list, so every tool that reads it sees it. "
+            + "Lowercase letters, digits and dashes.", placeholder: "tag") { [weak self] tag in
+            let name = tag.lowercased()
+            guard !name.isEmpty else { return }
+            guard name.range(of: "^[a-z0-9-]+$", options: .regularExpression) != nil, name != "container" else {
+                self?.note("Not a tag local-repos-list takes: \(name)")
+                return
+            }
+            self?.repoTags.setTag(name, on: repo, true) { error in if let error = error { self?.note(error) } }
+        }
+    }
+
+    private func askHex(for tag: String, current: String?, done: @escaping (String?) -> Void) {
+        ask("Colour of \(tag)", "Any colour as #RRGGBB, for every folder tagged \(tag).",
+            placeholder: "#61AFEF", value: current.map { "#" + $0.replacingOccurrences(of: "#", with: "") } ?? "") {
+            [weak self] text in
+            let hex = text.replacingOccurrences(of: "#", with: "").uppercased()
+            guard hex.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil else {
+                if !text.isEmpty { self?.note("Not a colour: \(text)") }
+                return
+            }
+            self?.repoTags.setColor(tag, hex, done: done)
+        }
     }
 
     /// A new tag, put straight on the session it was asked from.
