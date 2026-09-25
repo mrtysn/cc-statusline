@@ -629,6 +629,111 @@ final class DisplayStore {
     }
 }
 
+/// The colours a tag can take: few enough to tell apart at a glance down a
+/// column, each light enough to read on the dark background.
+struct TagColour {
+    let name: String
+    let hex: String
+
+    var color: NSColor {
+        let v = UInt32(hex, radix: 16) ?? 0x7D828F
+        return NSColor(
+            srgbRed: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255,
+            blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+    }
+
+    static let all = [
+        TagColour(name: "Red", hex: "E06C75"), TagColour(name: "Orange", hex: "D19A66"),
+        TagColour(name: "Yellow", hex: "E5C07B"), TagColour(name: "Green", hex: "98C379"),
+        TagColour(name: "Blue", hex: "61AFEF"), TagColour(name: "Purple", hex: "C678DD"),
+        TagColour(name: "Grey", hex: "7D828F"),
+    ]
+}
+
+/// A label with a colour, made once and put on any number of sessions.
+struct Tag: Codable, Equatable {
+    var name: String
+    /// Written out so the status line script draws the same colour without a
+    /// table of its own.
+    var hex: String
+
+    var color: NSColor { TagColour(name: "", hex: hex).color }
+}
+
+struct TagFile: Codable {
+    var tags: [Tag] = []
+    /// Session id to tag name. Keyed by id because `claude --resume` keeps it:
+    /// a session restarted after an update is still tagged.
+    var sessions: [String: String] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        tags = try c.decodeIfPresent([Tag].self, forKey: .tags) ?? []
+        sessions = try c.decodeIfPresent([String: String].self, forKey: .sessions) ?? [:]
+    }
+}
+
+/// Owns tags.json beside display.json: the app is its single writer, and the
+/// status line script reads it on every redraw.
+final class TagStore {
+    private(set) var file = TagFile()
+    private let url = supportDir.appendingPathComponent("tags.json")
+
+    init() {
+        if let data = try? Data(contentsOf: url), let f = try? JSONDecoder().decode(TagFile.self, from: data) {
+            file = f
+        }
+    }
+
+    var tags: [Tag] { file.tags }
+
+    func tag(for sessionId: String?) -> Tag? {
+        guard let id = sessionId, let name = file.sessions[id] else { return nil }
+        return file.tags.first { $0.name == name }
+    }
+
+    func set(_ name: String?, for sessionId: String) {
+        file.sessions[sessionId] = name
+        save()
+    }
+
+    /// A new tag, or the existing one of that name recoloured.
+    func create(_ name: String, hex: String) {
+        if let i = file.tags.firstIndex(where: { $0.name == name }) {
+            file.tags[i].hex = hex
+        } else {
+            file.tags.append(Tag(name: name, hex: hex))
+        }
+        save()
+    }
+
+    /// Gone from every session that had it.
+    func delete(_ name: String) {
+        file.tags.removeAll { $0.name == name }
+        file.sessions = file.sessions.filter { $0.value != name }
+        save()
+    }
+
+    private func save() {
+        try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        // Atomic: the status line script must never read half of it.
+        try? encoder.encode(file).write(to: url, options: .atomic)
+    }
+}
+
+/// A filled circle in a tag's colour, for menus.
+func tagDot(_ color: NSColor) -> NSImage {
+    NSImage(size: NSSize(width: 10, height: 10), flipped: false) { rect in
+        color.setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
+        return true
+    }
+}
+
 /// Turns Claude Code's hook events into sounds, and remembers the one thing the
 /// transcript cannot show: a permission prompt waiting on the user.
 final class EventCenter {
@@ -1990,6 +2095,76 @@ func runInNewTab(_ command: String) {
     if result == "ok" { bringITermForward(label: "resume") }
 }
 
+/// Types a command into the iTerm session on this tty, as if at its prompt.
+/// "ok", or "not found" when no session has the tty any more.
+func typeInTerminal(tty: String, _ command: String) -> String {
+    let text = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    let script = """
+        tell application "iTerm2"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "\(tty)" then
+                  tell s to write text "\(text)"
+                  return "ok"
+                end if
+              end repeat
+            end repeat
+          end repeat
+        end tell
+        return "not found"
+        """
+    return runScript(script, label: "restart \(tty)")
+}
+
+/// True once the process is gone, false if it outlasts the wait.
+func waitForExit(_ pid: pid_t, seconds: Double) -> Bool {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        if kill(pid, 0) != 0 && errno == ESRCH { return true }
+        usleep(100_000)
+    }
+    return false
+}
+
+/// Waits until the processes on a terminal have stopped changing and stopped
+/// using CPU for a second: the shell is back at its prompt. Text typed while it
+/// still starts up races its queries to the terminal, whose replies can land in
+/// front of the command and garble it.
+func waitForQuietTerminal(_ tty: String, seconds: Double) {
+    var st = stat()
+    guard stat(tty, &st) == 0 else { return }
+    let device = UInt32(bitPattern: st.st_rdev)
+    func snapshot() -> (pids: [pid_t], cpu: UInt64) {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let n = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
+        var mine: [pid_t] = []
+        var cpu: UInt64 = 0
+        for pid in pids.prefix(max(0, n)) where pid > 0 {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size, info.e_tdev == device else { continue }
+            mine.append(pid)
+            var usage = rusage_info_v2()
+            let ok = withUnsafeMutablePointer(to: &usage) {
+                $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) == 0 }
+            }
+            if ok { cpu += usage.ri_user_time + usage.ri_system_time }
+        }
+        return (mine.sorted(), cpu)
+    }
+    let deadline = Date().addingTimeInterval(seconds)
+    var last = snapshot()
+    var quietSince = Date()
+    while Date() < deadline {
+        usleep(250_000)
+        let now = snapshot()
+        if now.pids != last.pids || now.cpu != last.cpu { quietSince = Date() }
+        last = now
+        if Date().timeIntervalSince(quietSince) >= 1 { return }
+    }
+}
+
 /// Runs an AppleScript and returns what it printed. Apple Events can be refused
 /// silently, so whatever osascript says is logged.
 @discardableResult
@@ -2481,7 +2656,9 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
 // MARK: - Window
 
-final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
+final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation,
+    NSMenuDelegate
+{
     private let statusLabel = NSTextField(labelWithString: "")
     private let quotaBar = NSStackView()
     private let gridScroll = NSScrollView()
@@ -2506,6 +2683,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// on-demand Verdicts view opened from a session's Directory cell.
     private let displayStore = DisplayStore()
     private let verdictsToggle = NSButton(title: "", target: nil, action: nil)
+    /// tags.json: the labels put on sessions from their right-click menu.
+    private let tagStore = TagStore()
+    /// Shows only the sessions with one tag; nil shows every session.
+    private var tagFilter: String?
+    private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    /// Every session in the last snapshot; `rows` is what the filter lets through.
+    private var allRows: [(session: Session, past: Bool)] = []
     private var verdictsWindows: [String: VerdictsWindow] = [:]
     private var watcher: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
@@ -2588,6 +2772,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         table.target = self
         // A double-click on the columns that name a session goes to its terminal.
         table.doubleAction = #selector(showClickedTerminal)
+        // Right-click anywhere on a row: built when it opens, for the clicked row.
+        let rowMenu = NSMenu()
+        rowMenu.delegate = self
+        table.menu = rowMenu
         // The default spacing plus per-cell padding is most of the row's width.
         table.intercellSpacing = NSSize(width: 4, height: 0)
         table.columnAutoresizingStyle = .noColumnAutoresizing
@@ -2651,6 +2839,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let columns: [Column] = [
         Column(key: "age", title: "Last Seen", width: 74),
         Column(key: "cwd", title: "Directory", width: 164),
+        Column(key: "tag", title: "Tag", width: 96),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "state", title: "State", width: 112),
         // Beside the state: what a session is doing and how long its cache has
@@ -2727,7 +2916,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // left of it, beside the sound controls.
         let gap = NSView()
         gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let top = NSStackView(views: [soundControls.volumeRow, gap, verdictsToggle, packButton])
+        filterPopup.controlSize = .small
+        filterPopup.font = NSFont.systemFont(ofSize: 11)
+        filterPopup.isBordered = false
+        filterPopup.target = self
+        filterPopup.action = #selector(filterChanged)
+        filterPopup.toolTip = "Show only the sessions with one tag"
+        drawFilterPopup()
+        let top = NSStackView(views: [soundControls.volumeRow, gap, filterPopup, verdictsToggle, packButton])
         top.spacing = 8
         top.distribution = .fill
         soundBar.addArrangedSubview(top)
@@ -2762,6 +2958,44 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             $0.verdictRow = !hook.isEmpty
         }
         drawVerdictsToggle()
+    }
+
+    /// "All sessions", then one entry per tag with its dot. A filter on a tag
+    /// that has since been deleted falls back to all.
+    private func drawFilterPopup() {
+        if let f = tagFilter, !tagStore.tags.contains(where: { $0.name == f }) { tagFilter = nil }
+        filterPopup.removeAllItems()
+        filterPopup.addItem(withTitle: "All sessions")
+        for tag in tagStore.tags {
+            filterPopup.addItem(withTitle: tag.name)
+            filterPopup.lastItem?.image = tagDot(tag.color)
+        }
+        filterPopup.selectItem(at: tagFilter.flatMap { f in tagStore.tags.firstIndex { $0.name == f } }.map { $0 + 1 } ?? 0)
+        filterPopup.isHidden = tagStore.tags.isEmpty
+    }
+
+    @objc private func filterChanged() {
+        let index = filterPopup.indexOfSelectedItem
+        tagFilter = index > 0 && index - 1 < tagStore.tags.count ? tagStore.tags[index - 1].name : nil
+        applyFilter()
+    }
+
+    /// Rows from the last snapshot through the tag filter, sorted and drawn.
+    private func applyFilter() {
+        let keep = selected?.session.summary.session_id
+        rows = allRows.filter { tagFilter == nil || tagStore.tag(for: $0.session.summary.session_id)?.name == tagFilter }
+        emptyLabel.stringValue = allRows.isEmpty
+            ? "No session has drawn a status line yet." : "No session has the tag \(tagFilter ?? "")."
+        emptyLabel.isHidden = !rows.isEmpty
+        sortRows()
+        refreshTable(full: true)
+        select(keep)
+    }
+
+    /// After a tag changes: the popup lists it, and the rows show it.
+    private func tagsChanged() {
+        drawFilterPopup()
+        applyFilter()
     }
 
     private func drawPackButton() {
@@ -2856,12 +3090,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let ended = { (s: Session) in reused.contains(s.summary.session_id ?? "") }
         let live = snapshot.live.filter { !ended($0) }
         let past = snapshot.live.filter(ended) + snapshot.history
-        rows = live.map { ($0, false) } + past.map { ($0, true) }
+        allRows = live.map { ($0, false) } + past.map { ($0, true) }
+        rows = allRows.filter { tagFilter == nil || tagStore.tag(for: $0.session.summary.session_id)?.name == tagFilter }
         counts = "\(live.count) live · \(past.count) finished"
         toolCost = (cost, footprint)
         healthIssues = snapshot.health ?? []
         latest.refreshIfDue()
         if noteToken == nil { statusLabel.stringValue = counts }
+        emptyLabel.stringValue = allRows.isEmpty
+            ? "No session has drawn a status line yet." : "No session has the tag \(tagFilter ?? "")."
         emptyLabel.isHidden = !rows.isEmpty
         drawQuotaBar(snapshot)
         sortRows()
@@ -3251,6 +3488,203 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         note("Resuming \(id ?? "session")")
     }
 
+    // MARK: Session menu
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let row = table.clickedRow - 1
+        guard row >= 0, row < rows.count else { return }
+        fillSessionMenu(menu, rows[row], flash: nil)
+    }
+
+    /// What a right-click on a session offers: copies of what names it, its
+    /// tag, its verdicts, and opening it again.
+    private func fillSessionMenu(_ menu: NSMenu, _ entry: (session: Session, past: Bool), flash: (() -> Void)?) {
+        let (session, past) = entry
+        let s = session.summary
+        menu.autoenablesItems = false
+        // The path in full rather than with its ~.
+        let path = s.cwd.map { ($0 as NSString).expandingTildeInPath }
+        let name = session.peer_name
+        let copy = { [weak self] (text: String) in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            flash?()
+            self?.note("Copied \(text)")
+        }
+        menu.addItem(ActionItem("Copy Path", enabled: path != nil) { path.map(copy) })
+        menu.addItem(ActionItem("Copy Session Name", enabled: name != nil) { name.map(copy) })
+        menu.addItem(.separator())
+        if let sid = s.session_id {
+            let tagItem = NSMenuItem(title: "Tag", action: nil, keyEquivalent: "")
+            tagItem.submenu = tagMenu(for: sid)
+            menu.addItem(tagItem)
+        }
+        let sid = s.session_id
+        menu.addItem(ActionItem("Verdicts", enabled: sid != nil) { [weak self] in
+            sid.map { self?.openVerdicts(sessionId: $0) }
+        })
+        menu.addItem(.separator())
+        if past {
+            menu.addItem(ActionItem("Resume Session", enabled: session.transcript != nil) { [weak self] in self?.resume(session) })
+        } else {
+            let item = ActionItem("Restart Session", enabled: restartBlocker(session) == nil) { [weak self] in
+                self?.restartInPlace(session)
+            }
+            item.toolTip = restartBlocker(session) ?? "Exits Claude Code here and resumes it in the same iTerm tab"
+            menu.addItem(item)
+        }
+    }
+
+    /// Every tag, the session's own checked; then removing it, making a new
+    /// one, and deleting one from every session.
+    private func tagMenu(for sessionId: String) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let current = tagStore.tag(for: sessionId)?.name
+        for tag in tagStore.tags {
+            let name = tag.name
+            let item = ActionItem(name) { [weak self] in
+                self?.tagStore.set(name, for: sessionId)
+                self?.tagsChanged()
+            }
+            item.image = tagDot(tag.color)
+            item.state = name == current ? .on : .off
+            menu.addItem(item)
+        }
+        if current != nil {
+            menu.addItem(ActionItem("No Tag") { [weak self] in
+                self?.tagStore.set(nil, for: sessionId)
+                self?.tagsChanged()
+            })
+        }
+        if !tagStore.tags.isEmpty { menu.addItem(.separator()) }
+        menu.addItem(ActionItem("New Tag…") { [weak self] in self?.newTag(for: sessionId) })
+        if !tagStore.tags.isEmpty {
+            let delete = NSMenuItem(title: "Delete Tag", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for tag in tagStore.tags {
+                let name = tag.name
+                let item = ActionItem(name) { [weak self] in
+                    self?.tagStore.delete(name)
+                    self?.tagsChanged()
+                    self?.note("Deleted the tag \(name)")
+                }
+                item.image = tagDot(tag.color)
+                sub.addItem(item)
+            }
+            delete.submenu = sub
+            menu.addItem(delete)
+        }
+        return menu
+    }
+
+    /// A name and a colour, then the tag goes on the session it was asked from.
+    /// A name that already exists takes the new colour.
+    private func newTag(for sessionId: String) {
+        guard let window = window else { return }
+        let alert = NSAlert()
+        alert.messageText = "New Tag"
+        alert.informativeText = "It goes on this session, and can then be put on any other."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 30, width: 220, height: 24))
+        field.placeholderString = "Name"
+        let colours = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 220, height: 26), pullsDown: false)
+        let used = Set(tagStore.tags.map(\.hex))
+        for colour in TagColour.all {
+            colours.addItem(withTitle: colour.name)
+            colours.lastItem?.image = tagDot(colour.color)
+        }
+        // The first colour no tag has yet, so a new tag stands out by default.
+        colours.selectItem(at: TagColour.all.firstIndex { !used.contains($0.hex) } ?? 0)
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 56))
+        box.addSubview(field)
+        box.addSubview(colours)
+        alert.accessoryView = box
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self = self, response == .alertFirstButtonReturn else { return }
+            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { return }
+            let colour = TagColour.all[max(0, colours.indexOfSelectedItem)]
+            self.tagStore.create(name, hex: colour.hex)
+            self.tagStore.set(name, for: sessionId)
+            self.tagsChanged()
+        }
+    }
+
+    // MARK: Restarting in place
+
+    /// Why a live session cannot be restarted now, or nil when it can. Only an
+    /// idle one: a restart mid-turn would cut the turn off.
+    private func restartBlocker(_ session: Session) -> String? {
+        let s = session.summary
+        guard s.session_id != nil, session.pid != nil, session.tty != nil else { return "Its process or terminal is unknown" }
+        guard session.transcript != nil else { return "Nothing to resume: the session never had a prompt" }
+        guard s.project_dir != nil else { return "Its launch directory was never recorded" }
+        guard stateWords(session, past: false).0 == "your turn", (session.transcript?.agents?.running ?? 0) == 0 else {
+            return "Busy: restart it once it is your turn"
+        }
+        return nil
+    }
+
+    /// Running an older Claude Code than the newest release, or than the newest
+    /// any live session runs when the release is unknown.
+    private func isOutdated(_ session: Session) -> Bool {
+        guard let v = session.summary.version, let reference = latest.version ?? newestVersion else { return false }
+        return versionOrder(v, reference)
+    }
+
+    /// Every idle live session on an older Claude Code, restarted where it is.
+    @objc func restartOutdatedSessions() {
+        let outdated = allRows.filter { !$0.past && isOutdated($0.session) }.map(\.session)
+        let ready = outdated.filter { restartBlocker($0) == nil }
+        let busy = outdated.count - ready.count
+        guard !ready.isEmpty else {
+            note(outdated.isEmpty
+                ? "Every live session runs the newest Claude Code"
+                : "\(busy) outdated session\(busy == 1 ? " is" : "s are") busy; none restarted")
+            return
+        }
+        guard let window = window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Restart \(ready.count) session\(ready.count == 1 ? "" : "s") on an older Claude Code?"
+        alert.informativeText = "Each one exits and resumes in its own iTerm tab, with its model, effort and permission mode."
+            + (busy > 0 ? " \(busy) busy session\(busy == 1 ? " is" : "s are") left alone." : "")
+        alert.addButton(withTitle: "Restart")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            ready.forEach { self?.restartInPlace($0) }
+        }
+    }
+
+    /// Ends Claude Code in its own tab and types the resume command there, so
+    /// the tab keeps its place. SIGTERM is a clean exit: Claude Code runs its
+    /// SessionEnd hooks, and the session is idle, so no turn is cut off. A tab
+    /// that closed with it gets the command in a new tab instead.
+    private func restartInPlace(_ session: Session) {
+        guard restartBlocker(session) == nil, let pid = session.pid, let tty = session.tty,
+            let id = session.summary.session_id,
+            let command = resumeCommand(session.summary, mode: session.transcript?.mode)
+        else { return }
+        let sampler = self.sampler
+        note("Restarting \(id)")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let report = { (message: String) in DispatchQueue.main.async { self?.note(message) } }
+            // The pid is only ours to signal while it is still that process on that terminal.
+            guard sampler.owns(pid: pid, tty: tty) else { return report("Not restarted: \(id) already ended") }
+            kill(pid, SIGTERM)
+            guard waitForExit(pid, seconds: 15) else { return report("Not restarted: \(id) did not exit") }
+            waitForQuietTerminal(tty, seconds: 10)
+            if typeInTerminal(tty: tty, command) != "ok" {
+                DispatchQueue.main.async { runInNewTab(command) }
+            }
+            report("Restarted \(id)")
+        }
+    }
+
     /// A line of feedback for an action that changes nothing on screen.
     func note(_ message: String) {
         statusLabel.stringValue = message
@@ -3309,6 +3743,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             top = title
             // Claude Code's own name for the session, under the topic ours derives.
             bottom = s.session_name ?? ""
+        case "tag":
+            if let tag = tagStore.tag(for: s.session_id) {
+                let line = NSMutableAttributedString(attributedString: mono("●  ", tag.color))
+                line.append(prose(tag.name, tag.color))
+                top = line
+            } else {
+                top = NSAttributedString(string: "")
+            }
+            bottom = ""
         case "state":
             let (word, colour) = stateWords(session, past: past)
             // The state and the permission mode share the top line; under them,
@@ -3591,29 +4034,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             field.toolTip = "Double-click to resume in a new iTerm tab"
         }
         if key == "cwd" {
-            // Right-click copies what the cell names, the path in full rather
-            // than with its ~.
+            // The row's menu, with the copies flashing the cell they came from.
             let menu = NSMenu()
-            menu.autoenablesItems = false
-            let path = s.cwd.map { ($0 as NSString).expandingTildeInPath }
-            let name = session.peer_name
-            let copy = { [weak self, weak cell] (text: String) in
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-                cell?.flash()
-                self?.note("Copied \(text)")
-            }
-            menu.addItem(ActionItem("Copy Path", enabled: path != nil) { path.map(copy) })
-            menu.addItem(ActionItem("Copy Session Name", enabled: name != nil) { name.map(copy) })
-            menu.addItem(.separator())
-            let sid = s.session_id
-            menu.addItem(ActionItem("Verdicts", enabled: sid != nil) { [weak self] in
-                sid.map { self?.openVerdicts(sessionId: $0) }
-            })
-            if past {
-                menu.addItem(.separator())
-                menu.addItem(ActionItem("Resume Session", enabled: session.transcript != nil) { [weak self] in self?.resume(session) })
-            }
+            fillSessionMenu(menu, (session, past), flash: { [weak cell] in cell?.flash() })
             cell.menu = menu
         }
         // On the cell as well as the text: the text is only as tall as its
@@ -3834,6 +4257,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let s = entry.session.summary
             switch key {
             case "topic": return (0, (s.topic ?? "~").lowercased())
+            // Tagged sessions together, by tag, above the untagged.
+            case "tag": return tagStore.tag(for: s.session_id).map { (0, $0.name.lowercased()) } ?? (1, "")
             case "cwd": return (0, (s.cwd ?? "~").lowercased())
             case "git": return (0, (s.git?.branch ?? "~").lowercased())
             case "model": return (modelRank(s.model), (s.model ?? "").lowercased())
@@ -3955,6 +4380,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let s = session.summary
         let age = "\(ago(session.active_at ?? session.updated_at)) ago"
         switch key {
+        case "tag":
+            return tagStore.tag(for: s.session_id).map { "Tag \($0.name)" } ?? "No tag"
         case "topic":
             return "\(past ? "Finished" : "Live") session, \(s.topic ?? "no topic")"
                 + (s.session_name.map { ", named \($0)" } ?? "")
@@ -4136,7 +4563,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// The newest Claude Code version any live session runs.
     private var newestVersion: String? {
-        rows.filter { !$0.past }.compactMap { $0.session.summary.version }.max { versionOrder($0, $1) }
+        allRows.filter { !$0.past }.compactMap { $0.session.summary.version }.max { versionOrder($0, $1) }
     }
 
     /// True when a is an older version than b: 2.1.9 before 2.1.10.
@@ -4216,6 +4643,10 @@ func buildMenu() {
         withTitle: "Show Terminal", action: #selector(SessionsWindow.showSelectedTerminal),
         keyEquivalent: "\r")
     showItem.keyEquivalentModifierMask = [.command]
+    sessionMenu.addItem(.separator())
+    sessionMenu.addItem(
+        withTitle: "Restart Outdated Sessions…", action: #selector(SessionsWindow.restartOutdatedSessions),
+        keyEquivalent: "")
     sessionItem.submenu = sessionMenu
     main.addItem(sessionItem)
 
