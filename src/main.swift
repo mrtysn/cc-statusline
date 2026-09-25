@@ -3130,6 +3130,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var filterChoices: [TagFilter?] = []
     private var tagRules: TagRulesWindow?
     private let rulesButton = NSButton(title: "", target: nil, action: nil)
+    /// The tag filter, Tag Rules and the verdicts toggle: what the list and the
+    /// status line show, not how anything sounds.
+    private let listControls = NSStackView()
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// Every session in the last snapshot; `rows` is what the filter lets through.
     private var allRows: [(session: Session, past: Bool)] = []
@@ -3243,6 +3246,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         buildSoundBar()
         content.addSubview(statusLabel)
+        content.addSubview(listControls)
         content.addSubview(quotaBar)
         content.addSubview(soundBar)
         content.addSubview(gridScroll)
@@ -3251,6 +3255,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            // The list's controls on the same line as its counts, at the right.
+            listControls.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            listControls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: listControls.leadingAnchor, constant: -24),
             quotaBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             quotaBar.trailingAnchor.constraint(lessThanOrEqualTo: soundBar.leadingAnchor, constant: -24),
@@ -3354,8 +3362,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             self?.refreshTable()
         }
         // The pack sits at the right edge, over the end of the event row; the
-        // gap before it takes up the difference. The verdicts toggle sits just
-        // left of it, beside the sound controls.
+        // gap before it takes up the difference. The list's own controls are
+        // not here: they sit in the top row, beside the counts they narrow.
         let gap = NSView()
         gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
         filterPopup.controlSize = .small
@@ -3371,7 +3379,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         rulesButton.target = self
         rulesButton.action = #selector(openTagRules)
         rulesButton.toolTip = "Tag Rules: dots and tags for every session launched under a directory"
-        let top = NSStackView(views: [soundControls.volumeRow, gap, filterPopup, rulesButton, verdictsToggle, packButton])
+        let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
+        listControls.setViews([filterPopup, rulesButton, verdictsToggle], in: .leading)
+        listControls.spacing = 12
+        listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
         top.distribution = .fill
         soundBar.addArrangedSubview(top)
