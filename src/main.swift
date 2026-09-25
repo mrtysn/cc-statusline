@@ -47,10 +47,25 @@ let systemOneShadowDir: URL = {
     return xdgDir("XDG_STATE_HOME", fallback: ".local/state").appendingPathComponent("system-one").appendingPathComponent("shadow")
 }()
 
-func systemOneShadowFile(for sessionId: String) -> URL? {
-    let safe = sessionId.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
-    guard !safe.isEmpty else { return nil }
-    return systemOneShadowDir.appendingPathComponent("\(safe).jsonl")
+/// The three hooks with a shadow log, in the order the Verdicts window's hook
+/// selector lists them.
+let systemOneHooks = ["bash", "prompt", "stop"]
+
+/// Short labels for the questions each hook asks, in display order, mirroring
+/// cc-statusline.js's HOOK_LABELS so the status line row and this window agree
+/// (bash keeps the irr/for/net/ins order section 9 of the design doc fixed).
+/// A question outside the map still renders, at its position (q1, q2, ...).
+let systemOneHookLabels: [String: [(key: String, label: String)]] = [
+    "bash": [("irreversible", "Irr"), ("foreign_process", "For"), ("leaves_machine", "Net"), ("network_install", "Ins")],
+    "prompt": [("kind", "Knd"), ("wants_action", "Act")],
+    "stop": [("overlong", "Lng"), ("needless_table", "Tbl")],
+]
+
+func systemOneShadowFile(for sessionId: String, hook: String) -> URL? {
+    let safeSession = sessionId.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+    let safeHook = hook.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+    guard !safeSession.isEmpty, !safeHook.isEmpty else { return nil }
+    return systemOneShadowDir.appendingPathComponent(safeHook).appendingPathComponent("\(safeSession).jsonl")
 }
 
 /// The checkout this bundle was built from; bundle.sh writes it into Info.plist.
@@ -567,12 +582,17 @@ let vorbisDecodes: Bool = {
 /// every redraw the same way it reads sounds.json and the usage cache.
 struct DisplaySettings: Codable {
     var verdictRow = false
+    /// Which hook's shadow log the status line row draws ('bash' | 'prompt' |
+    /// 'stop'); empty is off, even when verdictRow is on. Default empty: a
+    /// session that never picked a hook draws nothing.
+    var verdictHook = ""
 
     init() {}
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         verdictRow = try c.decodeIfPresent(Bool.self, forKey: .verdictRow) ?? false
+        verdictHook = try c.decodeIfPresent(String.self, forKey: .verdictHook) ?? ""
     }
 }
 
@@ -2225,9 +2245,10 @@ final class SessionRowView: NSTableRowView {
 private struct VerdictRow {
     let time: String
     let excerpt: String
-    /// Keyed by the question name (irreversible, foreign_process,
-    /// leaves_machine, network_install); nil when the log line lacks it.
-    let scores: [String: Double]
+    /// Keyed by question name: the cell text (a two-decimal probability for
+    /// noul and score answers, the chosen option's first three letters for a
+    /// choice answer); absent when the log line lacks the question.
+    let cells: [String: String]
     let fired: Set<String>
 }
 
@@ -2238,10 +2259,12 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let sessionId: String
     private let table = NSTableView()
     private let status = NSTextField(labelWithString: "")
+    private let hookSelector = NSPopUpButton(frame: .zero, pullsDown: false)
     private var rows: [VerdictRow] = []
     private var timer: Timer?
     /// Size and mtime of the log at the last parse: a tick that finds them
-    /// unchanged does nothing.
+    /// unchanged does nothing. Reset on a hook switch, so the next reload
+    /// always re-parses the newly chosen log.
     private var seen: (size: UInt64, modified: Date)?
     /// How much of the log's tail is read: a shadow log grows without bound
     /// over a long session, and the view shows its recent calls, not all of it.
@@ -2250,12 +2273,15 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// Told to the opener so it can drop its reference once the window closes.
     var onClose: (() -> Void)?
 
-    private static let order: [(label: String, key: String)] = [
-        ("Irr", "irreversible"), ("For", "foreign_process"), ("Net", "leaves_machine"), ("Ins", "network_install"),
-    ]
+    /// The hook currently shown; drives both the file read and the column
+    /// set. Columns are the chosen hook's known questions (systemOneHookLabels),
+    /// in that fixed order, so headers do not reshuffle row to row.
+    private var hook: String
+    private var order: [(key: String, label: String)] { systemOneHookLabels[hook] ?? [] }
 
-    init(sessionId: String) {
+    init(sessionId: String, hook: String = "bash") {
         self.sessionId = sessionId
+        self.hook = systemOneHooks.contains(hook) ? hook : "bash"
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 780, height: 420),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -2282,16 +2308,13 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         status.translatesAutoresizingMaskIntoConstraints = false
         status.lineBreakMode = .byTruncatingMiddle
 
-        let columns: [(String, String, CGFloat)] = [
-            ("time", "Time", 150), ("cmd", "Command", 340), ("irr", "Irr", 46), ("for", "For", 46),
-            ("net", "Net", 46), ("ins", "Ins", 46), ("fired", "Fired", 110),
-        ]
-        for (key, title, width) in columns {
-            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
-            column.title = title
-            column.width = width
-            table.addTableColumn(column)
-        }
+        hookSelector.addItems(withTitles: systemOneHooks)
+        hookSelector.selectItem(withTitle: hook)
+        hookSelector.target = self
+        hookSelector.action = #selector(hookChanged)
+        hookSelector.translatesAutoresizingMaskIntoConstraints = false
+
+        rebuildColumns()
         table.dataSource = self
         table.delegate = self
         table.backgroundColor = Palette.background
@@ -2308,16 +2331,42 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
         content.addSubview(status)
+        content.addSubview(hookSelector)
         content.addSubview(scroll)
         NSLayoutConstraint.activate([
             status.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
             status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -12),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: hookSelector.leadingAnchor, constant: -12),
+            hookSelector.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
+            hookSelector.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             scroll.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
+    }
+
+    /// Rebuilds the table's columns for the current hook: Time, Command, one
+    /// column per known question (from `order`), then Fired.
+    private func rebuildColumns() {
+        for column in table.tableColumns { table.removeTableColumn(column) }
+        var columns: [(String, String, CGFloat)] = [("time", "Time", 150), ("cmd", "Command", 300)]
+        for (key, label) in order { columns.append((key, label, 50)) }
+        columns.append(("fired", "Fired", 110))
+        for (key, title, width) in columns {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
+            column.title = title
+            column.width = width
+            table.addTableColumn(column)
+        }
+    }
+
+    @objc private func hookChanged() {
+        guard let title = hookSelector.titleOfSelectedItem, title != hook else { return }
+        hook = title
+        seen = nil
+        rebuildColumns()
+        reload()
     }
 
     /// The command excerpt, first 80 characters: the Bash hook's own `state`
@@ -2333,7 +2382,7 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     private func reload() {
-        guard let file = systemOneShadowFile(for: sessionId) else {
+        guard let file = systemOneShadowFile(for: sessionId, hook: hook) else {
             status.stringValue = "No session id"
             rows = []
             table.reloadData()
@@ -2364,12 +2413,20 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         for line in lines.suffix(Self.maxRows) {
             guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
             let answers = obj["answers"] as? [String: Any] ?? [:]
-            var scores: [String: Double] = [:]
-            for (_, key) in Self.order {
-                if let a = answers[key] as? [String: Any], let v = a["noul"] as? Double { scores[key] = v }
+            var cells: [String: String] = [:]
+            for (key, _) in order {
+                guard let a = answers[key] as? [String: Any] else { continue }
+                if let v = a["noul"] as? Double {
+                    cells[key] = String(format: "%.2f", v)
+                } else if let v = a["score"] as? Double {
+                    let levels = (a["probabilities"] as? [String: Any])?.count ?? 0
+                    cells[key] = String(format: "%.2f", v / Double(max(levels - 1, 1)))
+                } else if let c = a["choice"] as? String {
+                    cells[key] = String(c.prefix(3))
+                }
             }
             let fired = Set((obj["fired"] as? [[String: Any]])?.compactMap { $0["q"] as? String } ?? [])
-            parsed.append(VerdictRow(time: (obj["ts"] as? String) ?? "", excerpt: Self.excerpt(of: obj), scores: scores, fired: fired))
+            parsed.append(VerdictRow(time: (obj["ts"] as? String) ?? "", excerpt: Self.excerpt(of: obj), cells: cells, fired: fired))
         }
         rows = parsed.reversed()
         status.stringValue = "\(sessionId)  \u{00B7}  \(rows.count) call(s)\(cut ? ", most recent" : "")  \u{00B7}  \(file.path)"
@@ -2390,14 +2447,12 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             text = r.fired.isEmpty ? "" : r.fired.joined(separator: ",")
             colour = r.fired.isEmpty ? Palette.dim : Palette.yellow
         default:
-            if let entry = Self.order.first(where: { $0.label.lowercased() == key }) {
-                if let v = r.scores[entry.key] {
-                    text = String(format: "%.2f", v)
-                    colour = r.fired.contains(entry.key) ? Palette.yellow : Palette.dim
-                } else {
-                    text = "--"
-                    colour = Palette.dim
-                }
+            if let v = r.cells[key] {
+                text = v
+                colour = r.fired.contains(key) ? Palette.yellow : Palette.dim
+            } else if order.contains(where: { $0.key == key }) {
+                text = "--"
+                colour = Palette.dim
             } else {
                 text = ""
             }
@@ -2680,23 +2735,32 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         top.widthAnchor.constraint(equalTo: soundControls.eventRow.widthAnchor).isActive = true
     }
 
-    /// system-one's show-mode verdict row (irr/for/net/ins) on the status line:
-    /// a text toggle in the ● on / ○ off style the event boxes use, bound to
-    /// display.json so the status line script picks the change up on its next
-    /// redraw.
+    /// system-one's verdict row on the status line: a text toggle in the
+    /// ● on / ○ off style the event boxes use, bound to display.json so the
+    /// status line script picks the change up on its next redraw. A click
+    /// cycles off -> bash -> prompt -> stop -> off, since the row draws at
+    /// most one hook's scores at a time.
     private func drawVerdictsToggle() {
-        let on = displayStore.settings.verdictRow
+        let hook = displayStore.settings.verdictHook
+        let on = displayStore.settings.verdictRow && !hook.isEmpty
         verdictsToggle.attributedTitle = NSAttributedString(
-            string: (on ? "● " : "○ ") + "verdicts",
+            string: (on ? "\u{25CF} " : "\u{25CB} ") + "verdicts" + (on ? " (\(hook))" : ""),
             attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
         verdictsToggle.toolTip =
-            "system-one's four gate scores as a fourth status line row (irr/for/net/ins), "
-            + (on ? "on — click to turn off" : "off — click to turn on")
-        verdictsToggle.setAccessibilityLabel("Verdict row on the status line, \(on ? "on" : "off")")
+            "system-one's gate scores as a fourth status line row, for the shown hook's questions. "
+            + (on ? "Showing \(hook). Click to cycle or turn off." : "Off. Click to choose a hook.")
+        verdictsToggle.setAccessibilityLabel("Verdict row on the status line, \(on ? "on, \(hook)" : "off")")
     }
 
     @objc private func verdictsToggled() {
-        displayStore.update { $0.verdictRow.toggle() }
+        displayStore.update {
+            let next: [String] = ["", "bash", "prompt", "stop"]
+            let current = $0.verdictRow ? $0.verdictHook : ""
+            let idx = next.firstIndex(of: current) ?? 0
+            let hook = next[(idx + 1) % next.count]
+            $0.verdictHook = hook
+            $0.verdictRow = !hook.isEmpty
+        }
         drawVerdictsToggle()
     }
 
@@ -2718,7 +2782,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             existing.window?.makeKeyAndOrderFront(nil)
             return
         }
-        let window = VerdictsWindow(sessionId: sessionId)
+        let defaultHook = displayStore.settings.verdictHook
+        let window = VerdictsWindow(sessionId: sessionId, hook: defaultHook.isEmpty ? "bash" : defaultHook)
         verdictsWindows[sessionId] = window
         window.onClose = { [weak self] in self?.verdictsWindows[sessionId] = nil }
         window.window?.center()

@@ -37,7 +37,6 @@ const DISPLAY_FILE = join(APP_SUPPORT_DIR, 'display.json');
 const SYSTEM_ONE_STATE_DIR =
   process.env.SYSTEM_ONE_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'system-one');
 const SYSTEM_ONE_SHADOW_DIR = join(SYSTEM_ONE_STATE_DIR, 'shadow');
-const SYSTEM_ONE_GATE_QUESTIONS = ['irreversible', 'foreign_process', 'leaves_machine', 'network_install'];
 const USAGE_FILE = join(CACHE_DIR, 'usage.json');
 const LOCK_FILE = join(CACHE_DIR, 'refresh.lock');
 const ERROR_LOG = join(CACHE_DIR, 'error.log');
@@ -221,12 +220,18 @@ function readUsageCache() {
 // display.json: the app's own settings file, read the same way sounds.json and
 // the usage cache are — a small JSON file, on every redraw, no caching beyond
 // that. Missing means the row is off (the app writes the file with a default on
-// first launch, same as sounds.json).
+// first launch, same as sounds.json). verdictHook names which hook's shadow log
+// to draw ('bash' | 'prompt' | 'stop'); empty (the default) means off, even
+// when verdictRow is on -- a session that never picked a hook draws nothing,
+// so the Bash hook's scores no longer reach the row by default.
 function readVerdictDisplay() {
   try {
-    return JSON.parse(readFileSync(DISPLAY_FILE, 'utf8'))?.verdictRow === true;
+    const d = JSON.parse(readFileSync(DISPLAY_FILE, 'utf8'));
+    if (d?.verdictRow !== true) return null;
+    const hook = typeof d?.verdictHook === 'string' ? d.verdictHook.trim() : '';
+    return hook || null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -267,16 +272,18 @@ function readLastLines(file) {
   }
 }
 
-// The Bash hook's per-session shadow log, last line: the four gate scores
-// (answers.<q>.noul) and which of them fired. Missing file, unparsable line, or
-// no session id all read as no verdict, same as every other reader here. A
-// last line that does not parse is one the hook is still writing: the line
-// before it stands in for that redraw.
-function readVerdict(sessionId) {
-  if (!sessionId) return null;
-  const safe = String(sessionId).replace(/[^\w-]/g, '');
-  if (!safe) return null;
-  const file = join(SYSTEM_ONE_SHADOW_DIR, `${safe}.jsonl`);
+// One hook's per-session shadow log (shadow/<hook>/<session_id>.jsonl), last
+// line: its raw answers object (renderVerdict picks the first four keys and
+// labels them) and which questions fired. Missing file, unparsable line, no
+// session id, or no hook all read as no verdict, same as every other reader
+// here. A last line that does not parse is one the hook is still writing: the
+// line before it stands in for that redraw.
+function readVerdict(sessionId, hook) {
+  if (!sessionId || !hook) return null;
+  const safeSession = String(sessionId).replace(/[^\w-]/g, '');
+  const safeHook = String(hook).replace(/[^\w-]/g, '');
+  if (!safeSession || !safeHook) return null;
+  const file = join(SYSTEM_ONE_SHADOW_DIR, safeHook, `${safeSession}.jsonl`);
   if (!existsSync(file)) return null;
   let entry = null;
   for (const line of readLastLines(file).reverse()) {
@@ -286,14 +293,9 @@ function readVerdict(sessionId) {
     } catch {}
   }
   if (!entry || typeof entry !== 'object') return null;
-  const answers = entry.answers || {};
-  const scores = {};
-  for (const q of SYSTEM_ONE_GATE_QUESTIONS) {
-    const v = answers[q]?.noul;
-    scores[q] = typeof v === 'number' ? v : null;
-  }
+  const answers = entry.answers && typeof entry.answers === 'object' ? entry.answers : {};
   const fired = Array.isArray(entry.fired) ? entry.fired.map((f) => f?.q).filter(Boolean) : [];
-  return { scores, fired };
+  return { hook: safeHook, answers, fired };
 }
 
 function logError(message) {
@@ -1307,7 +1309,8 @@ function main() {
   // so a session that never turned it on pays nothing beyond the one cheap
   // display.json read. Kept in args (words, not the drawn row) the same way
   // topic and git are, so the live view carries it without a separate file.
-  const verdict = readVerdictDisplay() ? readVerdict(input.session_id) : null;
+  const verdictHook = readVerdictDisplay();
+  const verdict = verdictHook ? readVerdict(input.session_id, verdictHook) : null;
   const args = {
     input,
     cwd,
