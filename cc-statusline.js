@@ -32,9 +32,13 @@ const CACHE_DIR = process.env.CC_STATUSLINE_CACHE_DIR || join(homedir(), '.cache
 // the one setting this script reads back on every redraw.
 const APP_SUPPORT_DIR = join(homedir(), 'Library', 'Application Support', 'Agent Bar Hopping');
 const DISPLAY_FILE = join(APP_SUPPORT_DIR, 'display.json');
-// The app's session tags: { tags: [{ name, hex }], sessions: { <id>: name },
-// dots: { <id>: hex } }; a session can have a preset dot, a named tag, or both.
+// The app's session tags: { tags: [{ name, hex }], sessions: { <id>: [name] },
+// dots: { <id>: [hex] }, rules: [{ dir, dots: [hex], tags: [name] }] }. A
+// session shows what was set on it by hand plus what the most specific rule
+// over its launch directory adds.
 const TAGS_FILE = join(APP_SUPPORT_DIR, 'tags.json');
+// The app's preset dots, in its order: TagColour.all in src/main.swift.
+const PRESET_DOTS = ['E06C75', 'D19A66', 'E5C07B', '98C379', '61AFEF', 'C678DD', '7D828F'];
 // system-one's per-session shadow log (agents-shared/notebook/2026-09-24-system-one-decision-model-integration.md,
 // section 9): one JSONL file per session, read for the show-mode verdict row.
 const SYSTEM_ONE_STATE_DIR =
@@ -227,18 +231,26 @@ function readUsageCache() {
 // to draw ('bash' | 'prompt' | 'stop'); empty (the default) means off, even
 // when verdictRow is on -- a session that never picked a hook draws nothing,
 // so the Bash hook's scores no longer reach the row by default.
-// This session's dot and tag from the app's tags.json, read on every redraw
-// like display.json. Missing file, unknown session or a malformed entry: none.
-function readTag(sessionId) {
-  if (!sessionId) return null;
+// This session's dots and tags from the app's tags.json, read on every redraw
+// like display.json. Missing file, unknown session or malformed entries: none.
+// A single value per session is the format from before a session had several.
+function readTag(sessionId, projectDir) {
   const isHex = (v) => typeof v === 'string' && /^[0-9a-fA-F]{6}$/.test(v);
+  const list = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);
   try {
     const file = JSON.parse(readFileSync(TAGS_FILE, 'utf8'));
-    const dot = file?.dots?.[sessionId];
-    const name = file?.sessions?.[sessionId];
-    const tag = typeof name === 'string' && (file.tags || []).find((t) => t?.name === name && isHex(t.hex));
-    if (!isHex(dot) && !tag) return null;
-    return { dot: isHex(dot) ? dot : null, name: tag ? tag.name : null, hex: tag ? tag.hex : null };
+    const dir = typeof projectDir === 'string' ? projectDir.replace(/\/+$/, '') || '/' : null;
+    const rule = dir
+      ? list(file?.rules)
+          .filter((r) => typeof r?.dir === 'string' && (dir === r.dir || dir.startsWith(r.dir === '/' ? '/' : r.dir + '/')))
+          .sort((x, y) => y.dir.length - x.dir.length)[0]
+      : null;
+    const hexes = new Set([...list(sessionId && file?.dots?.[sessionId]), ...list(rule?.dots)].filter(isHex));
+    const names = new Set([...list(sessionId && file?.sessions?.[sessionId]), ...list(rule?.tags)]);
+    // In the app's orders: the preset dots as listed, the tags as made.
+    const dots = PRESET_DOTS.filter((hex) => hexes.has(hex));
+    const tags = list(file?.tags).filter((t) => names.has(t?.name) && isHex(t?.hex)).map((t) => ({ name: t.name, hex: t.hex }));
+    return dots.length || tags.length ? { dots, tags } : null;
   } catch {
     return null;
   }
@@ -1338,7 +1350,7 @@ function main() {
     topic: renderTopic(input.session_id || '', input.transcript_path, terminal.tty, lastAt),
     waiting: waitingAgents(input.session_id, input.transcript_path),
     peer: peerName(terminal.pid, input.session_id),
-    tag: readTag(input.session_id),
+    tag: readTag(input.session_id, input.workspace?.project_dir),
     git: repo.info,
     home: homedir(),
     verdict,

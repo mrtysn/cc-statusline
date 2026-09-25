@@ -660,26 +660,56 @@ struct Tag: Codable, Equatable {
     var color: NSColor { TagColour(name: "", hex: hex).color }
 }
 
+/// Everything under one directory gets these marks: the directory a session
+/// was launched in, or any folder below it. The most specific rule applies.
+struct TagRule: Codable, Equatable {
+    /// Absolute, without a trailing slash.
+    var dir: String
+    var dots: [String] = []
+    var tags: [String] = []
+
+    init(dir: String) { self.dir = dir }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        dir = try c.decode(String.self, forKey: .dir)
+        dots = try c.decodeIfPresent([String].self, forKey: .dots) ?? []
+        tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+    }
+
+    func covers(_ path: String) -> Bool { path == dir || path.hasPrefix(dir == "/" ? "/" : dir + "/") }
+}
+
 struct TagFile: Codable {
     var tags: [Tag] = []
-    /// Session id to tag name. Keyed by id because `claude --resume` keeps it:
-    /// a session restarted after an update is still tagged.
-    var sessions: [String: String] = [:]
-    /// Session id to one of the preset colour dots, by its hex: a mark that
-    /// needs no name, beside or instead of a named tag.
-    var dots: [String: String] = [:]
+    /// Session id to the named tags set on it by hand. Keyed by id because
+    /// `claude --resume` keeps it: a session restarted after an update is
+    /// still tagged.
+    var sessions: [String: [String]] = [:]
+    /// Session id to the preset colour dots set on it by hand, by hex.
+    var dots: [String: [String]] = [:]
+    var rules: [TagRule] = []
 
     init() {}
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         tags = try c.decodeIfPresent([Tag].self, forKey: .tags) ?? []
-        sessions = try c.decodeIfPresent([String: String].self, forKey: .sessions) ?? [:]
-        dots = try c.decodeIfPresent([String: String].self, forKey: .dots) ?? [:]
+        sessions = Self.lists(c, CodingKeys.sessions)
+        dots = Self.lists(c, CodingKeys.dots)
+        rules = try c.decodeIfPresent([TagRule].self, forKey: .rules) ?? []
+    }
+
+    /// A list per session, or a single value from before a session could
+    /// have several.
+    private static func lists<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> [String: [String]] {
+        if let many = try? c.decodeIfPresent([String: [String]].self, forKey: key) { return many }
+        if let one = try? c.decodeIfPresent([String: String].self, forKey: key) { return one.mapValues { [$0] } }
+        return [:]
     }
 }
 
-/// What the session list is narrowed to: one preset dot, or one named tag.
+/// What the list is narrowed to: one preset dot, or one named tag.
 enum TagFilter: Equatable {
     case dot(String)
     case tag(String)
@@ -698,36 +728,35 @@ final class TagStore {
     }
 
     var tags: [Tag] { file.tags }
+    var rules: [TagRule] { file.rules }
 
-    func tag(for sessionId: String?) -> Tag? {
-        guard let id = sessionId, let name = file.sessions[id] else { return nil }
-        return file.tags.first { $0.name == name }
-    }
+    // MARK: By hand
 
-    func set(_ name: String?, for sessionId: String) {
-        file.sessions[sessionId] = name
+    func manualDots(_ sessionId: String) -> [String] { file.dots[sessionId] ?? [] }
+    func manualTags(_ sessionId: String) -> [String] { file.sessions[sessionId] ?? [] }
+
+    func toggleDot(_ hex: String, for sessionId: String) {
+        var dots = manualDots(sessionId)
+        if let i = dots.firstIndex(of: hex) { dots.remove(at: i) } else { dots.append(hex) }
+        file.dots[sessionId] = dots.isEmpty ? nil : dots
         save()
     }
 
-    /// The session's preset dot, if it has one still in the preset set.
-    func dot(for sessionId: String?) -> TagColour? {
-        guard let id = sessionId, let hex = file.dots[id] else { return nil }
-        return TagColour.all.first { $0.hex == hex }
-    }
-
-    func setDot(_ hex: String?, for sessionId: String) {
-        file.dots[sessionId] = hex
+    func toggleTag(_ name: String, for sessionId: String) {
+        var names = manualTags(sessionId)
+        if let i = names.firstIndex(of: name) { names.remove(at: i) } else { names.append(name) }
+        file.sessions[sessionId] = names.isEmpty ? nil : names
         save()
     }
 
-    /// Whether a session passes the list's filter.
-    func matches(_ filter: TagFilter?, _ sessionId: String?) -> Bool {
-        switch filter {
-        case nil: return true
-        case .dot(let hex)?: return dot(for: sessionId)?.hex == hex
-        case .tag(let name)?: return tag(for: sessionId)?.name == name
-        }
+    /// Every dot and tag set by hand; a rule's marks stay.
+    func clear(_ sessionId: String) {
+        file.dots[sessionId] = nil
+        file.sessions[sessionId] = nil
+        save()
     }
+
+    // MARK: Named tags
 
     /// A new tag, or the existing one of that name recoloured.
     func create(_ name: String, hex: String) {
@@ -739,11 +768,65 @@ final class TagStore {
         save()
     }
 
-    /// Gone from every session that had it.
+    /// Gone from every session and rule that had it.
     func delete(_ name: String) {
         file.tags.removeAll { $0.name == name }
-        file.sessions = file.sessions.filter { $0.value != name }
+        file.sessions = file.sessions.compactMapValues { names in
+            let kept = names.filter { $0 != name }
+            return kept.isEmpty ? nil : kept
+        }
+        for i in file.rules.indices { file.rules[i].tags.removeAll { $0 == name } }
         save()
+    }
+
+    // MARK: Rules
+
+    /// The most specific rule over a launch directory, `~` or absolute.
+    func rule(for projectDir: String?) -> TagRule? {
+        guard let dir = projectDir.map({ ($0 as NSString).expandingTildeInPath }) else { return nil }
+        return file.rules.filter { $0.covers(dir) }.max { $0.dir.count < $1.dir.count }
+    }
+
+    /// A rule for this directory, or the one it already has.
+    func addRule(_ dir: String) -> Int {
+        let clean = dir.count > 1 && dir.hasSuffix("/") ? String(dir.dropLast()) : dir
+        if let i = file.rules.firstIndex(where: { $0.dir == clean }) { return i }
+        file.rules.append(TagRule(dir: clean))
+        save()
+        return file.rules.count - 1
+    }
+
+    func updateRule(_ index: Int, _ change: (inout TagRule) -> Void) {
+        guard file.rules.indices.contains(index) else { return }
+        change(&file.rules[index])
+        save()
+    }
+
+    func removeRule(_ index: Int) {
+        guard file.rules.indices.contains(index) else { return }
+        file.rules.remove(at: index)
+        save()
+    }
+
+    // MARK: What a session shows
+
+    /// Its dots and tags, by hand and from its directory's rule together, in
+    /// the preset order and the order the tags were made.
+    func marks(_ sessionId: String?, _ projectDir: String?) -> (dots: [TagColour], tags: [Tag]) {
+        let rule = rule(for: projectDir)
+        let hexes = Set((sessionId.map(manualDots) ?? []) + (rule?.dots ?? []))
+        let names = Set((sessionId.map(manualTags) ?? []) + (rule?.tags ?? []))
+        return (TagColour.all.filter { hexes.contains($0.hex) }, file.tags.filter { names.contains($0.name) })
+    }
+
+    /// Whether a session passes the list's filter: any of its marks will do.
+    func matches(_ filter: TagFilter?, _ sessionId: String?, _ projectDir: String?) -> Bool {
+        guard let filter = filter else { return true }
+        let m = marks(sessionId, projectDir)
+        switch filter {
+        case .dot(let hex): return m.dots.contains { $0.hex == hex }
+        case .tag(let name): return m.tags.contains { $0.name == name }
+        }
     }
 
     private func save() {
@@ -2686,6 +2769,331 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
 // MARK: - Window
 
+/// A path with the home directory as `~`, for showing.
+func tildePath(_ path: String) -> String {
+    let home = NSHomeDirectory()
+    return path == home ? "~" : path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
+}
+
+/// Asks for a name and a colour and makes the tag; a name that already exists
+/// takes the new colour. Hands the name on once it is made.
+func promptNewTag(store: TagStore, on window: NSWindow, note: String, then: @escaping (String) -> Void) {
+    let alert = NSAlert()
+    alert.messageText = "New Tag"
+    alert.informativeText = note
+    alert.addButton(withTitle: "Add")
+    alert.addButton(withTitle: "Cancel")
+    let field = NSTextField(frame: NSRect(x: 0, y: 30, width: 220, height: 24))
+    field.placeholderString = "Name"
+    let colours = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 220, height: 26), pullsDown: false)
+    let used = Set(store.tags.map(\.hex))
+    for colour in TagColour.all {
+        colours.addItem(withTitle: colour.name)
+        colours.lastItem?.image = tagDot(colour.color)
+    }
+    // The first colour no tag has yet, so a new tag stands out by default.
+    colours.selectItem(at: TagColour.all.firstIndex { !used.contains($0.hex) } ?? 0)
+    let box = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 56))
+    box.addSubview(field)
+    box.addSubview(colours)
+    alert.accessoryView = box
+    alert.window.initialFirstResponder = field
+    alert.beginSheetModal(for: window) { response in
+        guard response == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        store.create(name, hex: TagColour.all[max(0, colours.indexOfSelectedItem)].hex)
+        then(name)
+    }
+}
+
+/// Tag Rules: each rule gives every session launched in a directory, or below
+/// it, a set of dots and tags on top of any set by hand. A list of rules, and
+/// under it the selected rule's directory, dots and tags; every change is saved
+/// as it is made.
+final class TagRulesWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    private let store: TagStore
+    var onChange: (() -> Void)?
+    private let table = NSTableView()
+    private let addRemove = NSSegmentedControl(
+        labels: ["+", "−"], trackingMode: .momentary, target: nil, action: nil)
+    private let dirLabel = NSTextField(labelWithString: "")
+    private let chooseButton = NSButton(title: "Change…", target: nil, action: nil)
+    private let dotRow = NSStackView()
+    private let tagList = NSStackView()
+    private let detail = NSStackView()
+    private let hint = NSTextField(wrappingLabelWithString: "")
+
+    init(store: TagStore) {
+        self.store = store
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 460),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.title = "Tag Rules"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.contentMinSize = NSSize(width: 480, height: 380)
+        super.init(window: window)
+        build()
+        table.reloadData()
+        if !store.rules.isEmpty { table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
+        drawDetail()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private var selectedIndex: Int? {
+        let row = table.selectedRow
+        return row >= 0 && row < store.rules.count ? row : nil
+    }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        let intro = NSTextField(wrappingLabelWithString:
+            "Every session launched in a directory, or anywhere under it, gets that rule's dots and tags, "
+            + "beside any set by hand. Where rules nest, the most specific one applies.")
+        intro.font = NSFont.systemFont(ofSize: 12)
+        intro.textColor = .secondaryLabelColor
+
+        for (key, title, width) in [("dir", "Directory", 300.0), ("marks", "Marks", 180.0)] {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
+            column.title = title
+            column.width = CGFloat(width)
+            table.addTableColumn(column)
+        }
+        table.dataSource = self
+        table.delegate = self
+        table.rowHeight = 22
+        table.usesAlternatingRowBackgroundColors = true
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+
+        addRemove.target = self
+        addRemove.action = #selector(addOrRemove)
+        addRemove.setToolTip("Add a rule for a directory", forSegment: 0)
+        addRemove.setToolTip("Remove the selected rule", forSegment: 1)
+
+        chooseButton.target = self
+        chooseButton.action = #selector(changeDirectory)
+        dirLabel.lineBreakMode = .byTruncatingMiddle
+        dirLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let dirRow = NSStackView(views: [dirLabel, chooseButton])
+        dirRow.spacing = 8
+
+        dotRow.spacing = 6
+        tagList.orientation = .vertical
+        tagList.alignment = .leading
+        tagList.spacing = 4
+        let newTag = NSButton(title: "New Tag…", target: self, action: #selector(makeTag))
+        newTag.controlSize = .small
+
+        let dotsTitle = NSTextField(labelWithString: "Dots")
+        let tagsTitle = NSTextField(labelWithString: "Tags")
+        for label in [dotsTitle, tagsTitle] { label.font = NSFont.systemFont(ofSize: 11); label.textColor = .secondaryLabelColor }
+        detail.orientation = .vertical
+        detail.alignment = .leading
+        detail.spacing = 8
+        for view in [dirRow, dotsTitle, dotRow, tagsTitle, tagList, newTag] { detail.addArrangedSubview(view) }
+        detail.setCustomSpacing(14, after: dirRow)
+        detail.setCustomSpacing(14, after: dotRow)
+
+        hint.font = NSFont.systemFont(ofSize: 12)
+        hint.textColor = .secondaryLabelColor
+        hint.stringValue = "Add a rule with +, then pick its dots and tags."
+
+        let done = NSButton(title: "Done", target: self, action: #selector(finish))
+        done.keyEquivalent = "\r"
+
+        for view in [intro, scroll, addRemove, detail, hint, done] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            intro.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            intro.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            scroll.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            addRemove.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 6),
+            addRemove.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            detail.topAnchor.constraint(equalTo: addRemove.bottomAnchor, constant: 16),
+            detail.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            detail.trailingAnchor.constraint(lessThanOrEqualTo: intro.trailingAnchor),
+            hint.topAnchor.constraint(equalTo: addRemove.bottomAnchor, constant: 16),
+            hint.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            hint.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            done.topAnchor.constraint(greaterThanOrEqualTo: detail.bottomAnchor, constant: 16),
+            done.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            done.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            dirLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 380),
+        ])
+    }
+
+    /// The selected rule's directory, dots and tags; nothing selected, a hint.
+    private func drawDetail() {
+        guard let index = selectedIndex else {
+            detail.isHidden = true
+            hint.isHidden = false
+            hint.stringValue = store.rules.isEmpty
+                ? "Add a rule with +, then pick its dots and tags." : "Select a rule to edit it."
+            addRemove.setEnabled(false, forSegment: 1)
+            return
+        }
+        let rule = store.rules[index]
+        detail.isHidden = false
+        hint.isHidden = true
+        addRemove.setEnabled(true, forSegment: 1)
+        dirLabel.stringValue = tildePath(rule.dir)
+        dirLabel.toolTip = rule.dir
+        dotRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for (i, colour) in TagColour.all.enumerated() {
+            let button = NSButton(checkboxWithTitle: "", target: self, action: #selector(dotToggled(_:)))
+            button.image = tagDot(colour.color)
+            button.imagePosition = .imageTrailing
+            button.tag = i
+            button.state = rule.dots.contains(colour.hex) ? .on : .off
+            button.toolTip = colour.name
+            button.setAccessibilityLabel("\(colour.name) dot")
+            dotRow.addArrangedSubview(button)
+        }
+        tagList.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        if store.tags.isEmpty {
+            let none = NSTextField(labelWithString: "No named tags yet.")
+            none.textColor = .secondaryLabelColor
+            tagList.addArrangedSubview(none)
+        }
+        for (i, tag) in store.tags.enumerated() {
+            let button = NSButton(checkboxWithTitle: tag.name, target: self, action: #selector(tagToggled(_:)))
+            button.image = tagDot(tag.color)
+            button.imagePosition = .imageLeading
+            button.tag = i
+            button.state = rule.tags.contains(tag.name) ? .on : .off
+            tagList.addArrangedSubview(button)
+        }
+    }
+
+    private func changed(reselect index: Int?) {
+        table.reloadData()
+        if let index = index { table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false) }
+        drawDetail()
+        onChange?()
+    }
+
+    /// A folder picker as a sheet over this one; the folder comes back.
+    private func pickDirectory(_ done: @escaping (String) -> Void) {
+        guard let window = window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Sessions launched in this directory, or under it, get the rule's marks."
+        if let index = selectedIndex { panel.directoryURL = URL(fileURLWithPath: store.rules[index].dir) }
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK, let url = panel.url else { return }
+            done(url.path)
+        }
+    }
+
+    @objc private func addOrRemove() {
+        if addRemove.selectedSegment == 0 {
+            pickDirectory { [weak self] dir in
+                guard let self = self else { return }
+                self.changed(reselect: self.store.addRule(dir))
+            }
+        } else if let index = selectedIndex {
+            store.removeRule(index)
+            changed(reselect: store.rules.isEmpty ? nil : min(index, store.rules.count - 1))
+        }
+    }
+
+    @objc private func changeDirectory() {
+        guard let index = selectedIndex else { return }
+        pickDirectory { [weak self] dir in
+            guard let self = self else { return }
+            let clean = dir.count > 1 && dir.hasSuffix("/") ? String(dir.dropLast()) : dir
+            // Another rule already has that directory: go to it rather than make two.
+            if let other = self.store.rules.firstIndex(where: { $0.dir == clean }), other != index {
+                self.changed(reselect: other)
+                return
+            }
+            self.store.updateRule(index) { $0.dir = clean }
+            self.changed(reselect: index)
+        }
+    }
+
+    @objc private func dotToggled(_ sender: NSButton) {
+        guard let index = selectedIndex, TagColour.all.indices.contains(sender.tag) else { return }
+        let hex = TagColour.all[sender.tag].hex
+        store.updateRule(index) { rule in
+            if sender.state == .on { if !rule.dots.contains(hex) { rule.dots.append(hex) } } else { rule.dots.removeAll { $0 == hex } }
+        }
+        changed(reselect: index)
+    }
+
+    @objc private func tagToggled(_ sender: NSButton) {
+        guard let index = selectedIndex, store.tags.indices.contains(sender.tag) else { return }
+        let name = store.tags[sender.tag].name
+        store.updateRule(index) { rule in
+            if sender.state == .on { if !rule.tags.contains(name) { rule.tags.append(name) } } else { rule.tags.removeAll { $0 == name } }
+        }
+        changed(reselect: index)
+    }
+
+    /// A new tag, ticked on the selected rule.
+    @objc private func makeTag() {
+        guard let window = window else { return }
+        let index = selectedIndex
+        promptNewTag(store: store, on: window, note: "It goes on this rule, and can be put on sessions and other rules.") {
+            [weak self] name in
+            guard let self = self else { return }
+            if let index = index { self.store.updateRule(index) { if !$0.tags.contains(name) { $0.tags.append(name) } } }
+            self.changed(reselect: index)
+        }
+    }
+
+    @objc private func finish() {
+        guard let window = window else { return }
+        window.sheetParent?.endSheet(window)
+    }
+
+    // MARK: Table
+
+    func numberOfRows(in tableView: NSTableView) -> Int { store.rules.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row < store.rules.count else { return nil }
+        let rule = store.rules[row]
+        let field = NSTextField(labelWithString: "")
+        field.lineBreakMode = .byTruncatingMiddle
+        if tableColumn?.identifier.rawValue == "dir" {
+            field.stringValue = tildePath(rule.dir)
+            field.toolTip = rule.dir
+        } else {
+            let text = NSMutableAttributedString()
+            let font = NSFont.systemFont(ofSize: 12)
+            for colour in TagColour.all where rule.dots.contains(colour.hex) {
+                text.append(NSAttributedString(string: "●", attributes: [.font: font, .foregroundColor: colour.color]))
+            }
+            for tag in store.tags where rule.tags.contains(tag.name) {
+                text.append(NSAttributedString(
+                    string: (text.length > 0 ? "  " : "") + tag.name, attributes: [.font: font, .foregroundColor: tag.color]))
+            }
+            if text.length == 0 {
+                text.append(NSAttributedString(
+                    string: "nothing yet", attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]))
+            }
+            field.attributedStringValue = text
+        }
+        return field
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) { drawDetail() }
+}
+
 final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation,
     NSMenuDelegate
 {
@@ -2720,6 +3128,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// The filter behind each popup entry, in order; nil for "All sessions"
     /// and for separators.
     private var filterChoices: [TagFilter?] = []
+    private var tagRules: TagRulesWindow?
+    private let rulesButton = NSButton(title: "", target: nil, action: nil)
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// Every session in the last snapshot; `rows` is what the filter lets through.
     private var allRows: [(session: Session, past: Bool)] = []
@@ -2955,7 +3365,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         filterPopup.action = #selector(filterChanged)
         filterPopup.toolTip = "Show only the sessions with one tag"
         drawFilterPopup()
-        let top = NSStackView(views: [soundControls.volumeRow, gap, filterPopup, verdictsToggle, packButton])
+        rulesButton.isBordered = false
+        rulesButton.attributedTitle = NSAttributedString(
+            string: "rules", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim])
+        rulesButton.target = self
+        rulesButton.action = #selector(openTagRules)
+        rulesButton.toolTip = "Tag Rules: dots and tags for every session launched under a directory"
+        let top = NSStackView(views: [soundControls.volumeRow, gap, filterPopup, rulesButton, verdictsToggle, packButton])
         top.spacing = 8
         top.distribution = .fill
         soundBar.addArrangedSubview(top)
@@ -3035,7 +3451,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// Rows from the last snapshot through the tag filter, sorted and drawn.
     private func applyFilter() {
         let keep = selected?.session.summary.session_id
-        rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id) }
+        rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id, $0.session.summary.project_dir) }
         emptyLabel.stringValue = allRows.isEmpty
             ? "No session has drawn a status line yet." : "No session has \(filterWords)."
         emptyLabel.isHidden = !rows.isEmpty
@@ -3143,7 +3559,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let live = snapshot.live.filter { !ended($0) }
         let past = snapshot.live.filter(ended) + snapshot.history
         allRows = live.map { ($0, false) } + past.map { ($0, true) }
-        rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id) }
+        rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id, $0.session.summary.project_dir) }
         counts = "\(live.count) live · \(past.count) finished"
         toolCost = (cost, footprint)
         healthIssues = snapshot.health ?? []
@@ -3569,7 +3985,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         menu.addItem(.separator())
         if let sid = s.session_id {
             let tagItem = NSMenuItem(title: "Tag", action: nil, keyEquivalent: "")
-            tagItem.submenu = tagMenu(for: sid)
+            tagItem.submenu = tagMenu(for: sid, projectDir: s.project_dir)
             menu.addItem(tagItem)
         }
         let sid = s.session_id
@@ -3588,49 +4004,47 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
-    /// Every tag, the session's own checked; then removing it, making a new
-    /// one, and deleting one from every session.
-    private func tagMenu(for sessionId: String) -> NSMenu {
+    /// The preset dots, then the named tags, each an on/off toggle for this
+    /// session. One that comes from the directory's rule shows as mixed: it
+    /// stays while the rule does, whatever is set here.
+    private func tagMenu(for sessionId: String, projectDir: String?) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
-        // The preset dots first: one click, nothing to name.
-        let currentDot = tagStore.dot(for: sessionId)?.hex
+        let rule = tagStore.rule(for: projectDir)
+        let dots = tagStore.manualDots(sessionId)
+        let names = tagStore.manualTags(sessionId)
+        func state(_ manual: Bool, _ ruled: Bool) -> NSControl.StateValue { manual ? .on : ruled ? .mixed : .off }
         for colour in TagColour.all {
             let hex = colour.hex
             let item = ActionItem(colour.name) { [weak self] in
-                self?.tagStore.setDot(hex, for: sessionId)
+                self?.tagStore.toggleDot(hex, for: sessionId)
                 self?.tagsChanged()
             }
             item.image = tagDot(colour.color)
-            item.state = hex == currentDot ? .on : .off
+            item.state = state(dots.contains(hex), rule?.dots.contains(hex) == true)
+            if rule?.dots.contains(hex) == true { item.toolTip = "From the rule for \(tildePath(rule!.dir))" }
             menu.addItem(item)
         }
-        if currentDot != nil {
-            menu.addItem(ActionItem("No Dot") { [weak self] in
-                self?.tagStore.setDot(nil, for: sessionId)
-                self?.tagsChanged()
-            })
-        }
-        menu.addItem(.separator())
-        let current = tagStore.tag(for: sessionId)?.name
+        if !tagStore.tags.isEmpty { menu.addItem(.separator()) }
         for tag in tagStore.tags {
             let name = tag.name
             let item = ActionItem(name) { [weak self] in
-                self?.tagStore.set(name, for: sessionId)
+                self?.tagStore.toggleTag(name, for: sessionId)
                 self?.tagsChanged()
             }
             item.image = tagDot(tag.color)
-            item.state = name == current ? .on : .off
+            item.state = state(names.contains(name), rule?.tags.contains(name) == true)
+            if rule?.tags.contains(name) == true { item.toolTip = "From the rule for \(tildePath(rule!.dir))" }
             menu.addItem(item)
         }
-        if current != nil {
-            menu.addItem(ActionItem("No Tag") { [weak self] in
-                self?.tagStore.set(nil, for: sessionId)
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("New Tag…") { [weak self] in self?.newTag(for: sessionId) })
+        if !dots.isEmpty || !names.isEmpty {
+            menu.addItem(ActionItem("Clear") { [weak self] in
+                self?.tagStore.clear(sessionId)
                 self?.tagsChanged()
             })
         }
-        if !tagStore.tags.isEmpty { menu.addItem(.separator()) }
-        menu.addItem(ActionItem("New Tag…") { [weak self] in self?.newTag(for: sessionId) })
         if !tagStore.tags.isEmpty {
             let delete = NSMenuItem(title: "Delete Tag", action: nil, keyEquivalent: "")
             let sub = NSMenu()
@@ -3647,42 +4061,29 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             delete.submenu = sub
             menu.addItem(delete)
         }
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Tag Rules…") { [weak self] in self?.openTagRules() })
         return menu
     }
 
-    /// A name and a colour, then the tag goes on the session it was asked from.
-    /// A name that already exists takes the new colour.
+    /// A new tag, put straight on the session it was asked from.
     private func newTag(for sessionId: String) {
         guard let window = window else { return }
-        let alert = NSAlert()
-        alert.messageText = "New Tag"
-        alert.informativeText = "It goes on this session, and can then be put on any other."
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 30, width: 220, height: 24))
-        field.placeholderString = "Name"
-        let colours = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 220, height: 26), pullsDown: false)
-        let used = Set(tagStore.tags.map(\.hex))
-        for colour in TagColour.all {
-            colours.addItem(withTitle: colour.name)
-            colours.lastItem?.image = tagDot(colour.color)
-        }
-        // The first colour no tag has yet, so a new tag stands out by default.
-        colours.selectItem(at: TagColour.all.firstIndex { !used.contains($0.hex) } ?? 0)
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 56))
-        box.addSubview(field)
-        box.addSubview(colours)
-        alert.accessoryView = box
-        alert.window.initialFirstResponder = field
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard let self = self, response == .alertFirstButtonReturn else { return }
-            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty else { return }
-            let colour = TagColour.all[max(0, colours.indexOfSelectedItem)]
-            self.tagStore.create(name, hex: colour.hex)
-            self.tagStore.set(name, for: sessionId)
+        promptNewTag(store: tagStore, on: window, note: "It goes on this session, and can then be put on any other.") {
+            [weak self] name in
+            guard let self = self else { return }
+            if !self.tagStore.manualTags(sessionId).contains(name) { self.tagStore.toggleTag(name, for: sessionId) }
             self.tagsChanged()
         }
+    }
+
+    /// Rules that tag sessions by their launch directory, as a sheet over the list.
+    @objc func openTagRules() {
+        guard let window = window, window.attachedSheet == nil else { return }
+        let rules = TagRulesWindow(store: tagStore)
+        rules.onChange = { [weak self] in self?.tagsChanged() }
+        tagRules = rules
+        window.beginSheet(rules.window!) { [weak self] _ in self?.tagRules = nil }
     }
 
     // MARK: Restarting in place
@@ -3793,10 +4194,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // A background tint for the columns where the number is a temperature.
         var heat: NSColor? = nil
         var captionColour = Palette.dim
-        // A stretch of the caption drawn in its own colour: yellow for the part
-        // that needs attention, a tag's colour for its name.
-        var highlight: NSRange? = nil
-        var highlightColour = Palette.yellow
+        // Stretches of the caption drawn in their own colour: yellow for the
+        // part that needs attention, each tag's colour for its name.
+        var highlights: [(range: NSRange, colour: NSColor)] = []
         var captionIndent: CGFloat = 0
         switch key {
         case "topic":
@@ -3870,28 +4270,34 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             bottom = ""
         case "cwd":
-            // The preset dot leads the path, where the eye already goes to tell
-            // sessions apart; the caption lines up with the path, not the dot.
+            // The dots lead the path, where the eye already goes to tell sessions
+            // apart; the caption lines up with the path, not the dots.
+            let marks = tagStore.marks(s.session_id, s.project_dir)
             let line = NSMutableAttributedString()
-            if let dot = tagStore.dot(for: s.session_id) {
-                let mark = mono("●  ", dot.color)
-                captionIndent = ceil(mark.size().width)
-                line.append(mark)
+            if !marks.dots.isEmpty {
+                let dots = NSMutableAttributedString()
+                for dot in marks.dots { dots.append(mono("●", dot.color)) }
+                dots.append(mono("  ", Palette.text))
+                captionIndent = ceil(dots.size().width)
+                line.append(dots)
             }
             line.append(prose(s.cwd ?? "—", Palette.text))
             top = line
             // The name other sessions message this one by; the terminal it runs
             // in is in the tooltip. A finished session has no name, so its
-            // caption falls back to the terminal. A named tag comes first, in
-            // its own colour.
+            // caption falls back to the terminal. The named tags come first,
+            // each in its own colour.
             let name = session.peer_name ?? session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
-            if let tag = tagStore.tag(for: s.session_id) {
-                bottom = tag.name + (name.isEmpty ? "" : " · " + name)
-                highlight = NSRange(location: 0, length: (tag.name as NSString).length)
-                highlightColour = past ? tag.color.withAlphaComponent(0.6) : tag.color
-            } else {
-                bottom = name
+            var parts: [String] = []
+            var at = 0
+            for tag in marks.tags {
+                highlights.append((NSRange(location: at, length: (tag.name as NSString).length),
+                    past ? tag.color.withAlphaComponent(0.6) : tag.color))
+                parts.append(tag.name)
+                at += (tag.name as NSString).length + 3
             }
+            if !name.isEmpty { parts.append(name) }
+            bottom = parts.joined(separator: " · ")
         case "git":
             top = mono(gitText(s.git), Palette.text)
             bottom = gitWords(s.git)
@@ -3917,7 +4323,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 let kept = "v" + mine.prefix(same).map { $0 + "." }.joined()
                 let changed = mine.dropFirst(same).joined(separator: ".")
                 bottom = kept + changed + (age.isEmpty ? "" : " · " + age)
-                highlight = NSRange(location: (kept as NSString).length, length: (changed as NSString).length)
+                highlights = [(NSRange(location: (kept as NSString).length, length: (changed as NSString).length), Palette.yellow)]
             }
         case "context":
             return CellContent(
@@ -3978,12 +4384,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                     .paragraphStyle, value: style,
                     range: NSRange(location: stack.length - (bottom as NSString).length, length: (bottom as NSString).length))
             }
-            if let range = highlight {
-                // The caption starts after the top line and its newline.
-                let start = stack.length - (bottom as NSString).length
+            // The caption starts after the top line and its newline.
+            let start = stack.length - (bottom as NSString).length
+            for (range, colour) in highlights {
                 stack.addAttribute(
-                    .foregroundColor, value: highlightColour,
-                    range: NSRange(location: start + range.location, length: range.length))
+                    .foregroundColor, value: colour, range: NSRange(location: start + range.location, length: range.length))
             }
         }
 
@@ -4477,10 +4882,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return "CPU " + (load.cpuPercent.map { String(format: "%.0f percent", $0) } ?? "not yet measured")
                 + ", \(cpuTime(load.cpuSeconds)) in total"
         case "cwd":
-            let marks = [
-                tagStore.dot(for: s.session_id).map { "\($0.name.lowercased()) dot" },
-                tagStore.tag(for: s.session_id).map { "tag \($0.name)" },
-            ].compactMap { $0 }
+            let m = tagStore.marks(s.session_id, s.project_dir)
+            let marks = m.dots.map { "\($0.name.lowercased()) dot" } + m.tags.map { "tag \($0.name)" }
             return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? "")"
                 + (marks.isEmpty ? "" : ", " + marks.joined(separator: ", ")) + ". "
                 + "Double-click to show that terminal."
@@ -4727,6 +5130,7 @@ func buildMenu() {
         keyEquivalent: "\r")
     showItem.keyEquivalentModifierMask = [.command]
     sessionMenu.addItem(.separator())
+    sessionMenu.addItem(withTitle: "Tag Rules…", action: #selector(SessionsWindow.openTagRules), keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "Restart Outdated Sessions…", action: #selector(SessionsWindow.restartOutdatedSessions),
         keyEquivalent: "")
