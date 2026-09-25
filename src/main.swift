@@ -2872,7 +2872,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let columns: [Column] = [
         Column(key: "age", title: "Last Seen", width: 74),
         Column(key: "cwd", title: "Directory", width: 164),
-        Column(key: "tag", title: "Tag", width: 96),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "state", title: "State", width: 112),
         // Beside the state: what a session is doing and how long its cache has
@@ -3794,8 +3793,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // A background tint for the columns where the number is a temperature.
         var heat: NSColor? = nil
         var captionColour = Palette.dim
-        // A stretch of the caption drawn in yellow: the part that needs attention.
+        // A stretch of the caption drawn in its own colour: yellow for the part
+        // that needs attention, a tag's colour for its name.
         var highlight: NSRange? = nil
+        var highlightColour = Palette.yellow
         var captionIndent: CGFloat = 0
         switch key {
         case "topic":
@@ -3815,13 +3816,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             top = title
             // Claude Code's own name for the session, under the topic ours derives.
             bottom = s.session_name ?? ""
-        case "tag":
-            // The dot in its colour, then the named tag in its own.
-            let line = NSMutableAttributedString()
-            if let dot = tagStore.dot(for: s.session_id) { line.append(mono("●  ", dot.color)) }
-            if let tag = tagStore.tag(for: s.session_id) { line.append(prose(tag.name, tag.color)) }
-            top = line
-            bottom = ""
         case "state":
             let (word, colour) = stateWords(session, past: past)
             // The state and the permission mode share the top line; under them,
@@ -3876,11 +3870,28 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             bottom = ""
         case "cwd":
-            top = prose(s.cwd ?? "—", Palette.text)
+            // The preset dot leads the path, where the eye already goes to tell
+            // sessions apart; the caption lines up with the path, not the dot.
+            let line = NSMutableAttributedString()
+            if let dot = tagStore.dot(for: s.session_id) {
+                let mark = mono("●  ", dot.color)
+                captionIndent = ceil(mark.size().width)
+                line.append(mark)
+            }
+            line.append(prose(s.cwd ?? "—", Palette.text))
+            top = line
             // The name other sessions message this one by; the terminal it runs
             // in is in the tooltip. A finished session has no name, so its
-            // caption falls back to the terminal.
-            bottom = session.peer_name ?? session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
+            // caption falls back to the terminal. A named tag comes first, in
+            // its own colour.
+            let name = session.peer_name ?? session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
+            if let tag = tagStore.tag(for: s.session_id) {
+                bottom = tag.name + (name.isEmpty ? "" : " · " + name)
+                highlight = NSRange(location: 0, length: (tag.name as NSString).length)
+                highlightColour = past ? tag.color.withAlphaComponent(0.6) : tag.color
+            } else {
+                bottom = name
+            }
         case "git":
             top = mono(gitText(s.git), Palette.text)
             bottom = gitWords(s.git)
@@ -3971,7 +3982,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 // The caption starts after the top line and its newline.
                 let start = stack.length - (bottom as NSString).length
                 stack.addAttribute(
-                    .foregroundColor, value: Palette.yellow,
+                    .foregroundColor, value: highlightColour,
                     range: NSRange(location: start + range.location, length: range.length))
             }
         }
@@ -4328,11 +4339,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             switch key {
             case "topic": return (0, (s.topic ?? "~").lowercased())
             // Tagged sessions together, by tag, above the untagged.
-            case "tag":
-                let dot = tagStore.dot(for: s.session_id).flatMap { d in TagColour.all.firstIndex { $0.hex == d.hex } }
-                let name = tagStore.tag(for: s.session_id)?.name.lowercased()
-                if dot == nil && name == nil { return (Double(TagColour.all.count + 1), "") }
-                return (Double(dot ?? TagColour.all.count), name ?? "~")
             case "cwd": return (0, (s.cwd ?? "~").lowercased())
             case "git": return (0, (s.git?.branch ?? "~").lowercased())
             case "model": return (modelRank(s.model), (s.model ?? "").lowercased())
@@ -4454,12 +4460,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let s = session.summary
         let age = "\(ago(session.active_at ?? session.updated_at)) ago"
         switch key {
-        case "tag":
-            let words = [
-                tagStore.dot(for: s.session_id).map { "\($0.name) dot" },
-                tagStore.tag(for: s.session_id).map { "tag \($0.name)" },
-            ].compactMap { $0 }
-            return words.isEmpty ? "No tag" : words.joined(separator: ", ")
         case "topic":
             return "\(past ? "Finished" : "Live") session, \(s.topic ?? "no topic")"
                 + (s.session_name.map { ", named \($0)" } ?? "")
@@ -4477,7 +4477,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return "CPU " + (load.cpuPercent.map { String(format: "%.0f percent", $0) } ?? "not yet measured")
                 + ", \(cpuTime(load.cpuSeconds)) in total"
         case "cwd":
-            return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? ""). "
+            let marks = [
+                tagStore.dot(for: s.session_id).map { "\($0.name.lowercased()) dot" },
+                tagStore.tag(for: s.session_id).map { "tag \($0.name)" },
+            ].compactMap { $0 }
+            return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? "")"
+                + (marks.isEmpty ? "" : ", " + marks.joined(separator: ", ")) + ". "
                 + "Double-click to show that terminal."
         case "git": return "Branch \(gitText(s.git)), \(gitWords(s.git))"
         case "model": return "Model \(s.model_full ?? s.model ?? "unknown")"
