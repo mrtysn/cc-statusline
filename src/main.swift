@@ -5895,6 +5895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: SessionsWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        replaceOlderCopies()
         NSApp.setActivationPolicy(.regular)
         buildMenu()
         controller = SessionsWindow()
@@ -5905,6 +5906,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// One copy at a time, the newest: a rebuild, a copy started from
+    /// elsewhere and one opened from the Applications folder are separate
+    /// processes to macOS, and two would play every sound twice and drain the
+    /// same event queue. An older copy holds nothing unsaved, so one that does
+    /// not quit when asked is made to.
+    private func replaceOlderCopies() {
+        guard let id = Bundle.main.bundleIdentifier else { return }
+        let me = NSRunningApplication.current
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: id).filter { $0 != me }
+        guard !others.isEmpty else { return }
+        log("replacing \(others.count) older cop\(others.count == 1 ? "y" : "ies"): \(others.map(\.processIdentifier))")
+        others.forEach { $0.terminate() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            others.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
+        }
+    }
 }
 
 /// Without a menu the key equivalents do not exist, so ⌘Q and ⌘C do nothing.
