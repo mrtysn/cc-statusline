@@ -4078,7 +4078,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             filterChoices.append(nil)
             let colours = tagStore.file.repos.reduce(into: [String: String]()) { $0.merge($1.colors) { a, _ in a } }
             for name in repoTags {
-                add(name, colours[name].map { tagDot(TagColour(name: "", hex: $0).color) }, .tag(name))
+                add(name, tagDot(colours[name].map { TagColour(name: "", hex: $0).color } ?? .clear), .tag(name))
             }
         }
         filterPopup.selectItem(at: filterChoices.firstIndex { $0 == tagFilter && $0 != nil } ?? 0)
@@ -4740,23 +4740,26 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             item.state = has ? .on : .off
             item.indentationLevel = 1
-            if let hex = colours[name] { item.image = tagDot(TagColour(name: "", hex: hex).color) }
+            item.image = tagDot(colours[name].map { TagColour(name: "", hex: $0).color } ?? .clear)
             item.toolTip = repo.isAutomatic(name)
                 ? "Set by local-repos-list from git; a manual mine, fork or third-party replaces it"
                 : "\(has ? "Take \(name) off" : "Tag") \(repo.name) in local-repos-list"
             menu.addItem(item)
         }
         let add = ActionItem("Add Tag to Folder…") { [weak self] in self?.addRepoTag(repo) }
+        // A clear dot where there is no colour, so every name starts at the same place.
+        add.image = tagDot(.clear)
         add.indentationLevel = 1
         menu.addItem(add)
         guard !repo.tags.isEmpty else { return }
         let colourItem = NSMenuItem(title: "Tag Colours", action: nil, keyEquivalent: "")
         colourItem.indentationLevel = 1
+        colourItem.image = tagDot(.clear)
         let sub = NSMenu()
         sub.autoenablesItems = false
         for name in repo.tags {
             let item = NSMenuItem(title: name, action: nil, keyEquivalent: "")
-            if let hex = colours[name] { item.image = tagDot(TagColour(name: "", hex: hex).color) }
+            item.image = tagDot(colours[name].map { TagColour(name: "", hex: $0).color } ?? .clear)
             item.submenu = colourMenu(for: name, current: colours[name], done: done)
             sub.addItem(item)
         }
