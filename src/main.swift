@@ -669,7 +669,7 @@ struct RepoEntry: Codable, Equatable {
     var path: String
     var tags: [String] = []
     var colors: [String: String] = [:]
-    /// The tag git decides (mine, fork, third-party), which untag cannot take off.
+    /// The tag git decides (my, fork, third-party), which untag cannot take off.
     var auto_tag: String?
     var container: Bool = false
 
@@ -740,7 +740,7 @@ struct RepoSnapshot: Decodable, Equatable {
         /// The bare upper-case digits, as the app keeps colours; nil for none.
         var color: String?
         var folders: [String]
-        /// Set by local-repos-list itself (mine, fork, third-party, container)
+        /// Set by local-repos-list itself (my, fork, third-party, container)
         /// on the folders git or the tree decides; it can still be set by hand.
         var automatic: Bool
 
@@ -3437,7 +3437,7 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         nameLabel.textColor = info.color.map { TagColour(name: "", hex: $0).color } ?? Palette.text
         kindLabel.stringValue = !info.automatic ? ""
             : name == "container" ? "Automatic: on every folder that holds repos."
-            : "Automatic: git puts it on a folder with no mine, fork or third-party set by hand. It can be set by hand too."
+            : "Automatic: git puts it on a folder with no my, fork or third-party set by hand. It can be set by hand too."
 
         dotRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for (i, colour) in TagColour.all.enumerated() {
@@ -3652,7 +3652,7 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         remove.isEnabled = !automatic
         remove.toolTip = automatic
             ? (name == "container" ? "local-repos-list decides which folders are containers"
-                : "Set by local-repos-list from git; a manual mine, fork or third-party replaces it")
+                : "Set by local-repos-list from git; a manual my, fork or third-party replaces it")
             : "Take \(name) off \(folder)"
         // The name takes the room, so every button lines up at the right edge.
         let gap = NSView()
@@ -4742,7 +4742,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             item.indentationLevel = 1
             item.image = tagDot(colours[name].map { TagColour(name: "", hex: $0).color } ?? .clear)
             item.toolTip = repo.isAutomatic(name)
-                ? "Set by local-repos-list from git; a manual mine, fork or third-party replaces it"
+                ? "Set by local-repos-list from git; a manual my, fork or third-party replaces it"
                 : "\(has ? "Take \(name) off" : "Tag") \(repo.name) in local-repos-list"
             menu.addItem(item)
         }
