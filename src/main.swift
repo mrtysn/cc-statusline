@@ -3130,6 +3130,10 @@ final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         var parsed: [VerdictRow] = []
         for line in lines.suffix(Self.maxRows) {
             guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
+            // Outcome receipts (design doc section 13) share these files with
+            // the verdict rows they label; they carry no answers and would
+            // render as blank rows, so they are skipped like cc-statusline.js does.
+            if (obj["kind"] as? String) == "outcome" { continue }
             let answers = obj["answers"] as? [String: Any] ?? [:]
             var cells: [String: String] = [:]
             for (key, _) in order {

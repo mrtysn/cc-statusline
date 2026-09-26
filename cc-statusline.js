@@ -284,7 +284,10 @@ function readVerdictDisplay() {
 // (or reaches the file's size): the first may be cut mid-line by the chunk
 // boundary, so the last two are whole, and the reader can fall back from a
 // last line the hook is still appending to the one before it.
-function readLastLines(file) {
+// The last `count` lines of a file (default two), without reading the rest of
+// it. The last one may be partial while a writer is still appending it; the
+// caller parses each and skips what does not parse.
+function readLastLines(file, count = 2) {
   let size;
   try {
     size = statSync(file).size;
@@ -301,7 +304,7 @@ function readLastLines(file) {
       const buf = Buffer.alloc(want);
       readSync(fd, buf, 0, want, size - want);
       const lines = buf.toString('utf8').split('\n').filter((l) => l.trim());
-      if (lines.length >= 3 || want >= size) return lines.slice(want >= size ? 0 : 1).slice(-2);
+      if (lines.length >= count + 1 || want >= size) return lines.slice(want >= size ? 0 : 1).slice(-count);
       chunk *= 4;
     }
   } catch {
@@ -328,10 +331,16 @@ function readVerdict(sessionId, hook) {
   if (!safeSession || !safeHook) return null;
   const file = join(SYSTEM_ONE_SHADOW_DIR, safeHook, `${safeSession}.jsonl`);
   if (!existsSync(file)) return null;
+  // 6 lines, not 2: the prompt and stop hooks now interleave "outcome" rows
+  // (section 13 of the design doc -- receipts for scripts/system-one-receipts.py)
+  // among their own verdict rows, so the latest *verdict* can sit a few lines
+  // back from the end of the file. Skipped below.
   let entry = null;
-  for (const line of readLastLines(file).reverse()) {
+  for (const line of readLastLines(file, 6).reverse()) {
     try {
-      entry = JSON.parse(line);
+      const parsed = JSON.parse(line);
+      if (parsed?.kind === 'outcome') continue;
+      entry = parsed;
       break;
     } catch {}
   }
