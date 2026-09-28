@@ -111,9 +111,9 @@ One cache is shared by every session in `~/.cache/cc-statusline/` (override with
 |---|---|
 | `usage.json` | Last reading and the error of the last refresh, if any |
 | `refresh.lock` | Held while a refresh runs, so sessions never fetch in parallel |
-| `error.log` | One timestamped line per failed refresh: `keychain`, `network`, `http <status>`, or `parse` |
+| `error.log` | One timestamped line per failed refresh: `keychain`, `network`, `auth`, `http <status>`, or `parse` |
 
-A refresh starts when the cache is older than five minutes, or after one minute when the 7-day percentage in the status line input has moved since the last fetch. A failed refresh keeps the last good value and adds a red `!`; the next successful one clears it. The endpoint is undocumented: if its shape changes, the bar shows `󰫳 !` and `error.log` says `parse`.
+A refresh starts when the cache is older than five minutes, or after one minute when the 7-day percentage in the status line input has moved since the last fetch. A failed refresh keeps the last good value and adds a red `!`; the next successful one clears it. A 401 is retried once after 8 seconds with the keychain's current token, since Claude Code renews an expired one a moment after it lapses; both the first failure and a recovery are logged, and a second 401 is logged as `auth` and raises the `!`. The endpoint is undocumented: if its shape changes, the bar shows `󰫳 !` and `error.log` says `parse`.
 
 `scripts/probe-usage.zsh` calls the endpoint once and prints every limit window, for checking what the account currently reports.
 

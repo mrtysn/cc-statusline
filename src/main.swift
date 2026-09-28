@@ -4281,7 +4281,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 let since = clock(issue.first_seen)
                 return "\(issue.problem) — since \(since)"
                     + (issue.version.map { ", Claude Code \($0)" } ?? "") + ", seen \(issue.count)×"
-            }.joined(separator: "\n") + "\nDetails in error.log; cleared once parsing works again."
+            }.joined(separator: "\n") + "\nDetails in error.log; cleared once it works again."
         } else if key == "cpu", let cpu = toolCost.cpu {
             // The split, for when the total is worth looking into.
             cell.toolTip = String(format: "Status line redraws %.1f%%, app and its snapshots %.1f%%", cpu.redraws, cpu.app)

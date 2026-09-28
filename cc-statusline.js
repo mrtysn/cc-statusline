@@ -53,6 +53,8 @@ const REFRESH_MS = 5 * 60000;
 // Floor for the early refresh when the 7-day figure moves mid-turn.
 const MIN_REFRESH_MS = 60000;
 const LOCK_STALE_MS = 30000;
+// Wait before the one retry of a 401; 10s + this + 10s of timeouts stays under LOCK_STALE_MS.
+const AUTH_RETRY_MS = 8000;
 const LOG_MAX_BYTES = 256 * 1024;
 // Session topics: a manual one set by /statusline-topic, else one Haiku derives
 // from the transcript in the background.
@@ -481,6 +483,27 @@ function readOauthToken() {
 // Runs in the detached child. Keeps the last good reading on failure and
 // records the failure, so the statusline can mark the value stale. The token
 // is never renewed here: renewal rotates the refresh token under Claude Code.
+async function requestUsage() {
+  let token;
+  try {
+    token = readOauthToken();
+  } catch (err) {
+    throw new Error(`keychain: ${err.message}`);
+  }
+  try {
+    return await fetch(USAGE_URL, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (err) {
+    throw new Error(`network: ${err.cause?.code || err.message}`);
+  }
+}
+
 async function refreshUsage(sevenArg) {
   const previous = readUsageCache();
   const next = {
@@ -489,25 +512,20 @@ async function refreshUsage(sevenArg) {
     fable: previous?.fable ?? null,
     error: null,
   };
+  let authFailed = false;
   try {
-    let token;
-    try {
-      token = readOauthToken();
-    } catch (err) {
-      throw new Error(`keychain: ${err.message}`);
+    let res = await requestUsage();
+    // A token that has just expired is renewed by Claude Code on its next call, a
+    // moment later. Both the failure and the recovery are logged.
+    if (res.status === 401) {
+      logError(`auth: http 401, retrying in ${AUTH_RETRY_MS / 1000}s with the keychain's current token`);
+      await new Promise((resolve) => setTimeout(resolve, AUTH_RETRY_MS));
+      res = await requestUsage();
+      if (res.ok) logError('auth: recovered after retry');
     }
-    let res;
-    try {
-      res = await fetch(USAGE_URL, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'anthropic-beta': 'oauth-2025-04-20',
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-    } catch (err) {
-      throw new Error(`network: ${err.cause?.code || err.message}`);
+    if (res.status === 401 || res.status === 403) {
+      authFailed = true;
+      throw new Error(`auth: http ${res.status}, token expired or not yet renewed by Claude Code`);
     }
     if (!res.ok) throw new Error(`http ${res.status}`);
     let body;
@@ -531,6 +549,8 @@ async function refreshUsage(sevenArg) {
     // A changed or moved endpoint, not an outage: no network or no keychain
     // says nothing about the format.
     if (/^(parse|http)/.test(err.message)) checkFormat('usage/response', false, `usage endpoint: ${err.message}`);
+    // Rejected twice is a login problem, not a format one: still loud, worded as such.
+    else if (authFailed) checkFormat('usage/response', false, `usage endpoint rejected the login token: ${err.message}`);
   }
   try {
     const tmp = `${USAGE_FILE}.${process.pid}.tmp`;
