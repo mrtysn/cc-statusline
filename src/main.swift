@@ -14,6 +14,7 @@ import AudioToolbox
 import AVFoundation
 import CryptoKit
 import Foundation
+import MacAppBase
 
 // MARK: - Paths
 
@@ -68,26 +69,16 @@ func systemOneShadowFile(for sessionId: String, hook: String) -> URL? {
     return systemOneShadowDir.appendingPathComponent(safeHook).appendingPathComponent("\(safeSession).jsonl")
 }
 
-/// The checkout this bundle was built from; bundle.sh writes it into Info.plist.
+/// The checkout this bundle was built from; the build writes it into Info.plist.
 let repoDir: URL = {
-    if let p = Bundle.main.object(forInfoDictionaryKey: "CCStatuslineRepo") as? String, !p.isEmpty {
+    if let p = Checkout.directory(infoPlistKey: "CCStatuslineRepo") {
         return URL(fileURLWithPath: (p as NSString).expandingTildeInPath)
     }
     return home.appendingPathComponent("dev/cc-statusline")
 }()
 
 func log(_ message: String) {
-    let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-    guard let data = line.data(using: .utf8) else { return }
-    // The throwing calls, not seekToEndOfFile() and write(_:): those raise an
-    // Objective-C exception on a full disk, which Swift cannot catch.
-    if let handle = try? FileHandle(forWritingTo: logURL) {
-        _ = try? handle.seekToEnd()
-        try? handle.write(contentsOf: data)
-        try? handle.close()
-    } else {
-        try? data.write(to: logURL)
-    }
+    LogFile.append(message, to: logURL)
 }
 
 // MARK: - Model
@@ -5914,6 +5905,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
 // MARK: - Application
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: SessionsWindow?
 
@@ -5936,15 +5928,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// same event queue. An older copy holds nothing unsaved, so one that does
     /// not quit when asked is made to.
     private func replaceOlderCopies() {
-        guard let id = Bundle.main.bundleIdentifier else { return }
-        let me = NSRunningApplication.current
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: id).filter { $0 != me }
-        guard !others.isEmpty else { return }
-        log("replacing \(others.count) older cop\(others.count == 1 ? "y" : "ies"): \(others.map(\.processIdentifier))")
-        others.forEach { $0.terminate() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            others.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
-        }
+        SingleInstance.replaceOlder(replacing: { pids in
+            log("replacing \(pids.count) older cop\(pids.count == 1 ? "y" : "ies"): \(pids)")
+        })
     }
 }
 
@@ -6004,6 +5990,6 @@ func buildMenu() {
 }
 
 let app = NSApplication.shared
-let delegate = AppDelegate()
+let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 app.run()
