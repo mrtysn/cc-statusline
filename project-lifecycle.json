@@ -1,6 +1,7 @@
 {
   "kind": "mac-app",
   "name": "Agent Bar Hopping",
+  "tool": "agent-bar-hopping",
   "version": "1.0",
   "mac_app": {
     "bundle_id": "local.agent-bar-hopping",
