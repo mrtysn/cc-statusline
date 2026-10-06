@@ -272,6 +272,7 @@ func readSnapshot(columns: Int) -> Snapshot? {
     let script = repoDir.appendingPathComponent("cc-statusline.js")
     guard fm.isExecutableFile(atPath: script.path) else {
         log("cc-statusline.js not executable at \(script.path)")
+        Reporter.event("statusline-script-missing", severity: .error)
         return nil
     }
 
@@ -330,12 +331,14 @@ private func finishSnapshot(_ task: Process, _ pipe: Pipe) -> Snapshot? {
     guard task.terminationStatus == 0 else {
         let hint = task.terminationStatus == 127 ? " (node not found on PATH)" : ""
         log("cc-statusline.js live exited \(task.terminationStatus)\(hint)")
+        Reporter.event("snapshot-failed", ["exit": String(task.terminationStatus)], severity: .error)
         return nil
     }
     do {
         return try JSONDecoder().decode(Snapshot.self, from: data)
     } catch {
         log("decode failed: \(error)")
+        Reporter.event("snapshot-decode-failed", severity: .error)
         return nil
     }
 }
@@ -2734,9 +2737,13 @@ func bringITermForward(label: String) {
     do {
         try bring.run()
         bring.waitUntilExit()
-        if bring.terminationStatus != 0 { log("\(label): open -a iTerm exited \(bring.terminationStatus)") }
+        if bring.terminationStatus != 0 {
+            log("\(label): open -a iTerm exited \(bring.terminationStatus)")
+            Reporter.event("iterm-activation-failed", ["exit": String(bring.terminationStatus)], severity: .warn)
+        }
     } catch {
         log("\(label): open -a iTerm failed: \(error.localizedDescription)")
+        Reporter.event("iterm-activation-failed", severity: .warn)
     }
 }
 
@@ -5918,6 +5925,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller?.window?.makeKeyAndOrderFront(nil)
         controller?.focusTable()
         NSApp.activate(ignoringOtherApps: true)
+        // The receiver hears a launch and every stop; no heartbeat, the app is opened and quit by hand.
+        Reporter.start(tool: "agent-bar-hopping")
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
