@@ -325,20 +325,32 @@ func refreshUsageOnce() {
     }
 }
 
+/// Whether the current run of failed snapshots has been reported: one event per streak,
+/// not one per refresh.
+private var snapshotFailureReported = false
+
+private func reportSnapshotFailure(_ name: String, _ attributes: [String: String] = [:]) {
+    guard !snapshotFailureReported else { return }
+    snapshotFailureReported = true
+    Reporter.event(name, attributes, severity: .error)
+}
+
 private func finishSnapshot(_ task: Process, _ pipe: Pipe) -> Snapshot? {
     let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
     task.waitUntilExit()
     guard task.terminationStatus == 0 else {
         let hint = task.terminationStatus == 127 ? " (node not found on PATH)" : ""
         log("cc-statusline.js live exited \(task.terminationStatus)\(hint)")
-        Reporter.event("snapshot-failed", ["exit": String(task.terminationStatus)], severity: .error)
+        reportSnapshotFailure("snapshot-failed", ["exit": String(task.terminationStatus)])
         return nil
     }
     do {
-        return try JSONDecoder().decode(Snapshot.self, from: data)
+        let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
+        snapshotFailureReported = false
+        return snapshot
     } catch {
         log("decode failed: \(error)")
-        Reporter.event("snapshot-decode-failed", severity: .error)
+        reportSnapshotFailure("snapshot-decode-failed")
         return nil
     }
 }
