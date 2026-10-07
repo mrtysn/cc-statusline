@@ -2155,6 +2155,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
             column.title = title
             column.width = width
+            column.sortDescriptorPrototype = NSSortDescriptor(key: key, ascending: true)
             table.addTableColumn(column)
         }
         table.dataSource = self
@@ -2218,7 +2219,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
 
     /// The installed packs first, those the registry does not list among them,
     /// then the rest in the registry's order.
-    private func filter(selecting name: String?) {
+    private func filter(selecting name: String?, preview: Bool = true) {
         installed = store.installed
         let registry = store.packs
         let listed = Set(registry.map(\.name))
@@ -2231,6 +2232,34 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
                     .contains { $0.lowercased().contains(term) }
         }
         shown = matching.filter { installed.contains($0.name) } + matching.filter { !installed.contains($0.name) }
+        // A clicked header overrides the default order, installed packs first.
+        if let descriptor = table.sortDescriptors.first, let key = descriptor.key {
+            func text(_ pack: RegistryPack) -> String {
+                switch key {
+                case "name": return pack.display_name ?? pack.name
+                case "id": return pack.name
+                default: return pack.language ?? ""
+                }
+            }
+            func number(_ pack: RegistryPack) -> Int {
+                switch key {
+                case "sounds": return pack.sound_count ?? 0
+                case "size": return pack.total_size_bytes ?? 0
+                default: return installed.contains(pack.name) ? 1 : 0
+                }
+            }
+            let isText = ["name", "id", "language"].contains(key)
+            // Stable, so ties keep the default order.
+            let ordered = shown.enumerated().sorted { l, r in
+                let result: ComparisonResult = isText
+                    ? text(l.element).localizedStandardCompare(text(r.element))
+                    : number(l.element) < number(r.element) ? .orderedAscending
+                    : number(l.element) > number(r.element) ? .orderedDescending : .orderedSame
+                if result == .orderedSame { return l.offset < r.offset }
+                return (result == .orderedAscending) == descriptor.ascending
+            }
+            shown = ordered.map(\.element)
+        }
         table.reloadData()
         if let name = name, let row = shown.firstIndex(where: { $0.name == name }) {
             table.selectRowIndexes([row], byExtendingSelection: false)
@@ -2323,6 +2352,10 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
+
+    func tableView(_ tableView: NSTableView, sortDescriptorsDidChange old: [NSSortDescriptor]) {
+        filter(selecting: selected?.name, preview: false)
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard let key = tableColumn?.identifier.rawValue, row < shown.count else { return nil }
