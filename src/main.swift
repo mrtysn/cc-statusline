@@ -5452,16 +5452,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let units = Int((window / unit).rounded())
         var position = " "
         var marked: Int? = nil
+        var gonePercent = " "
         if let resets = limit.resets_at {
             let gone = window - (resets / 1000 - Date().timeIntervalSince1970)
             let current = min(units, max(1, Int(gone / unit) + 1))
-            // And how far through that hour or day it is.
-            let through = max(0, min(1, gone / unit - Double(current - 1)))
-            position = "\(unit == 3600 ? "hour" : "day") \(current) of \(units) · \(Int((through * 100).rounded()))%"
+            position = "\(unit == 3600 ? "hour" : "day") \(current) of \(units)"
+            // The share of the whole window gone, over the share column.
+            gonePercent = String(format: "%.0f%%", max(0, min(1, gone / window)) * 100)
             // Where this hour or day ends; on the last one the bar's end is it.
             if current < units { marked = current }
         }
-        grid.addRow(with: [NSView(), label(position, Palette.dim, small)])
+        grid.addRow(with: [NSView(), label(position, Palette.dim, small), label(gonePercent, Palette.dim, small)])
         let used = bar(percent / 100, colour)
         remember(used, title + " used")
         grid.addRow(with: [name, used, share, note])
