@@ -3651,7 +3651,16 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         default:
             return nil
         }
-        return field
+        // A label alone sits at the top of a taller row: centre it in a cell.
+        field.translatesAutoresizingMaskIntoConstraints = false
+        let cell = NSView()
+        cell.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
     }
 
     /// A folder carrying the selected tag, and a button to take it off unless
