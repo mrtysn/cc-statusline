@@ -2117,12 +2117,12 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         self.events = events
         controls = SoundControls(center: events, roomy: true)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 500),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = "Sound packs"
         // The controls draw in the sessions window's palette, which is dark.
         window.appearance = NSAppearance(named: .darkAqua)
-        window.contentMinSize = NSSize(width: 560, height: 300)
+        window.contentMinSize = NSSize(width: 700, height: 300)
         super.init(window: window)
         build()
         status.stringValue = "Loading the registry…"
@@ -2148,8 +2148,8 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         search.placeholderString = "Search name, language or description"
         search.delegate = self
         let columns: [(String, String, CGFloat)] = [
-            ("name", "Pack", 190), ("id", "ID", 130), ("language", "Lang", 50), ("sounds", "Sounds", 60), ("size", "Size", 70),
-            ("installed", "", 60),
+            ("name", "Pack", 210), ("id", "ID", 130), ("language", "Lang", 50), ("sounds", "Sounds", 60), ("size", "Size", 70),
+            ("installed", "State", 64),
         ]
         for (key, title, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
@@ -2246,7 +2246,8 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
                 switch key {
                 case "sounds": return pack.sound_count ?? 0
                 case "size": return pack.total_size_bytes ?? 0
-                default: return installed.contains(pack.name) ? 1 : 0
+                // In use, then installed, then not: ascending puts what is here first.
+                default: return pack.name == events.current.pack ? 0 : installed.contains(pack.name) ? 1 : 2
                 }
             }
             let isText = ["name", "id", "language"].contains(key)
