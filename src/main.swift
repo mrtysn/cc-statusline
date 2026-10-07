@@ -2148,7 +2148,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         search.placeholderString = "Search name, language or description"
         search.delegate = self
         let columns: [(String, String, CGFloat)] = [
-            ("name", "Pack", 220), ("language", "Lang", 50), ("sounds", "Sounds", 60), ("size", "Size", 70),
+            ("name", "Pack", 190), ("id", "ID", 130), ("language", "Lang", 50), ("sounds", "Sounds", 60), ("size", "Size", 70),
             ("installed", "", 60),
         ]
         for (key, title, width) in columns {
@@ -2330,6 +2330,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         let text: String
         switch key {
         case "name": text = pack.display_name ?? pack.name
+        case "id": text = pack.name
         case "language": text = pack.language ?? ""
         case "sounds": text = pack.sound_count.map(String.init) ?? ""
         case "size": text = pack.total_size_bytes.map { bytes(UInt64($0)) } ?? ""
@@ -2339,6 +2340,10 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         }
         let field = NSTextField(labelWithString: text)
         field.lineBreakMode = .byTruncatingTail
+        if key == "id" {
+            field.font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            field.textColor = .secondaryLabelColor
+        }
         field.toolTip = key == "name" ? [pack.name, pack.description].compactMap { $0 }.joined(separator: "\n") : nil
         field.translatesAutoresizingMaskIntoConstraints = false
         // In a cell of its own the text sits at the top of a taller row; centred
