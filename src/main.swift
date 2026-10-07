@@ -1369,6 +1369,18 @@ final class EventCenter {
             loadPack()
         }
         save()
+        // What is already sounding follows: muted stops it, a new volume applies to it.
+        if !settings.enabled { stopPlayback() } else { player.volume = settings.volume }
+    }
+
+    /// Whether a sound is sounding now.
+    var isPlaying: Bool { engine.isRunning && player.isPlaying }
+
+    private func stopPlayback() {
+        guard engine.isRunning else { return }
+        playCount += 1
+        player.stop()
+        engine.stop()
     }
 
     /// Reads the pack again, for when its files changed under the same name.
@@ -2059,6 +2071,8 @@ final class SoundControls: NSObject {
             if volume == 0 { $0.enabled = false } else if !$0.enabled { $0.enabled = true }
         }
         changed()
+        // A sound already playing takes the new volume as it is; a sample would cut it off.
+        guard !center.isPlaying else { return }
         if let sampler = sampler { sampler() } else { center.preview() }
     }
 
