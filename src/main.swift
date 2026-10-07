@@ -2851,6 +2851,11 @@ final class BarView: NSView {
                 (i == markedTick ? Palette.text : Palette.background).setFill()
                 tick((bounds.width * CGFloat(i) / CGFloat(divisions)).rounded())
             }
+            // The last hour or day ends at the bar's end, which is no gap.
+            if markedTick == divisions {
+                Palette.text.setFill()
+                tick(bounds.width - 1)
+            }
         }
         // Drawn last, so it wins where it falls on an hour or day.
         if let projection = projection, projection > 0 {
@@ -5607,8 +5612,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             position = "\(unit == 3600 ? "hour" : "day") \(current) of \(units)"
             // The share of the whole window gone, over the share column.
             gonePercent = String(format: "%.0f%%", max(0, min(1, gone / window)) * 100)
-            // Where this hour or day ends; on the last one the bar's end is it.
-            if current < units { marked = current }
+            // Where this hour or day ends; on the last one that is the bar's end.
+            marked = current
         }
         grid.addRow(with: [NSView(), label(position, Palette.dim, small), label(gonePercent, Palette.dim, shareFont)])
         let used = bar(percent / 100, colour)
