@@ -1370,9 +1370,7 @@ final class EventCenter {
         }
         save()
         // What is already sounding follows: muted stops it, a new volume applies to it.
-        let began = Date()
         if !settings.enabled { stopPlayback() } else { player.volume = settings.volume }
-        log("sound settings applied: enabled=\(settings.enabled) volume=\(settings.volume), \(Int(Date().timeIntervalSince(began) * 1000)) ms")
     }
 
     /// Whether a sound is sounding now.
@@ -1582,8 +1580,6 @@ final class EventCenter {
     /// buffer works. The engine runs only while a sound does, so the audio
     /// device is not held open between them.
     func playFile(_ url: URL) {
-        let began = Date()
-        defer { log("play \(url.lastPathComponent): \(Int(Date().timeIntervalSince(began) * 1000)) ms to start") }
         guard let file = try? AVAudioFile(forReading: url),
             let frames = AVAudioFrameCount(exactly: file.length),
             let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames),
