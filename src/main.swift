@@ -4145,7 +4145,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         packButton.isBordered = false
         packButton.target = self
         packButton.action = #selector(openPacks)
-        packButton.toolTip = "Hear, choose and install sound packs"
+        // A fixed width, so the name's length never moves the volume row beside it:
+        // 130pt holds 21 characters, which covers 95% of the registry's ids; the
+        // longest (31) is cut at the end and shown whole in the tooltip.
+        packButton.translatesAutoresizingMaskIntoConstraints = false
+        packButton.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        packButton.alignment = .right
+        packButton.lineBreakMode = .byTruncatingTail
         drawPackButton()
         verdictsToggle.isBordered = false
         verdictsToggle.target = self
@@ -4295,6 +4301,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             string: " ›", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim]))
         packButton.attributedTitle = title
         packButton.setAccessibilityLabel("Sound pack \(events.current.pack), choose another")
+        packButton.toolTip = "\(events.current.pack): hear, choose and install sound packs"
     }
 
     /// The per-session Verdicts view, from a session's Directory cell menu: an
