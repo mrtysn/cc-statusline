@@ -5481,7 +5481,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // minute after the reset would read as a runaway pace.
         if elapsed >= 0.02 {
             let pace = percent / elapsed
-            projection = "on pace for \(Int(pace.rounded()))%"
+            projection = "\(Int(pace.rounded()))%"
             projected = pace / 100
             if pace >= 100 {
                 projectionColour = Palette.red.withAlphaComponent(0.75)
@@ -5489,14 +5489,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 projectionColour = Palette.yellow.withAlphaComponent(0.75)
             }
         }
-        let elapsedText = String(format: "%.0f%%", elapsed * 100)
         let paceBar = bar(elapsed, ghost)
         remember(paceBar, title + " pace")
         paceBar.markedTick = marked
         paceBar.projection = projected
         grid.addRow(with: [
             label("pace target", ghost, NSFont.systemFont(ofSize: 11)), paceBar,
-            label(elapsedText, ghost, shareFont), label(projection, projectionColour, small),
+            label(projection.isEmpty ? " " : projection, projectionColour, shareFont),
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 2).xPlacement = .trailing
