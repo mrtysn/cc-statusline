@@ -3251,6 +3251,21 @@ func colourSwatch(_ color: NSColor, ringed: Bool) -> NSImage {
     }
 }
 
+/// A line of feedback that takes no room while it is empty.
+final class StatusLabel: NSTextField {
+    override var stringValue: String { didSet { isHidden = stringValue.isEmpty } }
+
+    init() {
+        super.init(frame: .zero)
+        isEditable = false
+        isBordered = false
+        drawsBackground = false
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+}
+
 /// Verdicts settings: which of system-one's verdicts the app reads, as a sheet
 /// over the list. One choice, each kind with the questions it scores, so the
 /// button on the list only has to say what is chosen.
@@ -3863,7 +3878,7 @@ func promptNewTag(store: TagStore, on window: NSWindow, note: String, then: @esc
 final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation,
     NSMenuDelegate
 {
-    private let statusLabel = NSTextField(labelWithString: "")
+    private let statusLabel = StatusLabel()
     private let quotaBar = NSStackView()
     private let gridScroll = NSScrollView()
     private let table = NSTableView()
@@ -4022,17 +4037,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
 
         buildSoundBar()
-        content.addSubview(statusLabel)
         content.addSubview(quotaBar)
         content.addSubview(soundBar)
         content.addSubview(gridScroll)
         content.addSubview(emptyLabel)
 
         NSLayoutConstraint.activate([
-            statusLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
-            quotaBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
+            quotaBar.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             quotaBar.trailingAnchor.constraint(lessThanOrEqualTo: soundBar.leadingAnchor, constant: -24),
             // The sound settings take the space right of the quotas.
@@ -4162,6 +4173,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         top.spacing = 8
         top.distribution = .fill
         // The list's controls, one row above the sound controls.
+        // A line of feedback shows above them only while it has something to say.
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360).isActive = true
+        soundBar.addArrangedSubview(statusLabel)
         soundBar.addArrangedSubview(listControls)
         soundBar.addArrangedSubview(top)
     }
