@@ -1946,9 +1946,9 @@ final class SoundControls: NSObject {
     /// Where a line of feedback goes.
     var report: (String) -> Void = { _ in }
 
-    /// `roomy` for the pack browser, where ▶ is the point of the window: the
-    /// largest glyph, on a target the size of a small button. The header's has
-    /// to fit beside the quotas, so it is smaller, on a smaller target.
+    /// `roomy` for the pack browser, where ▶ is the point of the window, on a
+    /// target the size of a small button. The header's has to fit beside the
+    /// quotas, so it has no ▶: the toggles alone.
     init(center: EventCenter, roomy: Bool = false) {
         self.center = center
         super.init()
@@ -1978,29 +1978,34 @@ final class SoundControls: NSObject {
             box.identifier = NSUserInterfaceItemIdentifier(event.key)
             return box
         }
-        // A ▶ beside each: its sounds one by one, in the pack's order.
-        previewButtons = Self.events.map { event in
+        // A ▶ beside each, in the pack browser only: its sounds one by one, in
+        // the pack's order. The header keeps just the toggles.
+        previewButtons = roomy ? Self.events.map { event in
             let play = NSButton(title: "", target: self, action: #selector(previewEvent))
             play.isBordered = false
             play.attributedTitle = NSAttributedString(
                 string: "▶",
-                attributes: [.font: NSFont.systemFont(ofSize: roomy ? 13 : 9), .foregroundColor: roomy ? Palette.text : Palette.dim])
+                attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: Palette.text])
             play.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
-                play.widthAnchor.constraint(equalToConstant: roomy ? 26 : 18),
-                play.heightAnchor.constraint(equalToConstant: roomy ? 22 : 18),
+                play.widthAnchor.constraint(equalToConstant: 26),
+                play.heightAnchor.constraint(equalToConstant: 22),
             ])
             play.identifier = NSUserInterfaceItemIdentifier(event.key)
             play.toolTip = "Play the next \(event.title) sound"
             play.setAccessibilityLabel("Preview \(event.title) sounds")
             return play
-        }
-        for (box, play) in zip(eventBoxes, previewButtons) {
-            let pair = NSStackView(views: [box, play])
-            pair.spacing = 2
-            // ▶ centres on the label: on a shared baseline it rides low.
-            pair.alignment = .centerY
-            eventRow.addArrangedSubview(pair)
+        } : []
+        if roomy {
+            for (box, play) in zip(eventBoxes, previewButtons) {
+                let pair = NSStackView(views: [box, play])
+                pair.spacing = 2
+                // ▶ centres on the label: on a shared baseline it rides low.
+                pair.alignment = .centerY
+                eventRow.addArrangedSubview(pair)
+            }
+        } else {
+            for box in eventBoxes { eventRow.addArrangedSubview(box) }
         }
         eventRow.spacing = roomy ? 6 : 8
         redraw()
