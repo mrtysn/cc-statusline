@@ -5565,7 +5565,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             view.heightAnchor.constraint(equalToConstant: 12).isActive = true
             return view
         }
-        let name = label(title, Palette.dim, NSFont.systemFont(ofSize: 12))
+        let name = label(title, Palette.dim, NSFont.systemFont(ofSize: 11))
         let small = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         let shareFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
 
