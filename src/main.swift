@@ -4041,8 +4041,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         top.spacing = 8
         top.distribution = .fill
         soundBar.addArrangedSubview(top)
-        soundBar.addArrangedSubview(soundControls.eventRow)
-        top.widthAnchor.constraint(equalTo: soundControls.eventRow.widthAnchor).isActive = true
     }
 
     /// system-one's verdict row on the status line: a text toggle in the
