@@ -3233,6 +3233,111 @@ func colourSwatch(_ color: NSColor, ringed: Bool) -> NSImage {
     }
 }
 
+/// Verdicts settings: which of system-one's verdicts the app reads, as a sheet
+/// over the list. One choice, each kind with the questions it scores, so the
+/// button on the list only has to say what is chosen.
+final class VerdictSettingsWindow: NSWindowController {
+    private let store: DisplayStore
+    private let onChange: () -> Void
+    private var radios: [String: NSButton] = [:]
+
+    /// "" is off; the others are the hooks that have a shadow log.
+    private static let choices: [(hook: String, title: String, detail: String)] = [
+        ("", "Off", "Reads no verdicts. A session's Verdicts window then opens on bash."),
+        ("bash", "Bash commands",
+         "Scores every shell command Claude runs, on four questions: irr (irreversible), for (foreign process), "
+         + "net (leaves the machine), ins (network install)."),
+        ("prompt", "Your prompts",
+         "Scores every prompt you send, on two questions: knd (what kind of prompt it is) and act (whether it asks for action)."),
+        ("stop", "Finished replies",
+         "Scores every reply Claude finishes, on two questions: lng (overlong) and tbl (a table that was not needed)."),
+    ]
+
+    init(store: DisplayStore, onChange: @escaping () -> Void) {
+        self.store = store
+        self.onChange = onChange
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "Verdicts"
+        window.appearance = NSAppearance(named: .darkAqua)
+        super.init(window: window)
+        build()
+        redraw()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        let intro = NSTextField(wrappingLabelWithString:
+            "system-one scores what happens in each session; a score is a verdict. Choose which kind this app reads. "
+            + "Right-click a session's Directory cell and pick Verdicts to see its calls, newest first, "
+            + "with the scores on the chosen kind. A score in yellow crossed its threshold.")
+        intro.font = NSFont.systemFont(ofSize: 12)
+        intro.textColor = .secondaryLabelColor
+
+        let list = NSStackView()
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 14
+        for choice in Self.choices {
+            let radio = NSButton(radioButtonWithTitle: choice.title, target: self, action: #selector(picked(_:)))
+            radio.identifier = NSUserInterfaceItemIdentifier(choice.hook)
+            radio.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            radios[choice.hook] = radio
+            let detail = NSTextField(wrappingLabelWithString: choice.detail)
+            detail.font = NSFont.systemFont(ofSize: 11)
+            detail.textColor = .secondaryLabelColor
+            detail.preferredMaxLayoutWidth = 440
+            let item = NSStackView(views: [radio, detail])
+            item.orientation = .vertical
+            item.alignment = .leading
+            item.spacing = 3
+            list.addArrangedSubview(item)
+        }
+
+        let done = NSButton(title: "Done", target: self, action: #selector(finish))
+        done.keyEquivalent = "\r"
+        for view in [intro, list, done] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            intro.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            intro.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            list.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 18),
+            list.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            list.trailingAnchor.constraint(lessThanOrEqualTo: intro.trailingAnchor),
+            done.topAnchor.constraint(greaterThanOrEqualTo: list.bottomAnchor, constant: 16),
+            done.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            done.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+        ])
+    }
+
+    private func redraw() {
+        let s = store.settings
+        let current = s.verdictRow ? s.verdictHook : ""
+        for (hook, radio) in radios { radio.state = hook == current ? .on : .off }
+    }
+
+    @objc private func picked(_ sender: NSButton) {
+        let hook = sender.identifier?.rawValue ?? ""
+        store.update {
+            $0.verdictHook = hook
+            $0.verdictRow = !hook.isEmpty
+        }
+        redraw()
+        onChange()
+    }
+
+    @objc private func finish() {
+        guard let window = window else { return }
+        window.sheetParent?.endSheet(window)
+    }
+}
+
 /// Repo Tags: every tag local-repos-list keeps, as a sheet over the list. The
 /// tags down the left, each with its colour and how many folders carry it;
 /// the selected one's colour and folders on the right. Every change goes
@@ -3775,6 +3880,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private lazy var repoTags = RepoTags(store: tagStore)
     /// Repo Tags, while it is open as a sheet over the list.
     private var repoTagsSheet: RepoTagsWindow?
+    /// The verdicts choice, while it is open as a sheet over the list.
+    private var verdictsSheet: VerdictSettingsWindow?
     /// Opens Repo Tags, beside the filter it feeds.
     private let repoTagsButton = NSButton(title: "", target: nil, action: nil)
     /// The tag filter and the verdicts toggle: what the list and the
@@ -4052,24 +4159,19 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let hook = displayStore.settings.verdictHook
         let on = displayStore.settings.verdictRow && !hook.isEmpty
         verdictsToggle.attributedTitle = NSAttributedString(
-            string: (on ? "\u{25CF} " : "\u{25CB} ") + "verdicts" + (on ? " (\(hook))" : ""),
+            string: (on ? "\u{25CF} " : "\u{25CB} ") + "verdicts: " + (on ? hook : "off") + "\u{2026}",
             attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
         verdictsToggle.toolTip =
-            "system-one's gate scores as a fourth status line row, for the shown hook's questions. "
-            + (on ? "Showing \(hook). Click to cycle or turn off." : "Off. Click to choose a hook.")
-        verdictsToggle.setAccessibilityLabel("Verdict row on the status line, \(on ? "on, \(hook)" : "off")")
+            on ? "The app reads system-one's \(hook) verdicts. Click to choose which kind."
+            : "No system-one verdicts are read. Click to choose which kind."
+        verdictsToggle.setAccessibilityLabel("Verdicts, \(on ? hook : "off"). Opens the choice")
     }
 
     @objc private func verdictsToggled() {
-        displayStore.update {
-            let next: [String] = ["", "bash", "prompt", "stop"]
-            let current = $0.verdictRow ? $0.verdictHook : ""
-            let idx = next.firstIndex(of: current) ?? 0
-            let hook = next[(idx + 1) % next.count]
-            $0.verdictHook = hook
-            $0.verdictRow = !hook.isEmpty
-        }
-        drawVerdictsToggle()
+        guard let window = window, window.attachedSheet == nil else { return }
+        let sheet = VerdictSettingsWindow(store: displayStore) { [weak self] in self?.drawVerdictsToggle() }
+        verdictsSheet = sheet
+        window.beginSheet(sheet.window!) { [weak self] _ in self?.verdictsSheet = nil }
     }
 
     /// "All sessions", then one entry per tag with its dot. A filter on a tag
