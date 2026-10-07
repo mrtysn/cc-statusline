@@ -5415,6 +5415,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         let name = label(title, Palette.dim, NSFont.systemFont(ofSize: 12))
         let small = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        let shareFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
 
         guard let limit = limit, let percent = limit.percent, let readAt = readAt else {
             // The same row as a reading, with the bar kept invisible, so the
@@ -5436,7 +5437,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         let colour = Palette.threshold(percent)
         let share = label(
-            "\(Int(percent.rounded()))%", colour, NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium))
+            "\(Int(percent.rounded()))%", colour, shareFont)
         // A reading only changes when a session redraws, so an old one is still
         // the truth — as long as the bar says how old it is.
         let age = Date().timeIntervalSince1970 - readAt / 1000
@@ -5462,7 +5463,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // Where this hour or day ends; on the last one the bar's end is it.
             if current < units { marked = current }
         }
-        grid.addRow(with: [NSView(), label(position, Palette.dim, small), label(gonePercent, Palette.dim, small)])
+        grid.addRow(with: [NSView(), label(position, Palette.dim, small), label(gonePercent, Palette.dim, shareFont)])
         let used = bar(percent / 100, colour)
         remember(used, title + " used")
         grid.addRow(with: [name, used, share, note])
@@ -5495,7 +5496,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         paceBar.projection = projected
         grid.addRow(with: [
             label("pace target", ghost, NSFont.systemFont(ofSize: 11)), paceBar,
-            label(elapsedText, ghost, small), label(projection, projectionColour, small),
+            label(elapsedText, ghost, shareFont), label(projection, projectionColour, small),
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 2).xPlacement = .trailing
