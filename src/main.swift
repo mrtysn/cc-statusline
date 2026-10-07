@@ -5455,7 +5455,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if let resets = limit.resets_at {
             let gone = window - (resets / 1000 - Date().timeIntervalSince1970)
             let current = min(units, max(1, Int(gone / unit) + 1))
-            position = "\(unit == 3600 ? "hour" : "day") \(current) of \(units)"
+            // And how far through that hour or day it is.
+            let through = max(0, min(1, gone / unit - Double(current - 1)))
+            position = "\(unit == 3600 ? "hour" : "day") \(current) of \(units) · \(Int((through * 100).rounded()))%"
             // Where this hour or day ends; on the last one the bar's end is it.
             if current < units { marked = current }
         }
