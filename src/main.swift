@@ -2793,7 +2793,8 @@ final class BarView: NSView {
     /// or day, the share a steady pace would have used by then.
     var markedTick: Int? { didSet { needsDisplay = true } }
     /// A blue tick at this share of the bar: where the pace row's projection
-    /// lands by the reset. Nil, or past the end, draws none.
+    /// lands by the reset. At 100% or more it is red, on the bar's last pixel.
+    /// Nil draws none.
     var projection: Double? { didSet { needsDisplay = true } }
 
     static let thickness: CGFloat = 4
@@ -2829,9 +2830,10 @@ final class BarView: NSView {
             }
         }
         // Drawn last, so it wins where it falls on an hour or day.
-        if let projection = projection, projection > 0, projection < 1 {
-            Palette.blue.setFill()
-            tick((bounds.width * CGFloat(projection)).rounded())
+        if let projection = projection, projection > 0 {
+            // Past the end the tick stops at the last pixel, in red.
+            (projection < 1 ? Palette.blue : Palette.red).setFill()
+            tick(min(bounds.width - 1, (bounds.width * CGFloat(projection)).rounded()))
         }
     }
 }
