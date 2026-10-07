@@ -2909,7 +2909,7 @@ final class BarView: NSView {
 /// which a right- or left-aligned title otherwise touches.
 final class PaddedHeaderCell: NSTableHeaderCell {
     override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
-        super.drawInterior(withFrame: cellFrame.insetBy(dx: 6, dy: 0), in: controlView)
+        super.drawInterior(withFrame: cellFrame.insetBy(dx: 4, dy: 0), in: controlView)
     }
 }
 
