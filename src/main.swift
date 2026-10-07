@@ -4229,7 +4229,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         toolCost = (cost, footprint)
         healthIssues = snapshot.health ?? []
         latest.refreshIfDue()
-        if noteToken == nil { statusLabel.stringValue = counts }
+        if noteToken == nil { statusLabel.stringValue = "" }
         emptyLabel.stringValue = allRows.isEmpty
             ? "No session has drawn a status line yet." : "No session has \(filterWords)."
         emptyLabel.isHidden = !rows.isEmpty
@@ -4259,7 +4259,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                     + (healthIssues.count > 1 ? " (+\(healthIssues.count - 1) more)" : "")
                 colour = Palette.red
             } else {
-                text = "cc-statusline"
+                text = "cc-statusline · " + counts
             }
         case "started":
             // Every session's version is held against this one.
@@ -4966,7 +4966,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         noteToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             guard let self = self, self.noteToken == token else { return }
-            self.statusLabel.stringValue = self.counts
+            self.statusLabel.stringValue = ""
         }
     }
 
