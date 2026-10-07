@@ -4005,7 +4005,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         buildSoundBar()
         content.addSubview(statusLabel)
-        content.addSubview(listControls)
         content.addSubview(quotaBar)
         content.addSubview(soundBar)
         content.addSubview(gridScroll)
@@ -4014,10 +4013,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            // The list's controls on the same line as its counts, at the right.
-            listControls.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
-            listControls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: listControls.leadingAnchor, constant: -24),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
             quotaBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             quotaBar.trailingAnchor.constraint(lessThanOrEqualTo: soundBar.leadingAnchor, constant: -24),
@@ -4147,6 +4143,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
         top.distribution = .fill
+        // The list's controls, one row above the sound controls.
+        soundBar.addArrangedSubview(listControls)
         soundBar.addArrangedSubview(top)
     }
 
@@ -4159,7 +4157,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let hook = displayStore.settings.verdictHook
         let on = displayStore.settings.verdictRow && !hook.isEmpty
         verdictsToggle.attributedTitle = NSAttributedString(
-            string: (on ? "\u{25CF} " : "\u{25CB} ") + "verdicts: " + (on ? hook : "off") + "\u{2026}",
+            string: (on ? "\u{25CF} " : "\u{25CB} ") + "verdicts: " + (on ? hook : "off"),
             attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
         verdictsToggle.toolTip =
             on ? "The app reads system-one's \(hook) verdicts. Click to choose which kind."
