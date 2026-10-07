@@ -2219,7 +2219,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
 
     /// The installed packs first, those the registry does not list among them,
     /// then the rest in the registry's order.
-    private func filter(selecting name: String?, preview: Bool = true) {
+    private func filter(selecting name: String?) {
         installed = store.installed
         let registry = store.packs
         let listed = Set(registry.map(\.name))
@@ -2354,7 +2354,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
     func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange old: [NSSortDescriptor]) {
-        filter(selecting: selected?.name, preview: false)
+        filter(selecting: selected?.name)
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
