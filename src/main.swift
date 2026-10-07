@@ -5615,7 +5615,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // Where this hour or day ends; on the last one that is the bar's end.
             marked = current
         }
-        grid.addRow(with: [NSView(), label(position, Palette.dim, small), label(gonePercent, Palette.dim, shareFont), note])
+        grid.addRow(with: [NSView(), label(position, Palette.dim, small), label(gonePercent, Palette.dim, small), note])
         let used = bar(percent / 100, colour)
         remember(used, title + " used")
         grid.addRow(with: [name, used, share])
