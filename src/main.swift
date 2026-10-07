@@ -5494,7 +5494,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         paceBar.markedTick = marked
         paceBar.projection = projected
         grid.addRow(with: [
-            label("pace target", ghost, NSFont.systemFont(ofSize: 11)), paceBar,
+            label("pace", ghost, NSFont.systemFont(ofSize: 11)), paceBar,
             label(projection.isEmpty ? " " : projection, projectionColour, shareFont),
         ])
         grid.column(at: 0).xPlacement = .trailing
