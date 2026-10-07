@@ -6147,7 +6147,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller?.showWindow(nil)
         controller?.window?.makeKeyAndOrderFront(nil)
         controller?.focusTable()
+        // Inside this callback the app has not finished launching, and macOS
+        // drops an activation made before it has; ask again on the next turn
+        // of the run loop, once the window is up, with the call macOS 14+ honours.
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async {
+            if #available(macOS 14.0, *) {
+                NSApp.activate()
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            self.controller?.window?.makeKeyAndOrderFront(nil)
+        }
         // The receiver hears a launch and every stop; no heartbeat, the app is opened and quit by hand.
         Reporter.start(tool: "agent-bar-hopping")
     }
