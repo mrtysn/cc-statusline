@@ -2154,6 +2154,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
         for (key, title, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
             column.title = title
+            column.headerCell = PaddedHeaderCell(textCell: title)
             column.width = width
             column.sortDescriptorPrototype = NSSortDescriptor(key: key, ascending: true)
             table.addTableColumn(column)
@@ -2901,6 +2902,14 @@ final class BarView: NSView {
             (projection < 1 ? Palette.blue : Palette.red).setFill()
             tick(min(bounds.width - 1, (bounds.width * CGFloat(projection)).rounded()))
         }
+    }
+}
+
+/// A column header whose text keeps clear of the separators on either side,
+/// which a right- or left-aligned title otherwise touches.
+final class PaddedHeaderCell: NSTableHeaderCell {
+    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        super.drawInterior(withFrame: cellFrame.insetBy(dx: 6, dy: 0), in: controlView)
     }
 }
 
@@ -4141,6 +4150,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         for spec in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(spec.key))
             column.title = spec.title
+            column.headerCell = PaddedHeaderCell(textCell: spec.title)
             column.width = spec.width
             column.minWidth = 16
             // A header follows its cells, or the two disagree. Model and effort
