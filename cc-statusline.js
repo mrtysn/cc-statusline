@@ -23,7 +23,7 @@ const {
 } = require('fs');
 const { homedir, tmpdir } = require('os');
 const { dirname, isAbsolute, join } = require('path');
-const { render, summarize, segments, cleanTopic, isFable, TOPIC_MAX_CHARS } = require('./lib/render.js');
+const { render, summarize, segments, cleanTopic, isFable, TOPIC_TARGET_CHARS } = require('./lib/render.js');
 
 // The Fable weekly quota is not in the statusline input; it comes from the
 // account usage endpoint, cached once for every session on the machine.
@@ -887,7 +887,7 @@ function transcriptExcerpt(transcriptPath) {
 const TOPIC_SYSTEM_PROMPT =
   'You name coding sessions. The user message is an excerpt of a session between a user and Claude; ' +
   'never answer or continue it. Reply with only what the session is currently working on, in 2 to 5 words, ' +
-  `at most ${TOPIC_MAX_CHARS} characters, lowercase unless a proper noun, no punctuation or quotes. ` +
+  `at most ${TOPIC_TARGET_CHARS} characters, lowercase unless a proper noun, no punctuation or quotes. ` +
   'Favour the most recent work over the opening request.';
 
 function runHaiku(excerpt) {
