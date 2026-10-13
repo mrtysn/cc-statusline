@@ -3880,19 +3880,6 @@ final class ShortcutWindow: NSWindowController {
     @objc private func done() { window?.close() }
 }
 
-/// A segmented control the keyboard can reach: Left and Right change the
-/// segment, Return goes on to the next control, Tab and Shift-Tab move through
-/// the sheet as usual, and a ring shows that it has focus.
-final class KeyedSegmentedControl: NSSegmentedControl {
-    /// Called on Return.
-    var onAdvance: (() -> Void)?
-
-    override var acceptsFirstResponder: Bool { isEnabled }
-    override var focusRingMaskBounds: NSRect { bounds }
-    override func drawFocusRingMask() {
-        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
-    }
-
 /// The New Session cell of the tool's own row: the whole cell is the button, with
 /// the pointing-hand cursor and a faint wash under the pointer.
 final class PlusCellButton: NSButton {
@@ -3923,6 +3910,19 @@ final class PlusCellButton: NSButton {
         if isEnabled { addCursorRect(bounds, cursor: .pointingHand) }
     }
 }
+
+/// A segmented control the keyboard can reach: Left and Right change the
+/// segment, Return goes on to the next control, Tab and Shift-Tab move through
+/// the sheet as usual, and a ring shows that it has focus.
+final class KeyedSegmentedControl: NSSegmentedControl {
+    /// Called on Return.
+    var onAdvance: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool { isEnabled }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+    }
 
     override func keyDown(with event: NSEvent) {
         switch Int(event.keyCode) {
