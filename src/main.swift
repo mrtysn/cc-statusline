@@ -3908,10 +3908,12 @@ final class UsageWindow: NSWindowController {
         return field
     }
 
-    private func bar(_ percent: Double) -> BarView {
+    /// `limit` bars take the quota thresholds' yellow and red; a share of the week is
+    /// statistics, not a limit, and stays neutral however high it is.
+    private func bar(_ percent: Double, limit: Bool = true) -> BarView {
         let view = BarView()
         view.fraction = max(0, min(1, percent / 100))
-        view.colour = Palette.threshold(percent)
+        view.colour = limit ? Palette.threshold(percent) : Palette.text
         view.translatesAutoresizingMaskIntoConstraints = false
         view.widthAnchor.constraint(equalToConstant: 120).isActive = true
         view.heightAnchor.constraint(equalToConstant: 12).isActive = true
@@ -3924,10 +3926,10 @@ final class UsageWindow: NSWindowController {
     }
 
     /// One row: name, a bar, and the reading in words. A nil bar leaves the cell empty.
-    private func row(_ name: String, bar percent: Double?, _ reading: String, _ note: String = "") {
+    private func row(_ name: String, bar percent: Double?, limit: Bool = true, _ reading: String, _ note: String = "") {
         grid.addRow(with: [
             label(name, Palette.dim, size: 11),
-            percent.map { bar($0) } ?? NSView(),
+            percent.map { bar($0, limit: limit) } ?? NSView(),
             label(reading, weight: .medium),
             label(note, Palette.dim, size: 11),
         ])
@@ -3975,7 +3977,7 @@ final class UsageWindow: NSWindowController {
         }
         if let surfaces = usage.surfaces, !surfaces.isEmpty {
             heading("THIS WEEK BY SURFACE")
-            for surface in surfaces { row(surface.name, bar: surface.percent, "\(Int(surface.percent.rounded()))%") }
+            for surface in surfaces { row(surface.name, bar: surface.percent, limit: false, "\(Int(surface.percent.rounded()))%") }
         }
         heading("")
         var footer = usage.read_at.map { "read \(ago($0)) ago" } ?? "never read"
