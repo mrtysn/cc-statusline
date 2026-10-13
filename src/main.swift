@@ -3554,6 +3554,19 @@ struct CloMenu: Decodable {
     let last: String?
     let effort: [String: String]?
 
+    /// The models smallest to largest, as clo's number shortcuts run (1 Haiku, 2 Sonnet,
+    /// 3 Opus, 4 Fable): by the family word in a model's value or label, a model of no
+    /// known family last, the rest keeping the order clo gave them.
+    func ordered() -> CloMenu {
+        let families = ["haiku", "sonnet", "opus", "fable"]
+        func rank(_ model: Model) -> Int {
+            let text = (model.value + " " + model.label).lowercased()
+            return families.firstIndex { text.contains($0) } ?? families.count
+        }
+        let sorted = models.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+        return CloMenu(models: sorted.map(\.element), last: last, effort: effort)
+    }
+
     /// Runs `clo --menu-json`. Blocks; call it off the main thread. The error
     /// is a sentence for the sheet.
     static func load() -> Result<CloMenu, CloMenuError> {
@@ -4238,7 +4251,8 @@ final class NewSessionWindow: NSWindowController, NSWindowDelegate, NSTextFieldD
         case .failure(let error):
             modelControl.setLabel("\u{2014}", forSegment: 0)
             show(error.message)
-        case .success(let menu):
+        case .success(let received):
+            let menu = received.ordered()
             cloMenu = menu
             modelControl.segmentCount = menu.models.count
             for (index, model) in menu.models.enumerated() { modelControl.setLabel(model.label, forSegment: index) }
