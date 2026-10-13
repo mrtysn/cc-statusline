@@ -5362,6 +5362,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 bottom = "✻ \(running == 1 ? "1 agent" : "\(running) agents")"
                 captionColour = Palette.orange
             }
+            // A standing permission is shown where it is used: the guard that
+            // asks before network code runs over ssh is off for this session.
+            if !past, let id = s.session_id, sshGuard.bypassed(id) {
+                if bottom.isEmpty { captionColour = Palette.yellow }
+                bottom = bottom.isEmpty ? "ssh open" : bottom + " · ssh open"
+            }
         case "tokens":
             top = mono(session.transcript?.tokens.map { tokens($0.total) } ?? "—", Palette.text)
             bottom = s.lines.map { "+\(Int($0.added)) −\(Int($0.removed))" } ?? ""
@@ -6028,7 +6034,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return "\(past ? "Finished" : "Live") session, \(s.topic ?? "no topic")"
                 + (s.session_name.map { ", named \($0)" } ?? "")
         case "state":
-            let caption = stateCaption(session.transcript)
+            var caption = stateCaption(session.transcript)
+            if !past, let id = s.session_id, sshGuard.bypassed(id) {
+                caption += caption.isEmpty ? "ssh guard bypassed" : ", ssh guard bypassed"
+            }
             return "State \(stateWords(session, past: past).0)" + (caption.isEmpty ? "" : ", \(caption)")
         case "tokens":
             return "Tokens \(session.transcript?.tokens.map { tokens($0.total) } ?? "unknown")"
