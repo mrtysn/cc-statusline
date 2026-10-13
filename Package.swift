@@ -3,14 +3,24 @@ import Foundation
 import PackageDescription
 
 // project-lifecycle builds with PROJECT_LIFECYCLE_PACKAGE set to its own checkout, so the
-// shared package comes from disk. A plain `swift build` fetches it instead.
+// shared package comes from disk. Without it (an editor's SourceKit-LSP, a plain `swift build`) the
+// checkout project-lifecycle last recorded is used, which keeps a pin of the remote branch out of
+// Package.resolved; only a machine that never ran project-lifecycle fetches it.
+func recordedCheckout() -> String? {
+    let environment = ProcessInfo.processInfo.environment
+    let base = environment["XDG_CONFIG_HOME"] ?? ((environment["HOME"] ?? "") + "/.config")
+    guard let text = try? String(contentsOfFile: base + "/project-lifecycle/checkout", encoding: .utf8) else { return nil }
+    let path = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return FileManager.default.fileExists(atPath: path + "/Package.swift") ? path : nil
+}
+
 let senders: Set<Package.Dependency.Trait> = [
     .trait(name: "OperationalReports", condition: .when(traits: ["OperationalReports"])),
     .trait(name: "UsageAnalytics", condition: .when(traits: ["UsageAnalytics"])),
 ]
 
 let shared: Package.Dependency =
-    ProcessInfo.processInfo.environment["PROJECT_LIFECYCLE_PACKAGE"].map { .package(path: $0, traits: senders) }
+    (ProcessInfo.processInfo.environment["PROJECT_LIFECYCLE_PACKAGE"] ?? recordedCheckout()).map { .package(path: $0, traits: senders) }
     ?? .package(url: "git@github.com:mrtysn/project-lifecycle.git", branch: "main", traits: senders)
 
 let package = Package(
