@@ -5089,6 +5089,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let hotKey = GlobalHotKey()
     private var shortcutWindow: ShortcutWindow?
     private var usageWindow: UsageWindow?
+    /// The info icon beside the quotas that opens the Usage window.
+    private let usageButton = NSButton(title: "", target: nil, action: nil)
     /// The newest usage reading, kept so the window opens with it at once.
     private var lastUsage: UsageSummary?
     /// The tag filter and the verdicts toggle: what the list and the
@@ -5177,6 +5179,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         quotaBar.spacing = 32
         quotaBar.translatesAutoresizingMaskIntoConstraints = false
         quotaBar.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(openUsage)))
+        usageButton.isBordered = false
+        usageButton.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Usage")
+        usageButton.contentTintColor = Palette.dim
+        usageButton.target = self
+        usageButton.action = #selector(openUsage)
+        usageButton.toolTip = "Usage: credits, monthly spend, Fable's share and the week by surface"
+        usageButton.translatesAutoresizingMaskIntoConstraints = false
 
         buildColumns()
         table.dataSource = self
@@ -5224,6 +5233,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         buildSoundBar()
         content.addSubview(quotaBar)
+        content.addSubview(usageButton)
         content.addSubview(soundBar)
         content.addSubview(gridScroll)
         content.addSubview(emptyLabel)
@@ -5231,7 +5241,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         NSLayoutConstraint.activate([
             quotaBar.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            quotaBar.trailingAnchor.constraint(lessThanOrEqualTo: soundBar.leadingAnchor, constant: -24),
+            usageButton.leadingAnchor.constraint(equalTo: quotaBar.trailingAnchor, constant: 8),
+            usageButton.topAnchor.constraint(equalTo: quotaBar.topAnchor),
+            usageButton.trailingAnchor.constraint(lessThanOrEqualTo: soundBar.leadingAnchor, constant: -16),
             // The sound settings take the space right of the quotas.
             soundBar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             // Level with the bottom of the quotas, so it sits on the table.
@@ -5741,10 +5753,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         select(keep)
     }
 
-    /// The window never narrows past the top row: the quotas, a gap and the sound controls side by side.
+    /// The window never narrows past the top row: the quotas, the usage icon, a gap and the sound controls side by side.
     private func fitMinimumWidth() {
         guard let window else { return }
-        let needed = ceil(16 + quotaBar.fittingSize.width + 24 + soundBar.fittingSize.width + 16)
+        let needed = ceil(16 + quotaBar.fittingSize.width + 8 + usageButton.fittingSize.width + 16 + soundBar.fittingSize.width + 16)
         let minimum = NSSize(width: max(720, needed), height: window.contentMinSize.height)
         guard minimum != window.contentMinSize else { return }
         window.contentMinSize = minimum
@@ -7533,6 +7545,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             problems = ["fixture did not decode: \(error)"]
         }
         problems += UsageWindow.selfTestProblems()
+        // CC_SESSIONS_WINDOW_PNG=<path> saves the list window's picture, to read its top row without opening the app.
+        if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_PNG"],
+            let content = controller?.window?.contentView,
+            let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+        {
+            content.cacheDisplay(in: content.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+        }
         try? fm.removeItem(at: selfTestRoot)
         for problem in problems { print("self-test: \(problem)") }
         print(problems.isEmpty ? "self-test: every check passed" : "self-test: \(problems.count) failed")
