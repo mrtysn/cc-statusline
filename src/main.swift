@@ -6598,8 +6598,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // A standing permission is shown where it is used: the guard that
             // asks before network code runs over ssh is off for this session.
             if !past, let id = s.session_id, sshGuard.bypassed(id) {
-                if bottom.isEmpty { captionColour = Palette.yellow }
-                bottom = bottom.isEmpty ? "ssh⚠" : bottom + " · ssh⚠"
+                // Yellow in either case: beside the agent count the caption is
+                // orange, so the warning is coloured on its own range.
+                if !bottom.isEmpty { bottom += " · " }
+                highlights.append((NSRange(location: (bottom as NSString).length, length: ("ssh⚠" as NSString).length), Palette.yellow))
+                bottom += "ssh⚠"
             }
         case "tokens":
             top = mono(session.transcript?.tokens.map { tokens($0.total) } ?? "—", Palette.text)
