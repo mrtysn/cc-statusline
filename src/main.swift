@@ -5366,7 +5366,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // asks before network code runs over ssh is off for this session.
             if !past, let id = s.session_id, sshGuard.bypassed(id) {
                 if bottom.isEmpty { captionColour = Palette.yellow }
-                bottom = bottom.isEmpty ? "ssh open" : bottom + " · ssh open"
+                bottom = bottom.isEmpty ? "ssh⚠" : bottom + " · ssh⚠"
             }
         case "tokens":
             top = mono(session.transcript?.tokens.map { tokens($0.total) } ?? "—", Palette.text)
