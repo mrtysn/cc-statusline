@@ -5121,6 +5121,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         window.subtitle = "Agent Bar Hopping"
         window.titlebarAppearsTransparent = true
         window.backgroundColor = Palette.background
+        window.clearFocusAtLaunch()
         super.init(window: window)
         build()
         // The window is exactly as wide as its columns, the spacing between them
