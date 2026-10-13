@@ -4743,7 +4743,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(openNewSession))
         button.isBordered = false
         button.imagePosition = .imageOnly
-        button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .bold)
         button.contentTintColor = Palette.dim
         button.isEnabled = available
         button.toolTip = available ? "New session" : "clo not on PATH"
@@ -4752,7 +4752,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let cell = NSView()
         cell.addSubview(button)
         NSLayoutConstraint.activate([
-            button.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            button.centerXAnchor.constraint(equalTo: cell.centerXAnchor),
             button.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
