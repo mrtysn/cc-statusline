@@ -3518,6 +3518,401 @@ final class VerdictSettingsWindow: NSWindowController {
     }
 }
 
+/// `clo`, found on the PATH the other CLIs get (`scriptProcess`): nil when it
+/// is not installed. Logged once per run, as a missing cc-statusline.js is.
+let cloPath: String? = {
+    let path = scriptProcess(URL(fileURLWithPath: "/usr/bin/true"), []).environment?["PATH"] ?? ""
+    for dir in path.split(separator: ":") {
+        let candidate = String(dir) + "/clo"
+        if fm.isExecutableFile(atPath: candidate) { return candidate }
+    }
+    log("clo not on PATH")
+    Reporter.event("clo-missing", severity: .warn)
+    return nil
+}()
+
+/// Single-quotes a word for the shell, so a folder or a first message with
+/// quotes, spaces or `$` reaches `clo` as one argument.
+func shellQuoted(_ text: String) -> String {
+    "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+struct CloMenuError: Error {
+    /// A sentence for the sheet.
+    let message: String
+}
+
+/// What `clo --menu-json` prints: the model menu, the last model picked, and
+/// each model's remembered effort.
+struct CloMenu: Decodable {
+    struct Model: Decodable {
+        let value: String
+        let label: String
+    }
+    let models: [Model]
+    let last: String?
+    let effort: [String: String]?
+
+    /// Runs `clo --menu-json`. Blocks; call it off the main thread. The error
+    /// is a sentence for the sheet.
+    static func load() -> Result<CloMenu, CloMenuError> {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        task.arguments = ["clo", "--menu-json"]
+        task.environment = scriptProcess(URL(fileURLWithPath: "/usr/bin/true"), []).environment
+        let out = Pipe()
+        let err = Pipe()
+        task.standardOutput = out
+        task.standardError = err
+        task.standardInput = FileHandle.nullDevice
+        do { try task.run() } catch {
+            log("clo --menu-json: \(error.localizedDescription)")
+            return .failure(CloMenuError(message: "clo did not start: \(error.localizedDescription)"))
+        }
+        let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
+        let message = String(decoding: (try? err.fileHandleForReading.readToEnd()) ?? Data(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else {
+            log("clo --menu-json exited \(task.terminationStatus): \(message)")
+            return .failure(CloMenuError(message: "clo --menu-json failed (exit \(task.terminationStatus)). \(message)"))
+        }
+        guard let menu = try? JSONDecoder().decode(CloMenu.self, from: data), !menu.models.isEmpty else {
+            log("clo --menu-json: output not understood")
+            return .failure(CloMenuError(message: "clo --menu-json printed something this app does not understand."))
+        }
+        return .success(menu)
+    }
+}
+
+/// A directory sessions were started in, for the New Session sheet's folder list.
+struct NewSessionFolder {
+    /// Absolute path, what `clo launch --dir` gets.
+    let dir: String
+    /// The same with `~` for the home folder, what is typed against and shown.
+    let shown: String
+    /// local-repos-list's tags for it.
+    let tags: [String]
+}
+
+/// fzf-style matching: the query's characters must appear in order, case
+/// ignored. Runs of adjacent characters and characters at the start of a word
+/// score higher, and gaps cost. The folder's own name is matched first, since
+/// that is what is typed; the whole path is the fallback.
+func fuzzyMatch(_ query: String, in path: String) -> (score: Int, positions: [Int])? {
+    let wanted = query.lowercased().filter { !$0.isWhitespace }.map { String($0) }
+    guard !wanted.isEmpty else { return (0, []) }
+    let chars = path.map { String($0).lowercased() }
+    let nameStart = (path.lastIndex(of: "/").map { path.distance(from: path.startIndex, to: $0) + 1 }) ?? 0
+
+    func scan(from start: Int) -> (score: Int, positions: [Int])? {
+        var positions: [Int] = []
+        var score = 0
+        var i = start
+        for w in wanted {
+            guard let found = (i..<chars.count).first(where: { chars[$0] == w }) else { return nil }
+            if let last = positions.last {
+                score += found == last + 1 ? 12 : -min(found - last - 1, 6)
+            }
+            if found == 0 || "/-_. ".contains(chars[found - 1]) { score += 8 }
+            positions.append(found)
+            i = found + 1
+        }
+        return (score, positions)
+    }
+
+    if let byName = scan(from: nameStart) { return (byName.score + 40, byName.positions) }
+    return scan(from: 0)
+}
+
+/// New Session: a sheet over the list that picks a folder, a model, an effort
+/// and an optional first message, and hands `clo launch ...` to `onLaunch`,
+/// which opens it in a new tab. The folder is typed: a field over a list that
+/// narrows as the letters come (fuzzy, best match first; Up and Down move,
+/// Return picks and goes on to the first message, Esc closes). The folders come
+/// from the sessions the app knows; the models and each model's remembered
+/// effort from `clo --menu-json`. Command-Return launches.
+final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private let folders: [NewSessionFolder]
+    private let onLaunch: (String) -> Void
+    private var cloMenu: CloMenu?
+    private let folderField = NSTextField()
+    private let folderTable = NSTableView()
+    private let folderScroll = NSScrollView()
+    /// What the list shows now: the folders that match the field, best first, with
+    /// the positions of the matched characters in `shown`.
+    private var matches: [(folder: NewSessionFolder, positions: [Int])] = []
+    /// The folder Return picked, until the field is typed in again.
+    private var chosen: NewSessionFolder?
+    private let modelControl = NSSegmentedControl()
+    private let effortControl = NSSegmentedControl(
+        labels: [NewSessionWindow.unset] + NewSessionWindow.efforts, trackingMode: .selectOne, target: nil, action: nil)
+    private let promptField = NSTextField()
+    private let problem = NSTextField(wrappingLabelWithString: "")
+    private let launchButton = NSButton(title: "Launch", target: nil, action: nil)
+    private static let efforts = ["low", "medium", "high", "xhigh", "max"]
+    private static let unset = "unset"
+
+    init(folders: [NewSessionFolder], onLaunch: @escaping (String) -> Void) {
+        self.folders = folders
+        self.onLaunch = onLaunch
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 360),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "New Session"
+        window.appearance = NSAppearance(named: .darkAqua)
+        super.init(window: window)
+        build()
+        filter()
+        load()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        folderField.placeholderString = "Type part of a folder name"
+        folderField.delegate = self
+        folderField.setAccessibilityLabel("Folder")
+        promptField.placeholderString = "Optional"
+        promptField.setAccessibilityLabel("First message")
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("folder"))
+        folderTable.addTableColumn(column)
+        folderTable.headerView = nil
+        folderTable.rowHeight = 20
+        folderTable.backgroundColor = .clear
+        folderTable.dataSource = self
+        folderTable.delegate = self
+        folderTable.target = self
+        folderTable.action = #selector(rowClicked)
+        folderScroll.documentView = folderTable
+        folderScroll.hasVerticalScroller = true
+        folderScroll.drawsBackground = false
+        folderScroll.borderType = .bezelBorder
+        folderScroll.heightAnchor.constraint(equalToConstant: 140).isActive = true
+
+        modelControl.segmentStyle = .rounded
+        modelControl.trackingMode = .selectOne
+        effortControl.segmentStyle = .rounded
+        modelControl.isEnabled = false
+        modelControl.segmentCount = 1
+        modelControl.setLabel("Loading…", forSegment: 0)
+
+        func label(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.font = NSFont.systemFont(ofSize: 12)
+            l.textColor = .secondaryLabelColor
+            l.alignment = .right
+            return l
+        }
+        let folderBox = NSStackView(views: [folderField, folderScroll])
+        folderBox.orientation = .vertical
+        folderBox.alignment = .width
+        folderBox.spacing = 6
+        let grid = NSGridView(views: [
+            [label("Folder"), folderBox],
+            [label("Model"), modelControl],
+            [label("Effort"), effortControl],
+            [label("First message"), promptField],
+        ])
+        grid.rowSpacing = 12
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 0).width = 90
+        grid.column(at: 1).xPlacement = .fill
+        grid.cell(for: modelControl)?.xPlacement = .leading
+        grid.cell(for: effortControl)?.xPlacement = .leading
+        grid.row(at: 0).yPlacement = .top
+        grid.translatesAutoresizingMaskIntoConstraints = false
+
+        problem.font = NSFont.systemFont(ofSize: 11)
+        problem.textColor = Palette.red
+        problem.isHidden = true
+        problem.translatesAutoresizingMaskIntoConstraints = false
+
+        launchButton.target = self
+        launchButton.action = #selector(launch)
+        launchButton.keyEquivalent = "\r"
+        launchButton.keyEquivalentModifierMask = [.command]
+        launchButton.isEnabled = false
+        launchButton.toolTip = "Command-Return"
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+        cancel.keyEquivalent = "\u{1b}"
+        let buttons = NSStackView(views: [cancel, launchButton])
+        buttons.spacing = 10
+        buttons.translatesAutoresizingMaskIntoConstraints = false
+
+        for view in [grid, problem, buttons] as [NSView] { content.addSubview(view) }
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            grid.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            problem.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 14),
+            problem.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
+            problem.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
+            buttons.topAnchor.constraint(greaterThanOrEqualTo: problem.bottomAnchor, constant: 16),
+            buttons.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
+            buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+        ])
+        window?.initialFirstResponder = folderField
+        if folders.isEmpty { show("No session has a directory yet, so there is no folder to start in.") }
+    }
+
+    // MARK: Folder list
+
+    /// The folders that match the field, best first; the field empty shows them
+    /// all, newest first. Highlights the first row.
+    private func filter() {
+        let query = folderField.stringValue
+        if query.allSatisfy({ $0.isWhitespace }) {
+            matches = folders.map { ($0, []) }
+        } else {
+            matches = folders.enumerated().compactMap { index, folder -> (Int, Int, NewSessionFolder, [Int])? in
+                fuzzyMatch(query, in: folder.shown).map { ($0.score, index, folder, $0.positions) }
+            }
+            // Ties keep the newest-first order the folders came in.
+            .sorted { $0.0 != $1.0 ? $0.0 > $1.0 : $0.1 < $1.1 }
+            .map { ($0.2, $0.3) }
+        }
+        chosen = nil
+        folderTable.reloadData()
+        if !matches.isEmpty { select(0) }
+    }
+
+    private func select(_ row: Int) {
+        guard !matches.isEmpty else { return }
+        let clamped = max(0, min(row, matches.count - 1))
+        folderTable.selectRowIndexes(IndexSet(integer: clamped), byExtendingSelection: false)
+        folderTable.scrollRowToVisible(clamped)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { matches.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let item = matches[safe: row] else { return nil }
+        let text = NSMutableAttributedString(
+            string: item.folder.shown,
+            attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.labelColor])
+        for position in item.positions {
+            text.addAttributes(
+                [.foregroundColor: Palette.yellow, .font: NSFont.boldSystemFont(ofSize: 12)],
+                range: NSRange(location: position, length: 1))
+        }
+        if !item.folder.tags.isEmpty {
+            text.append(NSAttributedString(
+                string: "   " + item.folder.tags.joined(separator: " "),
+                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim]))
+        }
+        let cell = NSTextField(labelWithAttributedString: text)
+        cell.lineBreakMode = .byTruncatingMiddle
+        return cell
+    }
+
+    @objc private func rowClicked() {
+        pickHighlighted()
+    }
+
+    /// Takes the highlighted folder, shows its path in the field and moves on to the message.
+    private func pickHighlighted() {
+        guard let item = matches[safe: folderTable.selectedRow] else { return }
+        chosen = item.folder
+        folderField.stringValue = item.folder.shown
+        window?.makeFirstResponder(promptField)
+    }
+
+    /// Up, Down, Return and Esc in the folder field act on the list.
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        guard control === folderField else { return false }
+        switch selector {
+        case #selector(NSResponder.moveUp(_:)):
+            select(folderTable.selectedRow - 1)
+        case #selector(NSResponder.moveDown(_:)):
+            select(folderTable.selectedRow + 1)
+        case #selector(NSResponder.insertNewline(_:)):
+            pickHighlighted()
+        case #selector(NSResponder.cancelOperation(_:)):
+            cancel()
+        default:
+            return false
+        }
+        return true
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard (notification.object as? NSTextField) === folderField else { return }
+        filter()
+    }
+
+    // MARK: Model and effort
+
+    /// Fills the model and effort controls from `clo --menu-json`, off the main thread.
+    private func load() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = CloMenu.load()
+            DispatchQueue.main.async { [weak self] in self?.loaded(result) }
+        }
+    }
+
+    private func loaded(_ result: Result<CloMenu, CloMenuError>) {
+        switch result {
+        case .failure(let error):
+            modelControl.setLabel("\u{2014}", forSegment: 0)
+            show(error.message)
+        case .success(let menu):
+            cloMenu = menu
+            modelControl.segmentCount = menu.models.count
+            for (index, model) in menu.models.enumerated() { modelControl.setLabel(model.label, forSegment: index) }
+            let start = menu.models.firstIndex { $0.value == menu.last } ?? 0
+            for index in menu.models.indices { modelControl.setSelected(index == start, forSegment: index) }
+            modelControl.target = self
+            modelControl.action = #selector(modelChanged)
+            modelControl.isEnabled = true
+            modelChanged()
+            launchButton.isEnabled = !folders.isEmpty
+        }
+    }
+
+    private func show(_ message: String) {
+        problem.stringValue = message
+        problem.isHidden = false
+    }
+
+    private var selectedModel: String? { cloMenu?.models[safe: modelControl.selectedSegment]?.value }
+
+    /// The effort that model last ran with; "unset" when none is remembered.
+    @objc private func modelChanged() {
+        let remembered = selectedModel.flatMap { cloMenu?.effort?[$0] } ?? Self.unset
+        effortControl.selectedSegment = ([Self.unset] + Self.efforts).firstIndex(of: remembered) ?? 0
+    }
+
+    // MARK: Launch
+
+    @objc private func launch() {
+        guard let folder = chosen ?? matches[safe: folderTable.selectedRow]?.folder, let model = selectedModel else {
+            return
+        }
+        var parts = ["clo", "launch", "--dir", shellQuoted(folder.dir), "--model", shellQuoted(model)]
+        if let effort = effortControl.label(forSegment: effortControl.selectedSegment), effort != Self.unset {
+            parts += ["--effort", shellQuoted(effort)]
+        }
+        let prompt = promptField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !prompt.isEmpty { parts += ["--prompt", shellQuoted(prompt)] }
+        let command = parts.joined(separator: " ")
+        cancel()
+        onLaunch(command)
+    }
+
+    @objc private func cancel() {
+        guard let window = window else { return }
+        window.sheetParent?.endSheet(window)
+    }
+}
+
+extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
+}
+
 /// Repo Tags: every tag local-repos-list keeps, as a sheet over the list. The
 /// tags down the left, each with its colour and how many folders carry it;
 /// the selected one's colour and folders on the right. Every change goes
@@ -4065,6 +4460,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var verdictsSheet: VerdictSettingsWindow?
     /// Opens Repo Tags, beside the filter it feeds.
     private let repoTagsButton = NSButton(title: "", target: nil, action: nil)
+    private var newSessionSheet: NewSessionWindow?
     /// The tag filter and the verdicts toggle: what the list and the
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
@@ -4339,6 +4735,54 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         soundBar.addArrangedSubview(top)
     }
 
+    /// The plus in the first cell of the tool's own row: opens New Session.
+    private func newSessionCell() -> NSView {
+        let available = cloPath != nil
+        let image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New session")
+        image?.isTemplate = true
+        let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(openNewSession))
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        button.contentTintColor = Palette.dim
+        button.isEnabled = available
+        button.toolTip = available ? "New session" : "clo not on PATH"
+        button.setAccessibilityLabel("New session")
+        button.translatesAutoresizingMaskIntoConstraints = false
+        let cell = NSView()
+        cell.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            button.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    /// One entry per distinct session directory, newest Last Seen first, as `~/…`
+    /// with the repo tags local-repos-list gives it; folders gone from disk are left out.
+    private func newSessionFolders() -> [NewSessionFolder] {
+        var newest: [String: Double] = [:]
+        for row in allRows {
+            guard let dir = row.session.summary.project_dir, !dir.isEmpty else { continue }
+            let full = (dir as NSString).expandingTildeInPath
+            newest[full] = max(newest[full] ?? 0, row.session.active_at ?? row.session.updated_at)
+        }
+        return newest.sorted { $0.value > $1.value }.compactMap { dir, _ in
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { return nil }
+            return NewSessionFolder(
+                dir: dir, shown: (dir as NSString).abbreviatingWithTildeInPath,
+                tags: tagStore.marks(nil, dir).tags.map(\.name))
+        }
+    }
+
+    @objc func openNewSession() {
+        guard cloPath != nil, let window = window, window.attachedSheet == nil else { return }
+        let sheet = NewSessionWindow(folders: newSessionFolders()) { command in runInNewTab(command) }
+        newSessionSheet = sheet
+        window.beginSheet(sheet.window!) { [weak self] _ in self?.newSessionSheet = nil }
+    }
+
     /// system-one's verdict row on the status line: a text toggle in the
     /// ● on / ○ off style the event boxes use, bound to display.json so the
     /// status line script picks the change up on its next redraw. A click
@@ -4556,6 +5000,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let text: String
         var colour = Palette.dim
         switch key {
+        case "age":
+            return newSessionCell()
         case "cwd":
             text = "this tool"
         case "topic":
