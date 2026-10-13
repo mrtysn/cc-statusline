@@ -23,6 +23,11 @@ import MacAppStyle
 let fm = FileManager.default
 let home = fm.homeDirectoryForCurrentUser
 
+/// A self-test run (CC_SESSIONS_SELFTEST=1) builds the window over fixture sessions and keeps
+/// every file it writes in `selfTestRoot`, never in the real cache, support or log folders.
+let selfTest = ProcessInfo.processInfo.environment["CC_SESSIONS_SELFTEST"] == "1"
+let selfTestRoot = fm.temporaryDirectory.appendingPathComponent("cc-sessions-selftest-\(getpid())")
+
 /// An XDG base dir from the environment, else the conventional location under $HOME.
 func xdgDir(_ key: String, fallback: String) -> URL {
     if let v = ProcessInfo.processInfo.environment[key], !v.isEmpty {
@@ -32,13 +37,16 @@ func xdgDir(_ key: String, fallback: String) -> URL {
 }
 
 let cacheDir: URL = {
+    if selfTest { return selfTestRoot.appendingPathComponent("cache") }
     if let v = ProcessInfo.processInfo.environment["CC_STATUSLINE_CACHE_DIR"], !v.isEmpty {
         return URL(fileURLWithPath: (v as NSString).expandingTildeInPath)
     }
     return xdgDir("XDG_CACHE_HOME", fallback: ".cache").appendingPathComponent("cc-statusline")
 }()
 let spoolDir = cacheDir.appendingPathComponent("live")
-let logURL = home.appendingPathComponent("Library/Logs/cc-sessions.log")
+let logURL = selfTest
+    ? selfTestRoot.appendingPathComponent("cc-sessions.log")
+    : home.appendingPathComponent("Library/Logs/cc-sessions.log")
 
 /// system-one's per-session shadow log (agents-shared/notebook/2026-09-24-system-one-
 /// decision-model-integration.md, section 9): one JSONL file per session, read for
@@ -523,7 +531,7 @@ final class SelfCost {
 // MARK: - Session events and sounds
 
 /// The app's own files: the sound packs and their settings.
-let supportDir: URL =
+let supportDir: URL = selfTest ? selfTestRoot.appendingPathComponent("support") :
     (fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? home.appendingPathComponent("Library"))
     .appendingPathComponent("Agent Bar Hopping")  // the app's original name, kept so existing tags and packs stay found
 /// Where hooks/event.zsh leaves one file per Claude Code event.
@@ -1729,6 +1737,7 @@ final class LatestVersion {
     }
 
     func refreshIfDue() {
+        guard !selfTest else { return }
         let now = Date().timeIntervalSince1970
         guard !inFlight, now - cache.fetched_at > Self.freshFor,
             now - (cache.failed_at ?? 0) > Self.pauseAfterFailure
@@ -4889,7 +4898,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var counts = ""
     private let emptyLabel = NSTextField(labelWithString: "No session has drawn a status line yet.")
 
-    init() {
+    /// `fixture` stands in for the live snapshot in a self-test run, which starts no watcher,
+    /// timer, subprocess or request.
+    init(fixture: Snapshot? = nil) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1560, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -4918,6 +4929,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // A frame saved before a column was added would cut the new one off.
         if let restored = window.contentView?.frame.width, restored < fitted {
             window.setContentSize(NSSize(width: fitted, height: window.contentView?.frame.height ?? 720))
+        }
+        if selfTest {
+            apply(fixture, loads: [:], reused: [], cost: nil, footprint: 0)
+            return
         }
         startWatching()
         events.onChange = { [weak self] in self?.refreshTable() }
@@ -5374,6 +5389,68 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         window?.makeFirstResponder(table)
     }
 
+    /// The problems a self-test run finds in this window, built over fixture sessions.
+    /// Checks the columns, the filter, the empty label, the buttons and the window's layout.
+    func selfTestProblems(fixture: Snapshot) -> [String] {
+        var problems: [String] = []
+        guard let window else { return ["no window"] }
+        window.layoutIfNeeded()
+
+        // Columns: every declared column is in the table, in order, with its title.
+        // A sorted column's title carries its order after the name ("Cache · soonest").
+        let shown = table.tableColumns.map(\.title)
+        if shown.count != columns.count || zip(shown, columns).contains(where: { !$0.hasPrefix($1.title) }) {
+            problems.append("table columns read \(shown)")
+        }
+        if table.tableColumns.contains(where: { $0.width < 16 }) { problems.append("a column is narrower than 16pt") }
+
+        // Rows: the tool's own row, then one per fixture session.
+        let total = fixture.live.count + fixture.history.count
+        if table.numberOfRows != total + 1 { problems.append("table has \(table.numberOfRows) rows, want \(total + 1)") }
+        if !emptyLabel.isHidden { problems.append("the empty label shows over \(total) sessions") }
+
+        // Filter: a dot narrows the list to its sessions; a dot nobody has shows the empty label.
+        guard let first = fixture.live.first?.summary.session_id else { return problems + ["fixture has no live session"] }
+        let green = TagColour.all[0]
+        tagStore.toggleDot(green.hex, for: first)
+        tagsChanged()
+        func choose(_ filter: TagFilter?) {
+            filterPopup.selectItem(at: filterChoices.firstIndex { $0 == filter && (filter != nil) } ?? 0)
+            filterChanged()
+        }
+        choose(.dot(green.hex))
+        if rows.count != 1 { problems.append("the \(green.name) dot filter keeps \(rows.count) sessions, want 1") }
+        if !emptyLabel.isHidden { problems.append("the empty label shows over a filtered list") }
+        tagStore.toggleDot(green.hex, for: first)
+        tagsChanged()
+        if rows.count != 0 { problems.append("a dot nobody has keeps \(rows.count) sessions, want 0") }
+        if emptyLabel.isHidden || !emptyLabel.stringValue.hasPrefix("No session has") {
+            problems.append("the empty label does not explain an empty filter: \(emptyLabel.stringValue)")
+        }
+        choose(nil)
+        if rows.count != total { problems.append("All sessions shows \(rows.count), want \(total)") }
+
+        // Empty snapshot: the label says no session has drawn a status line yet.
+        apply(Snapshot(live: [], history: [], fable: nil, health: nil), loads: [:], reused: [], cost: nil, footprint: 0)
+        if emptyLabel.isHidden || emptyLabel.stringValue != "No session has drawn a status line yet." {
+            problems.append("the empty snapshot shows \"\(emptyLabel.stringValue)\"")
+        }
+        apply(fixture, loads: [:], reused: [], cost: nil, footprint: 0)
+
+        // Buttons: each has a target that answers its action.
+        for (name, button) in [("pack", packButton), ("repo tags", repoTagsButton), ("verdicts", verdictsToggle)] {
+            guard let action = button.action, let target = button.target, target.responds(to: action) else {
+                problems.append("the \(name) button is not wired to an action")
+                continue
+            }
+        }
+        if filterPopup.target == nil || filterPopup.action == nil { problems.append("the filter popup is not wired") }
+
+        // Layout: resizes, fits the screen, shrinks to its minimum.
+        problems += WindowChecks.verify(window).map { "window: \($0)" }
+        return problems
+    }
+
     func reload() {
         let cols = rowColumns()
         worker.async { [weak self] in
@@ -5431,10 +5508,23 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             ? "No session has drawn a status line yet." : "No session has \(filterWords)."
         emptyLabel.isHidden = !rows.isEmpty
         drawQuotaBar(snapshot)
+        fitMinimumWidth()
         sortRows()
         refreshTable()
         table.reloadData(forRowIndexes: IndexSet(integer: 0), columnIndexes: IndexSet(table.tableColumns.indices))
         select(keep)
+    }
+
+    /// The window never narrows past the top row: the quotas, a gap and the sound controls side by side.
+    private func fitMinimumWidth() {
+        guard let window else { return }
+        let needed = ceil(16 + quotaBar.fittingSize.width + 24 + soundBar.fittingSize.width + 16)
+        let minimum = NSSize(width: max(720, needed), height: window.contentMinSize.height)
+        guard minimum != window.contentMinSize else { return }
+        window.contentMinSize = minimum
+        if let content = window.contentView, content.frame.width < minimum.width {
+            window.setContentSize(NSSize(width: minimum.width, height: content.frame.height))
+        }
     }
 
     /// What watching all this costs, shown as the table's first row: the status
@@ -7162,6 +7252,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: SessionsWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if selfTest {
+            runSelfTest()
+            return
+        }
         replaceOlderCopies()
         NSApp.setActivationPolicy(.regular)
         buildMenu()
@@ -7183,6 +7277,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // The receiver hears a launch and every stop; no heartbeat, the app is opened and quit by hand.
         Reporter.start(tool: "cc-sessions")
+    }
+
+    /// Builds the window over fixture sessions, reports what is wrong with it and exits.
+    /// It reads no Claude data, starts no watcher or sender, and writes only under `selfTestRoot`.
+    private func runSelfTest() {
+        let now = Date().timeIntervalSince1970
+        func session(_ id: String, dir: String, topic: String, ended: Bool) -> String {
+            """
+            {"updated_at": \(now), "active_at": \(now), "rows": ["fixture", "fixture"],
+             \(ended ? "\"ended\": {\"reason\": \"exited\", \"at\": \(now)}," : "")
+             "summary": {"session_id": "\(id)", "model": "Opus", "effort": "high", "context": 12,
+                         "topic": "\(topic)", "cwd": "\(dir)", "project_dir": "\(dir)"},
+             "segments": {}}
+            """
+        }
+        let json = """
+            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false)),
+                      \(session("fixture-b", dir: "/fixture/two", topic: "second fixture", ended: false))],
+             "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
+            """
+        var problems: [String] = []
+        do {
+            let fixture = try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
+            let controller = SessionsWindow(fixture: fixture)
+            self.controller = controller
+            problems = controller.selfTestProblems(fixture: fixture)
+        } catch {
+            problems = ["fixture did not decode: \(error)"]
+        }
+        try? fm.removeItem(at: selfTestRoot)
+        for problem in problems { print("self-test: \(problem)") }
+        print(problems.isEmpty ? "self-test: every check passed" : "self-test: \(problems.count) failed")
+        fflush(stdout)
+        exit(problems.isEmpty ? 0 : 1)
     }
 
     /// With a New Session shortcut set, closing the list leaves the app running so the
@@ -7270,4 +7398,5 @@ func buildMenu() {
 let app = NSApplication.shared
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
+app.setActivationPolicy(selfTest ? .prohibited : .regular)
 app.run()

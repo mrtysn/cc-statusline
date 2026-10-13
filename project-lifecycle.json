@@ -12,5 +12,6 @@
       "NSAppleEventsUsageDescription": "CC Sessions brings a session's iTerm tab to the front when you click its row.",
       "CCStatuslineRepo": "{repo}"
     }
-  }
+  },
+  "test": [{"name": "self-test", "run": ["{binary}"], "env": {"CC_SESSIONS_SELFTEST": "1"}}]
 }
