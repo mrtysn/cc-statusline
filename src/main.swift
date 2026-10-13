@@ -5292,7 +5292,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         Column(key: "model", title: "Model", width: 74),
         Column(key: "effort", title: "Effort", width: 60),
         Column(key: "context", title: "Context", width: 82),
-        Column(key: "sound", title: "Sound", width: 46),
+        Column(key: "sound", title: "Sound", width: 60),
         Column(key: "tokens", title: "Tokens", width: 88),
         Column(key: "memory", title: "Memory", width: 72),
         Column(key: "cpu", title: "CPU", width: 60),
@@ -6600,7 +6600,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             if !past, let id = s.session_id, sshGuard.bypassed(id) {
                 // Yellow in either case: beside the agent count the caption is
                 // orange, so the warning is coloured on its own range.
-                if !bottom.isEmpty { bottom += " · " }
+                if !bottom.isEmpty {
+                    highlights.append((NSRange(location: (bottom as NSString).length + 1, length: 1), Palette.dim))
+                    bottom += " · "
+                }
                 highlights.append((NSRange(location: (bottom as NSString).length, length: ("ssh⚠" as NSString).length), Palette.yellow))
                 bottom += "ssh⚠"
             }
