@@ -527,6 +527,98 @@ let supportDir: URL =
 /// Where hooks/event.zsh leaves one file per Claude Code event.
 let eventsDir = cacheDir.appendingPathComponent("events")
 
+/// The ssh-request-guard hook's asks, and the hosts cleared for each session.
+/// The hook appends one JSON line per ask to asks.jsonl; a host is cleared for a
+/// session by a line in session-allow/<session id>, the file
+/// allow-ssh-host-for-session writes. Clearing here is you acting, which is what
+/// the guard asks for; an agent never reaches this app.
+final class SSHGuard {
+    struct Ask {
+        let host: String
+        let at: Double
+    }
+
+    private let dir = xdgDir("CLAUDE_CONFIG_DIR", fallback: ".claude").appendingPathComponent("ssh-request-guard")
+    private var asksFile: URL { dir.appendingPathComponent("asks.jsonl") }
+    private var allowDir: URL { dir.appendingPathComponent("session-allow") }
+    /// Clearable asks per session, newest first, one entry per host.
+    private(set) var asks: [String: [Ask]] = [:]
+    private var seen: [String: Date] = [:]
+    private var timer: Timer?
+    /// Called on the main queue after an ask or a clearance changed.
+    var onChange: (() -> Void)?
+    /// How much of the log's end is read: recent asks only.
+    private static let tailBytes = 256 * 1024
+
+    func start() {
+        reload()
+        // Neither file can be watched while it does not exist yet, and a
+        // two-second look at two modification times costs nothing.
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.reload() }
+    }
+
+    private func stamp(_ url: URL) -> Date? {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
+    private func reload() {
+        let marks = ["asks": stamp(asksFile), "allow": stamp(allowDir)]
+        var changed = false
+        for (key, mark) in marks where seen[key] != mark {
+            seen[key] = mark
+            changed = true
+        }
+        guard changed else { return }
+        asks = readAsks()
+        onChange?()
+    }
+
+    private func readAsks() -> [String: [Ask]] {
+        guard let handle = try? FileHandle(forReadingFrom: asksFile) else { return [:] }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size > UInt64(Self.tailBytes) ? size - UInt64(Self.tailBytes) : 0)
+        guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return [:] }
+        let iso = ISO8601DateFormatter()
+        var found: [String: [Ask]] = [:]
+        for line in text.split(separator: "\n").reversed() {
+            guard let row = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
+                let session = row["session"] as? String, !session.isEmpty,
+                let host = row["host"] as? String, !host.isEmpty,
+                row["clearable"] as? Bool == true,
+                let at = (row["at"] as? String).flatMap({ iso.date(from: $0) })?.timeIntervalSince1970
+            else { continue }
+            if found[session]?.contains(where: { $0.host == host }) == true { continue }
+            found[session, default: []].append(Ask(host: host, at: at))
+        }
+        return found
+    }
+
+    func cleared(_ host: String, for session: String) -> Bool {
+        clearedHosts(session).contains(host)
+    }
+
+    private func clearedHosts(_ session: String) -> [String] {
+        guard let text = try? String(contentsOf: allowDir.appendingPathComponent(session), encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init)
+    }
+
+    /// Clears the host for the session, or takes the clearance back.
+    func toggle(_ host: String, for session: String) {
+        var hosts = clearedHosts(session)
+        if hosts.contains(host) { hosts.removeAll { $0 == host } } else { hosts.append(host) }
+        try? fm.createDirectory(at: allowDir, withIntermediateDirectories: true)
+        let file = allowDir.appendingPathComponent(session)
+        if hosts.isEmpty {
+            try? fm.removeItem(at: file)
+        } else {
+            try? (hosts.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
+        }
+        seen = [:]
+        reload()
+    }
+}
+
 /// sounds.json in the support directory; written with these defaults when absent.
 struct SoundSettings: Codable {
     var enabled = true
@@ -3944,6 +4036,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let sampler = ProcessSampler()
     private let selfCost = SelfCost()
     private let events = EventCenter()
+    private let sshGuard = SSHGuard()
     private let soundBar = NSStackView()
     private lazy var soundControls = SoundControls(center: events)
     /// The pack in use; a click opens the browser to hear and choose others.
@@ -4014,6 +4107,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         startWatching()
         events.onChange = { [weak self] in self?.refreshTable() }
+        sshGuard.onChange = { [weak self] in self?.refreshTable() }
+        sshGuard.start()
         repoTags.onChange = { [weak self] in
             self?.tagsChanged()
             self?.repoTagsSheet?.redraw()
@@ -4865,6 +4960,21 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         menu.addItem(ActionItem("Verdicts", enabled: sid != nil) { [weak self] in
             sid.map { self?.openVerdicts(sessionId: $0) }
         })
+        if let id = sid, let asked = sshGuard.asks[id] {
+            menu.addItem(.separator())
+            for ask in asked {
+                let on = sshGuard.cleared(ask.host, for: id)
+                let item = ActionItem("Allow ssh to \(ask.host)") { [weak self] in
+                    self?.sshGuard.toggle(ask.host, for: id)
+                }
+                item.state = on ? .on : .off
+                item.toolTip = on
+                    ? "ssh-request-guard no longer asks about \(ask.host) in this session; click to ask again"
+                    : "Stops ssh-request-guard asking about \(ask.host) in this session only; tunnels still ask"
+                menu.addItem(item)
+            }
+            menu.addItem(.separator())
+        }
         let launchDir = s.project_dir.map { ($0 as NSString).expandingTildeInPath }
         let gui = ActionItem("Open in local-repos-list", enabled: launchDir != nil) { [weak self] in
             launchDir.map { self?.openInRepoList($0) }
@@ -6069,6 +6179,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 asked >= (t.state_at ?? 0) / 1000,
                 (session.pid.flatMap { loads[$0]?.newestChild } ?? 0) < asked
             {
+                // The guard logs its ask just before the prompt it causes.
+                if let ask = sshGuard.asks[id]?.first, ask.at <= asked, asked - ask.at < 30,
+                    !sshGuard.cleared(ask.host, for: id)
+                {
+                    return ("ssh \(ask.host)?", Palette.yellow)
+                }
                 return ("approve?", Palette.yellow)
             }
             return ((t.tool ?? "tool") + since, Palette.dim)
