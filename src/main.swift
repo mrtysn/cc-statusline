@@ -3880,6 +3880,37 @@ final class KeyedSegmentedControl: NSSegmentedControl {
         NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
     }
 
+/// The New Session cell of the tool's own row: the whole cell is the button, with
+/// the pointing-hand cursor and a faint wash under the pointer.
+final class PlusCellButton: NSButton {
+    private var hovering = false {
+        didSet {
+            layer?.backgroundColor = (hovering && isEnabled ? Palette.text.withAlphaComponent(0.07) : .clear).cgColor
+        }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+
+    override func resetCursorRects() {
+        if isEnabled { addCursorRect(bounds, cursor: .pointingHand) }
+    }
+}
+
     override func keyDown(with event: NSEvent) {
         switch Int(event.keyCode) {
         case kVK_LeftArrow: step(-1)
@@ -5109,7 +5140,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let available = cloPath != nil
         let image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New session")
         image?.isTemplate = true
-        let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(openNewSession))
+        // The button is the whole cell, so a click anywhere in it counts; the table sizes it.
+        let button = PlusCellButton(frame: .zero)
+        button.image = image
+        button.target = self
+        button.action = #selector(openNewSession)
         button.isBordered = false
         button.imagePosition = .imageOnly
         button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .bold)
@@ -5117,14 +5152,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         button.isEnabled = available
         button.toolTip = available ? "New session" + (hotKey.active.map { "  " + $0.display } ?? "") : "clo not on PATH"
         button.setAccessibilityLabel("New session")
-        button.translatesAutoresizingMaskIntoConstraints = false
-        let cell = NSView()
-        cell.addSubview(button)
-        NSLayoutConstraint.activate([
-            button.centerXAnchor.constraint(equalTo: cell.centerXAnchor),
-            button.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-        return cell
+        return button
     }
 
     /// One entry per distinct session directory, newest Last Seen first, as `~/…`
