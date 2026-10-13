@@ -504,12 +504,64 @@ async function requestUsage() {
   }
 }
 
+// Money in the response is minor units plus an exponent: 6000 and 2 is $60.00.
+function minorToDollars(money) {
+  return typeof money?.amount_minor === 'number' ? money.amount_minor / 10 ** (money.exponent ?? 2) : null;
+}
+
+// What the Usage window shows beyond the quotas. Credit grants sit under
+// obfuscated top-level keys that Anthropic renames, so they are found by shape:
+// an object with a dollar limit. Finding none is a valid reading (no grants), not
+// a format problem; the five-hour and weekly entries carry the field too, null
+// unless the plan is dollar-metered, and are not grants.
+function extraUsage(body, fableEntry) {
+  const credits = Object.entries(body)
+    .filter(([key, v]) => !/^(five_hour|seven_day)/.test(key) && v && typeof v === 'object' && !Array.isArray(v) && typeof v.limit_dollars === 'number')
+    .map(([key, v]) => ({
+      key,
+      limit: v.limit_dollars,
+      used: v.used_dollars ?? null,
+      remaining: v.remaining_dollars ?? null,
+      resets_at: v.resets_at ?? null,
+    }));
+  const spend = body.spend && typeof body.spend === 'object'
+    ? {
+        used: minorToDollars(body.spend.used),
+        limit: minorToDollars(body.spend.limit),
+        enabled: body.spend.enabled === true,
+        disabled_reason: body.spend.disabled_reason ?? null,
+      }
+    : null;
+  const surfaces = Array.isArray(body.seven_day_breakdown?.rows)
+    ? body.seven_day_breakdown.rows
+        .filter((r) => typeof r?.percent === 'number')
+        .map((r) => ({ name: r.display_name ?? r.key, percent: r.percent }))
+    : null;
+  // The share rows point into limits[] by index: the Fable one is its own entry's.
+  let fableShare = null;
+  const shares = Array.isArray(body.weekly_scoped_shares) ? body.weekly_scoped_shares : [];
+  const index = fableEntry ? body.limits.indexOf(fableEntry) : -1;
+  const row = shares.find((r) => r?.limit_index === index);
+  if (row && typeof row.used_percent_of_weekly === 'number' && typeof row.allowance_percent_of_weekly === 'number') {
+    fableShare = { used: row.used_percent_of_weekly, allowance: row.allowance_percent_of_weekly };
+  }
+  const dangling = shares.some((r) => !Number.isInteger(r?.limit_index) || r.limit_index < 0 || r.limit_index >= body.limits.length);
+  checkFormat('usage/shares', !dangling, 'usage endpoint: weekly_scoped_shares points outside limits[]');
+  return { credits, spend, surfaces, fable_share: fableShare };
+}
+
 async function refreshUsage(sevenArg) {
   const previous = readUsageCache();
   const next = {
     fetched_at: Date.now(),
     seven_day_seen: sevenArg != null && sevenArg !== '' ? Number(sevenArg) : previous?.seven_day_seen ?? null,
     fable: previous?.fable ?? null,
+    // The rest of the account's picture, for the app's Usage window. Each is kept
+    // across a failed refresh like fable, so one bad fetch does not blank them.
+    credits: previous?.credits ?? null,
+    spend: previous?.spend ?? null,
+    surfaces: previous?.surfaces ?? null,
+    fable_share: previous?.fable_share ?? null,
     error: null,
   };
   let authFailed = false;
@@ -543,6 +595,7 @@ async function refreshUsage(sevenArg) {
       ? { percent: entry.percent, resets_at: entry.resets_at ?? null, is_active: entry.is_active === true }
       : null;
     checkFormat('usage/response', true);
+    Object.assign(next, extraUsage(body, entry));
   } catch (err) {
     next.error = err.message;
     logError(err.message);
@@ -1356,8 +1409,26 @@ function liveSnapshot(columns) {
     const over = resets != null && resets <= now;
     fable = { percent: over ? 0 : cached.fable.percent, resets_at: over ? null : resets, read_at: cached.fetched_at ?? null };
   }
+  const usage = usageSummary(cached, now);
   const health = Object.entries(readHealth()).map(([key, value]) => ({ key, ...value }));
-  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).filter((e) => !empty.has(e)).map(strip), fable, health };
+  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).filter((e) => !empty.has(e)).map(strip), fable, usage, health };
+}
+
+// The cache's extra readings as the app's Usage window draws them. A grant past
+// its expiry is gone, so it is dropped rather than shown as a balance.
+function usageSummary(cached, now) {
+  if (!cached) return null;
+  const credits = (cached.credits ?? [])
+    .map((c) => ({ key: c.key, limit: c.limit, used: c.used, remaining: c.remaining, expires_at: Date.parse(c.resets_at) || null }))
+    .filter((c) => c.expires_at == null || c.expires_at > now);
+  return {
+    read_at: cached.fetched_at ?? null,
+    error: cached.error ?? null,
+    credits,
+    spend: cached.spend ?? null,
+    surfaces: cached.surfaces ?? null,
+    fable_share: cached.fable_share ?? null,
+  };
 }
 
 function main() {
