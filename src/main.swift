@@ -16,6 +16,7 @@ import Carbon.HIToolbox
 import CryptoKit
 import Foundation
 import MacAppBase
+import MacAppStyle
 
 // MARK: - Paths
 
@@ -4911,8 +4912,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             + table.intercellSpacing.width * CGFloat(columns.count)
             + max(scroller, 16) + 2
         window.contentMinSize = NSSize(width: 720, height: 280)
-        window.setContentSize(NSSize(width: fitted, height: 720))
-        window.center()
+        // Fills the screen's usable area (Dock and menu bar stay visible) on every launch.
+        WindowPlacement.apply(window, launch: .maximized, minSize: window.contentMinSize, autosave: "AgentBarHopping")
         window.setFrameAutosaveName("AgentBarHopping")
         // A frame saved before a column was added would cut the new one off.
         if let restored = window.contentView?.frame.width, restored < fitted {

@@ -27,7 +27,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "CCSessions",
-            dependencies: [.product(name: "MacAppBase", package: "project-lifecycle")],
+            dependencies: [
+                .product(name: "MacAppBase", package: "project-lifecycle"),
+                .product(name: "MacAppStyle", package: "project-lifecycle"),
+            ],
             path: "src",
             sources: ["main.swift"]
         ),
