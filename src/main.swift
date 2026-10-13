@@ -5180,7 +5180,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         quotaBar.translatesAutoresizingMaskIntoConstraints = false
         quotaBar.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(openUsage)))
         usageButton.isBordered = false
-        usageButton.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Usage")
+        // Sized to the 11pt caption it sits beside: a default button is taller than the
+        // line and its image overflows above it.
+        usageButton.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Usage")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .regular))
+        usageButton.imagePosition = .imageOnly
+        usageButton.imageScaling = .scaleProportionallyDown
         usageButton.contentTintColor = Palette.dim
         usageButton.target = self
         usageButton.action = #selector(openUsage)
@@ -5242,7 +5247,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             quotaBar.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             usageButton.leadingAnchor.constraint(equalTo: quotaBar.trailingAnchor, constant: 8),
-            usageButton.topAnchor.constraint(equalTo: quotaBar.topAnchor),
+            usageButton.topAnchor.constraint(equalTo: quotaBar.topAnchor, constant: 1),
+            usageButton.widthAnchor.constraint(equalToConstant: 12),
+            usageButton.heightAnchor.constraint(equalToConstant: 12),
             usageButton.trailingAnchor.constraint(lessThanOrEqualTo: soundBar.leadingAnchor, constant: -16),
             // The sound settings take the space right of the quotas.
             soundBar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
