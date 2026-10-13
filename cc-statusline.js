@@ -530,6 +530,9 @@ function extraUsage(body, fableEntry) {
         limit: minorToDollars(body.spend.limit),
         enabled: body.spend.enabled === true,
         disabled_reason: body.spend.disabled_reason ?? null,
+        // The toggle on claude.ai, apart from whether spending can happen: on with
+        // an empty balance is enabled false, user_disabled false.
+        user_disabled: body.extra_usage?.user_disabled === true,
       }
     : null;
   const surfaces = Array.isArray(body.seven_day_breakdown?.rows)

@@ -242,6 +242,8 @@ struct SpendCap: Decodable {
     let limit: Double?
     let enabled: Bool?
     let disabled_reason: String?
+    /// The usage-credits toggle on claude.ai; absent in a cache from before it was kept.
+    let user_disabled: Bool?
 }
 
 struct SurfaceShare: Decodable {
@@ -3931,6 +3933,18 @@ final class UsageWindow: NSWindowController {
         ])
     }
 
+    /// Two facts, said apart: whether the usage-credits toggle is on, and whether
+    /// spending can happen. On with an empty balance is not the same as turned off.
+    private func spendNote(_ spend: SpendCap) -> String {
+        if spend.enabled == true { return "" }
+        if spend.user_disabled == true { return "turned off" }
+        switch spend.disabled_reason {
+        case "out_of_credits": return spend.user_disabled == false ? "on · no credits to spend" : "no credits to spend"
+        case let reason?: return "off · \(reason.replacingOccurrences(of: "_", with: " "))"
+        case nil: return "off"
+        }
+    }
+
     func update(_ usage: UsageSummary?) {
         // removeRow leaves a row's views in the grid as subviews; they would draw over the next reading.
         for _ in 0..<grid.numberOfRows { grid.removeRow(at: 0) }
@@ -3957,7 +3971,7 @@ final class UsageWindow: NSWindowController {
             heading("MONTHLY SPEND")
             let used = spend.used ?? 0
             row("this month", bar: limit > 0 ? used / limit * 100 : nil, "\(money(used)) of \(money(limit))",
-                spend.enabled == true ? "" : "off · \(spend.disabled_reason ?? "disabled")")
+                spendNote(spend))
         }
         if let surfaces = usage.surfaces, !surfaces.isEmpty {
             heading("THIS WEEK BY SURFACE")
@@ -3981,7 +3995,7 @@ final class UsageWindow: NSWindowController {
         let json = """
             {"read_at": \(Date().timeIntervalSince1970 * 1000 - 90000), "error": null,
              "credits": [{"limit": 250, "used": 62.5, "remaining": 187.5, "expires_at": \(Date().timeIntervalSince1970 * 1000 + 3 * 86400000)}],
-             "spend": {"used": 12.5, "limit": 60, "enabled": true, "disabled_reason": null},
+             "spend": {"used": 0, "limit": 60, "enabled": false, "disabled_reason": "out_of_credits", "user_disabled": false},
              "surfaces": [{"name": "Claude Code", "percent": 92}, {"name": "Chats", "percent": 8}],
              "fable_share": {"used": 7, "allowance": 50}}
             """
