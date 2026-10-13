@@ -594,8 +594,9 @@ final class SSHGuard {
         return found
     }
 
-    func cleared(_ host: String, for session: String) -> Bool {
-        clearedHosts(session).contains(host)
+    /// Whether the session has every ssh host cleared, a `*` line.
+    func bypassed(_ session: String) -> Bool {
+        clearedHosts(session).contains("*")
     }
 
     private func clearedHosts(_ session: String) -> [String] {
@@ -603,10 +604,11 @@ final class SSHGuard {
         return text.split(separator: "\n").map(String.init)
     }
 
-    /// Clears the host for the session, or takes the clearance back.
-    func toggle(_ host: String, for session: String) {
+    /// Clears every host for the session, or takes that back; hosts cleared
+    /// one by one with the script stay as they are.
+    func toggleBypass(for session: String) {
         var hosts = clearedHosts(session)
-        if hosts.contains(host) { hosts.removeAll { $0 == host } } else { hosts.append(host) }
+        if hosts.contains("*") { hosts.removeAll { $0 == "*" } } else { hosts.append("*") }
         try? fm.createDirectory(at: allowDir, withIntermediateDirectories: true)
         let file = allowDir.appendingPathComponent(session)
         if hosts.isEmpty {
@@ -4960,19 +4962,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         menu.addItem(ActionItem("Verdicts", enabled: sid != nil) { [weak self] in
             sid.map { self?.openVerdicts(sessionId: $0) }
         })
-        if let id = sid, let asked = sshGuard.asks[id] {
-            menu.addItem(.separator())
-            for ask in asked {
-                let on = sshGuard.cleared(ask.host, for: id)
-                let item = ActionItem("Allow ssh to \(ask.host)") { [weak self] in
-                    self?.sshGuard.toggle(ask.host, for: id)
-                }
-                item.state = on ? .on : .off
-                item.toolTip = on
-                    ? "ssh-request-guard no longer asks about \(ask.host) in this session; click to ask again"
-                    : "Stops ssh-request-guard asking about \(ask.host) in this session only; tunnels still ask"
-                menu.addItem(item)
+        if let id = sid, !past {
+            let on = sshGuard.bypassed(id)
+            let item = ActionItem("Bypass ssh guard for this session") { [weak self] in
+                self?.sshGuard.toggleBypass(for: id)
             }
+            item.state = on ? .on : .off
+            item.toolTip = on
+                ? "ssh-request-guard does not ask about any host in this session; click to ask again"
+                : "Stops ssh-request-guard asking about any host in this session only; tunnels still ask"
+            menu.addItem(item)
             menu.addItem(.separator())
         }
         let launchDir = s.project_dir.map { ($0 as NSString).expandingTildeInPath }
@@ -6181,7 +6180,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             {
                 // The guard logs its ask just before the prompt it causes.
                 if let ask = sshGuard.asks[id]?.first, ask.at <= asked, asked - ask.at < 30,
-                    !sshGuard.cleared(ask.host, for: id)
+                    !sshGuard.bypassed(id)
                 {
                     return ("ssh \(ask.host)?", Palette.yellow)
                 }
