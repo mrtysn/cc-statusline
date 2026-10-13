@@ -12,6 +12,7 @@
 import AppKit
 import AudioToolbox
 import AVFoundation
+import Carbon.HIToolbox
 import CryptoKit
 import Foundation
 import MacAppBase
@@ -3585,7 +3586,287 @@ struct CloMenu: Decodable {
     }
 }
 
-/// A directory sessions were started in, for the New Session sheet's folder list.
+/// A key and the modifiers held with it: the system-wide shortcut that opens
+/// New Session. There is no default; it is whatever the owner recorded.
+struct Shortcut: Codable, Equatable {
+    var keyCode: Int
+    /// Any of "control", "option", "shift", "command".
+    var modifiers: [String]
+    /// The key as typed, for showing it: "N", "Space", "F5".
+    var label: String
+
+    enum CodingKeys: String, CodingKey {
+        case keyCode = "key_code"
+        case modifiers
+        case label
+    }
+
+    /// The modifiers as Carbon's hot key API takes them.
+    var carbonModifiers: UInt32 {
+        var flags: UInt32 = 0
+        if modifiers.contains("control") { flags |= UInt32(controlKey) }
+        if modifiers.contains("option") { flags |= UInt32(optionKey) }
+        if modifiers.contains("shift") { flags |= UInt32(shiftKey) }
+        if modifiers.contains("command") { flags |= UInt32(cmdKey) }
+        return flags
+    }
+
+    /// Control, Option or Command: a shortcut without one would fire while typing.
+    var hasStrongModifier: Bool { !modifiers.filter { $0 != "shift" }.isEmpty }
+
+    /// `⌃⌥N`: the modifiers in the order macOS writes them, then the key.
+    var display: String {
+        let glyphs = [("control", "\u{2303}"), ("option", "\u{2325}"), ("shift", "\u{21E7}"), ("command", "\u{2318}")]
+        return glyphs.filter { modifiers.contains($0.0) }.map(\.1).joined() + label
+    }
+
+    /// How a key is written when its character is not a letter or digit.
+    private static let keyNames: [Int: String] = [
+        kVK_Space: "Space", kVK_Return: "Return", kVK_Tab: "Tab", kVK_Delete: "Delete",
+        kVK_ForwardDelete: "Fn-Delete", kVK_LeftArrow: "\u{2190}", kVK_RightArrow: "\u{2192}",
+        kVK_UpArrow: "\u{2191}", kVK_DownArrow: "\u{2193}", kVK_Home: "Home", kVK_End: "End",
+        kVK_PageUp: "Page Up", kVK_PageDown: "Page Down",
+        kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4", kVK_F5: "F5", kVK_F6: "F6",
+        kVK_F7: "F7", kVK_F8: "F8", kVK_F9: "F9", kVK_F10: "F10", kVK_F11: "F11", kVK_F12: "F12",
+    ]
+
+    /// The shortcut a key event makes, or nil for a key with no name to show it by.
+    init?(event: NSEvent) {
+        let code = Int(event.keyCode)
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let name = Self.keyNames[code] ?? event.charactersIgnoringModifiers?.uppercased() ?? ""
+        guard !name.isEmpty, !name.unicodeScalars.contains(where: { $0.value < 0x20 }) else { return nil }
+        keyCode = code
+        label = name
+        modifiers = [
+            flags.contains(.control) ? "control" : nil, flags.contains(.option) ? "option" : nil,
+            flags.contains(.shift) ? "shift" : nil, flags.contains(.command) ? "command" : nil,
+        ].compactMap { $0 }
+    }
+}
+
+/// shortcut.json beside sounds.json: the one global shortcut, or none. A missing
+/// or unreadable file means none; the app never invents one.
+final class ShortcutStore {
+    private struct File: Codable {
+        var shortcut: Shortcut?
+    }
+
+    private let url = supportDir.appendingPathComponent("shortcut.json")
+    private(set) var current: Shortcut?
+
+    init() {
+        if let data = try? Data(contentsOf: url), let file = try? JSONDecoder().decode(File.self, from: data) {
+            current = file.shortcut
+        }
+    }
+
+    func save(_ shortcut: Shortcut?) {
+        current = shortcut
+        try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        // Atomic, like the other settings files.
+        try? encoder.encode(File(shortcut: shortcut)).write(to: url, options: .atomic)
+    }
+}
+
+/// The system-wide hot key, through Carbon's RegisterEventHotKey: it needs no
+/// Accessibility permission and works from any app.
+final class GlobalHotKey {
+    /// Called on the main queue when the shortcut is pressed.
+    var onPress: (() -> Void)?
+    private(set) var active: Shortcut?
+    private var reference: EventHotKeyRef?
+    private static weak var instance: GlobalHotKey?
+
+    init() {
+        Self.instance = self
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, _, _ in
+                DispatchQueue.main.async { GlobalHotKey.instance?.onPress?() }
+                return noErr
+            }, 1, &spec, nil, nil)
+    }
+
+    /// Makes `shortcut` the hot key, or none with nil. Returns why it could not be,
+    /// and then the previous one stays.
+    func set(_ shortcut: Shortcut?) -> String? {
+        let previous = active
+        unregister()
+        guard let shortcut = shortcut else { return nil }
+        if let error = register(shortcut) {
+            if let previous = previous { _ = register(previous) }
+            return error
+        }
+        return nil
+    }
+
+    private func register(_ shortcut: Shortcut) -> String? {
+        var made: EventHotKeyRef?
+        let id = EventHotKeyID(signature: OSType(0x4343_5353), id: 1)
+        let status = RegisterEventHotKey(
+            UInt32(shortcut.keyCode), shortcut.carbonModifiers, id, GetApplicationEventTarget(), 0, &made)
+        guard status == noErr, let made = made else {
+            return status == OSStatus(eventHotKeyExistsErr)
+                ? "\(shortcut.display) is already taken by another app."
+                : "macOS refused \(shortcut.display) (error \(status))."
+        }
+        reference = made
+        active = shortcut
+        return nil
+    }
+
+    private func unregister() {
+        if let reference = reference { UnregisterEventHotKey(reference) }
+        reference = nil
+        active = nil
+    }
+}
+
+/// A button that records the next key combination typed while it is armed.
+final class ShortcutRecorder: NSButton {
+    /// A recorded combination; returns why it was refused, or nil.
+    var onRecord: ((Shortcut) -> String?)?
+    /// Said inline in the window: a refusal, or nothing.
+    var onMessage: ((String) -> Void)?
+    private var recording = false
+    var shortcut: Shortcut? { didSet { drawTitle() } }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    init() {
+        super.init(frame: .zero)
+        bezelStyle = .rounded
+        setButtonType(.momentaryPushIn)
+        target = self
+        action = #selector(arm)
+        drawTitle()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func drawTitle() {
+        title = recording ? "Type the new combination\u{2026}" : shortcut?.display ?? "Unset"
+    }
+
+    @objc private func arm() {
+        recording = true
+        window?.makeFirstResponder(self)
+        drawTitle()
+    }
+
+    override func resignFirstResponder() -> Bool {
+        recording = false
+        drawTitle()
+        return super.resignFirstResponder()
+    }
+
+    /// While armed, every combination is the recorder's, even ones a menu would take.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard recording else { return super.performKeyEquivalent(with: event) }
+        record(event)
+        return true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if recording { record(event) } else { super.keyDown(with: event) }
+    }
+
+    private func record(_ event: NSEvent) {
+        if Int(event.keyCode) == kVK_Escape {
+            recording = false
+            drawTitle()
+            return
+        }
+        guard let combination = Shortcut(event: event), combination.hasStrongModifier else {
+            onMessage?("Hold Control, Option or Command with the key.")
+            return
+        }
+        recording = false
+        if let refusal = onRecord?(combination) {
+            onMessage?(refusal)
+        } else {
+            onMessage?("")
+        }
+        drawTitle()
+    }
+}
+
+/// New Session Shortcut: the window where the global shortcut is recorded,
+/// cleared, and its refusal shown. Nothing is set until something is recorded.
+final class ShortcutWindow: NSWindowController {
+    private let apply: (Shortcut?) -> String?
+    private let recorder = ShortcutRecorder()
+    private let note = NSTextField(wrappingLabelWithString: "")
+
+    init(current: Shortcut?, apply: @escaping (Shortcut?) -> String?) {
+        self.apply = apply
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 170),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "New Session Shortcut"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        recorder.shortcut = current
+        build()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        let intro = NSTextField(wrappingLabelWithString:
+            "Press this from any app to open the New Session window. "
+            + "Click the box, then type a combination that includes Control, Option or Command. Esc cancels.")
+        intro.font = NSFont.systemFont(ofSize: 12)
+        intro.textColor = .secondaryLabelColor
+        recorder.onRecord = { [weak self] combination in
+            guard let self = self else { return nil }
+            if let refusal = self.apply(combination) { return refusal }
+            self.recorder.shortcut = combination
+            return nil
+        }
+        recorder.onMessage = { [weak self] message in self?.say(message) }
+        note.font = NSFont.systemFont(ofSize: 11)
+        note.textColor = Palette.red
+        let clear = NSButton(title: "Clear", target: self, action: #selector(clear))
+        let done = NSButton(title: "Done", target: self, action: #selector(done))
+        done.keyEquivalent = "\r"
+        let buttons = NSStackView(views: [clear, done])
+        buttons.spacing = 10
+        for view in [intro, recorder, note, buttons] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            intro.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            intro.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            recorder.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 14),
+            recorder.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            recorder.widthAnchor.constraint(equalToConstant: 200),
+            note.topAnchor.constraint(equalTo: recorder.bottomAnchor, constant: 8),
+            note.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            note.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            buttons.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+        ])
+    }
+
+    private func say(_ message: String) { note.stringValue = message }
+
+    /// Back to no shortcut at all.
+    @objc private func clear() {
+        if let refusal = apply(nil) { say(refusal) } else { say(""); recorder.shortcut = nil }
+    }
+
+    @objc private func done() { window?.close() }
+}
+
 /// A segmented control the keyboard can reach: Left and Right change the
 /// segment, Return goes on to the next control, Tab and Shift-Tab move through
 /// the sheet as usual, and a ring shows that it has focus.
@@ -3618,6 +3899,7 @@ final class KeyedSegmentedControl: NSSegmentedControl {
     }
 }
 
+/// A directory sessions were started in, for the New Session sheet's folder list.
 struct NewSessionFolder {
     /// Absolute path, what `clo launch --dir` gets.
     let dir: String
@@ -3657,14 +3939,18 @@ func fuzzyMatch(_ query: String, in path: String) -> (score: Int, positions: [In
     return scan(from: 0)
 }
 
-/// New Session: a sheet over the list that picks a folder, a model, an effort
+/// New Session: a window of its own that picks a folder, a model, an effort
 /// and an optional first message, and hands `clo launch ...` to `onLaunch`,
 /// which opens it in a new tab. The folder is typed: a field over a list that
 /// narrows as the letters come (fuzzy, best match first; Up and Down move,
 /// Return picks and goes on to the first message, Esc closes). The folders come
 /// from the sessions the app knows; the models and each model's remembered
 /// effort from `clo --menu-json`. Command-Return launches.
-final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class NewSessionWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegate, NSTableViewDataSource,
+    NSTableViewDelegate
+{
+    /// Called when the window has closed, launched or not.
+    var onClose: (() -> Void)?
     private let folders: [NewSessionFolder]
     private let onLaunch: (String) -> Void
     private var cloMenu: CloMenu?
@@ -3687,12 +3973,19 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
     init(folders: [NewSessionFolder], onLaunch: @escaping (String) -> Void) {
         self.folders = folders
         self.onLaunch = onLaunch
-        let window = NSWindow(
+        // Its own window, not a sheet of the sessions window, and non-activating: it can
+        // take keyboard focus while another app stays the active one, so the shortcut
+        // opens this and nothing else of CC Sessions.
+        let window = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 560, height: 360),
-            styleMask: [.titled], backing: .buffered, defer: false)
+            styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
         window.title = "New Session"
         window.appearance = NSAppearance(named: .darkAqua)
+        window.isFloatingPanel = true
+        window.hidesOnDeactivate = false
+        window.isReleasedWhenClosed = false
         super.init(window: window)
+        window.delegate = self
         build()
         filter()
         load()
@@ -3726,18 +4019,18 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
         modelControl.segmentStyle = .rounded
         modelControl.trackingMode = .selectOne
         effortControl.segmentStyle = .rounded
-        modelControl.isEnabled = false
         effortControl.trackingMode = .selectOne
         let efforts = [Self.unset] + Self.efforts
         effortControl.segmentCount = efforts.count
         for (index, effort) in efforts.enumerated() { effortControl.setLabel(effort, forSegment: index) }
+        modelControl.isEnabled = false
         modelControl.segmentCount = 1
         modelControl.setLabel("Loading…", forSegment: 0)
-
         modelControl.onAdvance = { [weak self] in self?.window?.makeFirstResponder(self?.effortControl) }
         effortControl.onAdvance = { [weak self] in self?.window?.makeFirstResponder(self?.promptField) }
         promptField.delegate = self
         folderTable.refusesFirstResponder = true
+
         func label(_ text: String) -> NSTextField {
             let l = NSTextField(labelWithString: text)
             l.font = NSFont.systemFont(ofSize: 12)
@@ -3794,13 +4087,13 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
             buttons.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
-        window?.initialFirstResponder = folderField
         // Folder, model, effort, first message, and round again.
         folderField.nextKeyView = modelControl
         modelControl.nextKeyView = effortControl
         effortControl.nextKeyView = promptField
         promptField.nextKeyView = folderField
         window?.autorecalculatesKeyViewLoop = false
+        window?.initialFirstResponder = folderField
         if folders.isEmpty { show("No session has a directory yet, so there is no folder to start in.") }
     }
 
@@ -3870,7 +4163,6 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
     /// Up, Down, Return and Esc in the folder field act on the list; Return in
     /// the first message launches, and Esc closes the sheet from either.
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
-        guard control === folderField else { return false }
         if control === promptField {
             switch selector {
             case #selector(NSResponder.insertNewline(_:)): launch()
@@ -3879,6 +4171,7 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
             }
             return true
         }
+        guard control === folderField else { return false }
         switch selector {
         case #selector(NSResponder.moveUp(_:)):
             select(folderTable.selectedRow - 1)
@@ -3959,8 +4252,23 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
     }
 
     @objc private func cancel() {
+        window?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) { onClose?() }
+
+    /// Centres the window on the screen the pointer is on and gives it the keyboard,
+    /// without activating CC Sessions or touching its other windows.
+    func show() {
         guard let window = window else { return }
-        window.sheetParent?.endSheet(window)
+        let pointer = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(pointer, $0.frame, false) } ?? NSScreen.main
+        if let area = screen?.visibleFrame {
+            window.setFrameOrigin(NSPoint(x: area.midX - window.frame.width / 2, y: area.midY - window.frame.height / 2))
+        }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        window.makeFirstResponder(folderField)
     }
 }
 
@@ -4515,7 +4823,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var verdictsSheet: VerdictSettingsWindow?
     /// Opens Repo Tags, beside the filter it feeds.
     private let repoTagsButton = NSButton(title: "", target: nil, action: nil)
-    private var newSessionSheet: NewSessionWindow?
+    private var newSessionWindow: NewSessionWindow?
+    /// The system-wide shortcut for New Session, and the window that sets it.
+    private let shortcutStore = ShortcutStore()
+    private let hotKey = GlobalHotKey()
+    private var shortcutWindow: ShortcutWindow?
     /// The tag filter and the verdicts toggle: what the list and the
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
@@ -4537,6 +4849,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "CC Sessions"
+        // Closing the list can leave the app running (see applicationShouldTerminateAfterLastWindowClosed).
+        window.isReleasedWhenClosed = false
         window.subtitle = "Agent Bar Hopping"
         window.titlebarAppearsTransparent = true
         window.backgroundColor = Palette.background
@@ -4574,7 +4888,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             DispatchQueue.main.async { self?.reload() }
         }
         reload()
-    }
+        startHotKey()    }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
@@ -4801,7 +5115,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .bold)
         button.contentTintColor = Palette.dim
         button.isEnabled = available
-        button.toolTip = available ? "New session" : "clo not on PATH"
+        button.toolTip = available ? "New session" + (hotKey.active.map { "  " + $0.display } ?? "") : "clo not on PATH"
         button.setAccessibilityLabel("New session")
         button.translatesAutoresizingMaskIntoConstraints = false
         let cell = NSView()
@@ -4831,11 +5145,46 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
+    var hasNewSessionShortcut: Bool { hotKey.active != nil }
+
+    /// Registers the recorded shortcut, if there is one, and answers its presses.
+    private func startHotKey() {
+        hotKey.onPress = { [weak self] in self?.openNewSession() }
+        if let error = hotKey.set(shortcutStore.current) { log("new session shortcut: \(error)") }
+    }
+
+    /// Session ▸ New Session Shortcut…
+    @objc func openShortcutSettings() {
+        if shortcutWindow == nil {
+            shortcutWindow = ShortcutWindow(current: hotKey.active) { [weak self] shortcut in
+                self?.applyShortcut(shortcut)
+            }
+        }
+        shortcutWindow?.showWindow(nil)
+        shortcutWindow?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Makes `shortcut` the hot key and keeps it; the reason it was refused otherwise.
+    private func applyShortcut(_ shortcut: Shortcut?) -> String? {
+        if let refusal = hotKey.set(shortcut) { return refusal }
+        shortcutStore.save(shortcut)
+        // The plus button's tooltip names the combination.
+        table.reloadData(forRowIndexes: IndexSet(integer: 0), columnIndexes: IndexSet(table.tableColumns.indices))
+        return nil
+    }
+
+    /// Shows the New Session window, the plus button's and the shortcut's one path: a
+    /// second press focuses the one already open. It touches no other window.
     @objc func openNewSession() {
-        guard cloPath != nil, let window = window, window.attachedSheet == nil else { return }
-        let sheet = NewSessionWindow(folders: newSessionFolders()) { command in runInNewTab(command) }
-        newSessionSheet = sheet
-        window.beginSheet(sheet.window!) { [weak self] _ in self?.newSessionSheet = nil }
+        guard cloPath != nil else { return }
+        if let open = newSessionWindow, open.window?.isVisible == true {
+            open.show()
+            return
+        }
+        let created = NewSessionWindow(folders: newSessionFolders()) { command in runInNewTab(command) }
+        created.onClose = { [weak self] in self?.newSessionWindow = nil }
+        newSessionWindow = created
+        created.show()
     }
 
     /// system-one's verdict row on the status line: a text toggle in the
@@ -5369,6 +5718,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(openShortcutSettings) {
+            item.title = "New Session Shortcut\u{2026} (\(hotKey.active?.display ?? "Unset"))"
+            return true
+        }
         guard item.action == #selector(showSelectedTerminal) else { return true }
         item.title = selected?.past == true ? "Resume Session" : "Show Terminal"
         return selected != nil
@@ -6789,7 +7142,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Reporter.start(tool: "cc-sessions")
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// With a New Session shortcut set, closing the list leaves the app running so the
+    /// shortcut keeps working; without one, closing the last window quits as it always did.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        controller?.hasNewSessionShortcut != true
+    }
+
+    /// A click on the Dock icon brings the list back after it was closed.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { controller?.showWindow(nil) }
+        return true
+    }
 
     /// One copy at a time, the newest: a rebuild, a copy started from
     /// elsewhere and one opened from the Applications folder are separate
@@ -6836,6 +7199,9 @@ func buildMenu() {
         keyEquivalent: "")
     sessionMenu.addItem(.separator())
     sessionMenu.addItem(withTitle: "Repo Tags…", action: #selector(SessionsWindow.openRepoTags), keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "New Session Shortcut…", action: #selector(SessionsWindow.openShortcutSettings),
+        keyEquivalent: "")
     sessionItem.submenu = sessionMenu
     main.addItem(sessionItem)
 

@@ -73,6 +73,8 @@ The app talks to local-repos-list only through its versioned `api` commands, so 
 
 Restart Session, and Restart Outdated Sessions… in the Session menu for every live session on an older Claude Code than the latest release, restarts a session in its own iTerm tab so the tabs keep their order: Claude Code gets a SIGTERM, a clean exit that runs its SessionEnd hooks, and once the shell is back at its prompt the resume command (with the session's model, effort and permission mode) is typed there. Only an idle session with no background agent out is restarted; the bulk action says how many busy ones it left alone. If the tab closed along with Claude Code, the session resumes in a new tab instead.
 
+The plus in the first cell of the `this tool` row opens New Session in a window of its own: type part of a folder name, pick a model and effort with the arrow keys, add a first message if you like, and Return on it (or ⌘↩) starts the session in a new iTerm tab through `clo launch`. A system-wide shortcut for that window is unset until you record one under Session → New Session Shortcut…; it is kept in `shortcut.json` beside `sounds.json`, and while one is set, closing the list leaves the app running so the shortcut keeps working.
+
 ## Session events and sounds
 
 The status line only runs when Claude Code redraws, so it never hears about events. `hooks/event.zsh` does: registered as an async hook, it writes each event's JSON to `~/.cache/cc-statusline/events/` (about 15 ms, and Claude Code does not wait for it), and the app reads and deletes each file. Register it with `scripts/install-event-hook.zsh` (`--remove` takes it out again); it edits `settings.json` in your Claude config directory and keeps the previous version as `settings.json.bak`.
