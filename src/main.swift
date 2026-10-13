@@ -229,6 +229,42 @@ struct FableQuota: Decodable {
     let read_at: Double?
 }
 
+/// A credit grant from the account's usage response: dollars, and when it lapses.
+struct CreditGrant: Decodable {
+    let limit: Double
+    let used: Double?
+    let remaining: Double?
+    let expires_at: Double?
+}
+
+struct SpendCap: Decodable {
+    let used: Double?
+    let limit: Double?
+    let enabled: Bool?
+    let disabled_reason: String?
+}
+
+struct SurfaceShare: Decodable {
+    let name: String
+    let percent: Double
+}
+
+struct FableShare: Decodable {
+    let used: Double
+    let allowance: Double
+}
+
+/// What the Usage window shows beyond the quota bar, from the shared usage cache.
+/// Every field is optional: a cache written before they existed has none.
+struct UsageSummary: Decodable {
+    let read_at: Double?
+    let error: String?
+    let credits: [CreditGrant]?
+    let spend: SpendCap?
+    let surfaces: [SurfaceShare]?
+    let fable_share: FableShare?
+}
+
 /// An outside format that stopped matching what the tool reads; see health.json.
 struct HealthIssue: Decodable {
     let key: String
@@ -242,6 +278,7 @@ struct Snapshot: Decodable {
     let live: [Session]
     let history: [Session]
     let fable: FableQuota?
+    let usage: UsageSummary?
     let health: [HealthIssue]?
 }
 
@@ -3820,6 +3857,158 @@ final class ShortcutRecorder: NSButton {
 
 /// New Session Shortcut: the window where the global shortcut is recorded,
 /// cleared, and its refusal shown. Nothing is set until something is recorded.
+/// Usage, from the Session menu or a click on the quota bar: what the account's
+/// usage endpoint says beyond the three quotas drawn there — Fable's share of the
+/// week, credit grants, the monthly spend cap and where the week went. A titled
+/// window, not a popover, so the capture script can read it.
+final class UsageWindow: NSWindowController {
+    fileprivate let grid = NSGridView()
+
+    init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 300),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Usage"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        guard let content = window.contentView else { return }
+        content.wantsLayer = true
+        content.layer?.backgroundColor = Palette.background.cgColor
+        grid.rowSpacing = 6
+        grid.columnSpacing = 12
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -18),
+        ])
+        update(nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func show() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func money(_ dollars: Double?) -> String {
+        guard let d = dollars else { return "—" }
+        return String(format: "$%.2f", d)
+    }
+
+    private func label(_ text: String, _ colour: NSColor = Palette.text, size: CGFloat = 12, weight: NSFont.Weight = .regular) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
+        field.textColor = colour
+        return field
+    }
+
+    private func bar(_ percent: Double) -> BarView {
+        let view = BarView()
+        view.fraction = max(0, min(1, percent / 100))
+        view.colour = Palette.threshold(percent)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        return view
+    }
+
+    private func heading(_ text: String) {
+        if grid.numberOfRows > 0 { grid.addRow(with: [label(" ", size: 6)]) }
+        grid.addRow(with: [label(text, Palette.dim, size: 11)])
+    }
+
+    /// One row: name, a bar, and the reading in words. A nil bar leaves the cell empty.
+    private func row(_ name: String, bar percent: Double?, _ reading: String, _ note: String = "") {
+        grid.addRow(with: [
+            label(name, Palette.dim, size: 11),
+            percent.map { bar($0) } ?? NSView(),
+            label(reading, weight: .medium),
+            label(note, Palette.dim, size: 11),
+        ])
+    }
+
+    func update(_ usage: UsageSummary?) {
+        // removeRow leaves a row's views in the grid as subviews; they would draw over the next reading.
+        for _ in 0..<grid.numberOfRows { grid.removeRow(at: 0) }
+        for view in grid.subviews { view.removeFromSuperview() }
+        guard let usage = usage else {
+            grid.addRow(with: [label("No usage reading yet.", Palette.dim)])
+            return
+        }
+        if let share = usage.fable_share {
+            heading("FABLE")
+            row("weekly share", bar: share.allowance > 0 ? share.used / share.allowance * 100 : nil,
+                "\(Int(share.used.rounded()))% of \(Int(share.allowance.rounded()))%", "of the weekly limit")
+        }
+        if let credits = usage.credits, !credits.isEmpty {
+            heading("CREDITS")
+            for grant in credits {
+                let used = grant.limit > 0 ? (grant.used ?? 0) / grant.limit * 100 : 0
+                row("cloud sessions", bar: used,
+                    "\(money(grant.remaining)) of \(money(grant.limit))",
+                    grant.expires_at.map { "left · expires \(clock($0))" } ?? "left")
+            }
+        }
+        if let spend = usage.spend, let limit = spend.limit {
+            heading("MONTHLY SPEND")
+            let used = spend.used ?? 0
+            row("this month", bar: limit > 0 ? used / limit * 100 : nil, "\(money(used)) of \(money(limit))",
+                spend.enabled == true ? "" : "off · \(spend.disabled_reason ?? "disabled")")
+        }
+        if let surfaces = usage.surfaces, !surfaces.isEmpty {
+            heading("THIS WEEK BY SURFACE")
+            for surface in surfaces { row(surface.name, bar: surface.percent, "\(Int(surface.percent.rounded()))%") }
+        }
+        heading("")
+        var footer = usage.read_at.map { "read \(ago($0)) ago" } ?? "never read"
+        if let error = usage.error { footer += " · refresh failed: \(error)" }
+        grid.addRow(with: [label(footer, usage.error == nil ? Palette.dim : Palette.yellow, size: 11)])
+        window?.layoutIfNeeded()
+        if let content = window?.contentView, let window = window {
+            window.setContentSize(NSSize(width: max(420, grid.fittingSize.width + 36), height: grid.fittingSize.height + 36))
+            _ = content
+        }
+    }
+
+    /// The window over a fixture reading, for the self-test: it must decode, draw every
+    /// section and fit its content. `CC_SESSIONS_USAGE_PNG=<path>` also saves the picture,
+    /// which is how the layout is read without opening the app.
+    static func selfTestProblems() -> [String] {
+        let json = """
+            {"read_at": \(Date().timeIntervalSince1970 * 1000 - 90000), "error": null,
+             "credits": [{"limit": 250, "used": 62.5, "remaining": 187.5, "expires_at": \(Date().timeIntervalSince1970 * 1000 + 3 * 86400000)}],
+             "spend": {"used": 12.5, "limit": 60, "enabled": true, "disabled_reason": null},
+             "surfaces": [{"name": "Claude Code", "percent": 92}, {"name": "Chats", "percent": 8}],
+             "fable_share": {"used": 7, "allowance": 50}}
+            """
+        guard let usage = try? JSONDecoder().decode(UsageSummary.self, from: Data(json.utf8)) else {
+            return ["usage fixture did not decode"]
+        }
+        let window = UsageWindow()
+        window.update(usage)
+        var problems: [String] = []
+        if window.grid.numberOfRows < 8 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 8 or more") }
+        if let content = window.window?.contentView {
+            content.layoutSubtreeIfNeeded()
+            if window.grid.frame.maxX > content.bounds.maxX || window.grid.frame.minY < 0 {
+                problems.append("usage window's content does not fit it")
+            }
+            if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_USAGE_PNG"],
+                let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+            {
+                content.cacheDisplay(in: content.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+            }
+        }
+        window.update(nil)
+        return problems
+    }
+}
+
 final class ShortcutWindow: NSWindowController {
     private let apply: (Shortcut?) -> String?
     private let recorder = ShortcutRecorder()
@@ -4883,6 +5072,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let shortcutStore = ShortcutStore()
     private let hotKey = GlobalHotKey()
     private var shortcutWindow: ShortcutWindow?
+    private var usageWindow: UsageWindow?
+    /// The newest usage reading, kept so the window opens with it at once.
+    private var lastUsage: UsageSummary?
     /// The tag filter and the verdicts toggle: what the list and the
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
@@ -4968,6 +5160,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         quotaBar.alignment = .top
         quotaBar.spacing = 32
         quotaBar.translatesAutoresizingMaskIntoConstraints = false
+        quotaBar.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(openUsage)))
 
         buildColumns()
         table.dataSource = self
@@ -5211,6 +5404,21 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if let error = hotKey.set(shortcutStore.current) { log("new session shortcut: \(error)") }
     }
 
+    /// Session ▸ Usage…, and a click on the quota bar: shows the Usage window with the
+    /// last reading, then asks for a fresher one; the call is age- and lock-gated.
+    @objc func openUsage() {
+        if usageWindow == nil {
+            usageWindow = UsageWindow()
+            usageWindow?.window?.center()
+        }
+        usageWindow?.update(lastUsage)
+        usageWindow?.show()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            refreshUsageOnce()
+            DispatchQueue.main.async { self?.reload() }
+        }
+    }
+
     /// Session ▸ New Session Shortcut…
     @objc func openShortcutSettings() {
         if shortcutWindow == nil {
@@ -5431,7 +5639,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if rows.count != total { problems.append("All sessions shows \(rows.count), want \(total)") }
 
         // Empty snapshot: the label says no session has drawn a status line yet.
-        apply(Snapshot(live: [], history: [], fable: nil, health: nil), loads: [:], reused: [], cost: nil, footprint: 0)
+        apply(Snapshot(live: [], history: [], fable: nil, usage: nil, health: nil), loads: [:], reused: [], cost: nil, footprint: 0)
         if emptyLabel.isHidden || emptyLabel.stringValue != "No session has drawn a status line yet." {
             problems.append("the empty snapshot shows \"\(emptyLabel.stringValue)\"")
         }
@@ -5509,6 +5717,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         emptyLabel.isHidden = !rows.isEmpty
         drawQuotaBar(snapshot)
         fitMinimumWidth()
+        lastUsage = snapshot.usage
+        usageWindow?.update(snapshot.usage)
         sortRows()
         refreshTable()
         table.reloadData(forRowIndexes: IndexSet(integer: 0), columnIndexes: IndexSet(table.tableColumns.indices))
@@ -7306,6 +7516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             problems = ["fixture did not decode: \(error)"]
         }
+        problems += UsageWindow.selfTestProblems()
         try? fm.removeItem(at: selfTestRoot)
         for problem in problems { print("self-test: \(problem)") }
         print(problems.isEmpty ? "self-test: every check passed" : "self-test: \(problems.count) failed")
@@ -7370,6 +7581,7 @@ func buildMenu() {
         keyEquivalent: "")
     sessionMenu.addItem(.separator())
     sessionMenu.addItem(withTitle: "Repo Tags…", action: #selector(SessionsWindow.openRepoTags), keyEquivalent: "")
+    sessionMenu.addItem(withTitle: "Usage…", action: #selector(SessionsWindow.openUsage), keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "New Session Shortcut…", action: #selector(SessionsWindow.openShortcutSettings),
         keyEquivalent: "")
