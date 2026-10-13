@@ -3586,6 +3586,38 @@ struct CloMenu: Decodable {
 }
 
 /// A directory sessions were started in, for the New Session sheet's folder list.
+/// A segmented control the keyboard can reach: Left and Right change the
+/// segment, Return goes on to the next control, Tab and Shift-Tab move through
+/// the sheet as usual, and a ring shows that it has focus.
+final class KeyedSegmentedControl: NSSegmentedControl {
+    /// Called on Return.
+    var onAdvance: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool { isEnabled }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch Int(event.keyCode) {
+        case kVK_LeftArrow: step(-1)
+        case kVK_RightArrow: step(1)
+        case kVK_Return, kVK_ANSI_KeypadEnter: onAdvance?()
+        case kVK_Tab:
+            if event.modifierFlags.contains(.shift) { window?.selectPreviousKeyView(nil) } else { window?.selectNextKeyView(nil) }
+        default: super.keyDown(with: event)
+        }
+    }
+
+    private func step(_ delta: Int) {
+        let next = max(0, min(segmentCount - 1, selectedSegment + delta))
+        guard next != selectedSegment else { return }
+        for index in 0..<segmentCount { setSelected(index == next, forSegment: index) }
+        sendAction(action, to: target)
+    }
+}
+
 struct NewSessionFolder {
     /// Absolute path, what `clo launch --dir` gets.
     let dir: String
@@ -3644,9 +3676,8 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
     private var matches: [(folder: NewSessionFolder, positions: [Int])] = []
     /// The folder Return picked, until the field is typed in again.
     private var chosen: NewSessionFolder?
-    private let modelControl = NSSegmentedControl()
-    private let effortControl = NSSegmentedControl(
-        labels: [NewSessionWindow.unset] + NewSessionWindow.efforts, trackingMode: .selectOne, target: nil, action: nil)
+    private let modelControl = KeyedSegmentedControl()
+    private let effortControl = KeyedSegmentedControl()
     private let promptField = NSTextField()
     private let problem = NSTextField(wrappingLabelWithString: "")
     private let launchButton = NSButton(title: "Launch", target: nil, action: nil)
@@ -3696,9 +3727,17 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
         modelControl.trackingMode = .selectOne
         effortControl.segmentStyle = .rounded
         modelControl.isEnabled = false
+        effortControl.trackingMode = .selectOne
+        let efforts = [Self.unset] + Self.efforts
+        effortControl.segmentCount = efforts.count
+        for (index, effort) in efforts.enumerated() { effortControl.setLabel(effort, forSegment: index) }
         modelControl.segmentCount = 1
         modelControl.setLabel("Loading…", forSegment: 0)
 
+        modelControl.onAdvance = { [weak self] in self?.window?.makeFirstResponder(self?.effortControl) }
+        effortControl.onAdvance = { [weak self] in self?.window?.makeFirstResponder(self?.promptField) }
+        promptField.delegate = self
+        folderTable.refusesFirstResponder = true
         func label(_ text: String) -> NSTextField {
             let l = NSTextField(labelWithString: text)
             l.font = NSFont.systemFont(ofSize: 12)
@@ -3756,6 +3795,12 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
         window?.initialFirstResponder = folderField
+        // Folder, model, effort, first message, and round again.
+        folderField.nextKeyView = modelControl
+        modelControl.nextKeyView = effortControl
+        effortControl.nextKeyView = promptField
+        promptField.nextKeyView = folderField
+        window?.autorecalculatesKeyViewLoop = false
         if folders.isEmpty { show("No session has a directory yet, so there is no folder to start in.") }
     }
 
@@ -3813,17 +3858,27 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
         pickHighlighted()
     }
 
-    /// Takes the highlighted folder, shows its path in the field and moves on to the message.
+    /// Takes the highlighted folder, shows its path in the field and moves on to the model.
     private func pickHighlighted() {
         guard let item = matches[safe: folderTable.selectedRow] else { return }
         chosen = item.folder
         folderField.stringValue = item.folder.shown
-        window?.makeFirstResponder(promptField)
+        // The model control refuses focus until clo has answered; the message is next then.
+        if window?.makeFirstResponder(modelControl) != true { window?.makeFirstResponder(promptField) }
     }
 
-    /// Up, Down, Return and Esc in the folder field act on the list.
+    /// Up, Down, Return and Esc in the folder field act on the list; Return in
+    /// the first message launches, and Esc closes the sheet from either.
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         guard control === folderField else { return false }
+        if control === promptField {
+            switch selector {
+            case #selector(NSResponder.insertNewline(_:)): launch()
+            case #selector(NSResponder.cancelOperation(_:)): cancel()
+            default: return false
+            }
+            return true
+        }
         switch selector {
         case #selector(NSResponder.moveUp(_:)):
             select(folderTable.selectedRow - 1)
@@ -3889,7 +3944,7 @@ final class NewSessionWindow: NSWindowController, NSTextFieldDelegate, NSTableVi
     // MARK: Launch
 
     @objc private func launch() {
-        guard let folder = chosen ?? matches[safe: folderTable.selectedRow]?.folder, let model = selectedModel else {
+        guard launchButton.isEnabled, let folder = chosen ?? matches[safe: folderTable.selectedRow]?.folder, let model = selectedModel else {
             return
         }
         var parts = ["clo", "launch", "--dir", shellQuoted(folder.dir), "--model", shellQuoted(model)]
