@@ -576,6 +576,26 @@ let supportDir: URL = selfTest ? selfTestRoot.appendingPathComponent("support") 
 /// Where hooks/event.zsh leaves one file per Claude Code event.
 let eventsDir = cacheDir.appendingPathComponent("events")
 
+/// The subagent-guard hook's approval for a session. Past its spawn budget the
+/// hook asks once, then leaves /tmp/claude-spawn-asked-<session id> and asks no
+/// more for that session; making that file here is approving in advance, and
+/// removing it makes the hook ask again past the budget. The nesting ban stays.
+enum SpawnGuard {
+    private static func file(_ session: String) -> String { "/tmp/claude-spawn-asked-\(session)" }
+
+    static func bypassed(_ session: String) -> Bool {
+        FileManager.default.fileExists(atPath: file(session))
+    }
+
+    static func toggleBypass(for session: String) {
+        if bypassed(session) {
+            try? FileManager.default.removeItem(atPath: file(session))
+        } else {
+            FileManager.default.createFile(atPath: file(session), contents: Data())
+        }
+    }
+}
+
 /// The ssh-request-guard hook's asks, and the hosts cleared for each session.
 /// The hook appends one JSON line per ask to asks.jsonl; a host is cleared for a
 /// session by a line in session-allow/<session id>, the file
@@ -6206,6 +6226,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 ? "ssh-request-guard does not ask about any host in this session; click to ask again"
                 : "Stops ssh-request-guard asking about any host in this session only; tunnels still ask"
             menu.addItem(item)
+            let spawnOn = SpawnGuard.bypassed(id)
+            let spawn = ActionItem("Bypass subagent spawn guard for this session") {
+                SpawnGuard.toggleBypass(for: id)
+            }
+            spawn.state = spawnOn ? .on : .off
+            spawn.toolTip = spawnOn
+                ? "subagent-guard does not ask about spawns past its budget in this session; click to ask again"
+                : "Stops subagent-guard asking once this session passes its spawn budget; nesting is still refused"
+            menu.addItem(spawn)
             menu.addItem(.separator())
         }
         let launchDir = s.project_dir.map { ($0 as NSString).expandingTildeInPath }
