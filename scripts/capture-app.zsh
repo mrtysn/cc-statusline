@@ -1,5 +1,5 @@
 #!/bin/zsh
-# DESC: Capture the Agent Bar Hopping window, optionally cropped, without activating it
+# DESC: Capture the CC Sessions window, optionally cropped, without activating it
 set -euo pipefail
 
 if [[ ${1:-} == (-h|--help) || $# -lt 1 ]]; then
@@ -21,12 +21,12 @@ trap 'rm -rf -- "$tmp"' EXIT
 cat > "$tmp/find.swift" <<'EOF'
 import CoreGraphics
 let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
-if let w = list.first(where: { ($0[kCGWindowName as String] as? String) == "Agent Bar Hopping" }) {
+if let w = list.first(where: { ($0[kCGWindowName as String] as? String) == "CC Sessions" }) {
     print(w[kCGWindowNumber as String]!)
 }
 EOF
 id=$(swift "$tmp/find.swift")
-[[ -n $id ]] || { print -u2 "capture-app: no Agent Bar Hopping window is open"; exit 1; }
+[[ -n $id ]] || { print -u2 "capture-app: no CC Sessions window is open"; exit 1; }
 
 if (( $# == 0 )); then
   screencapture -x -o -l "$id" "$out"

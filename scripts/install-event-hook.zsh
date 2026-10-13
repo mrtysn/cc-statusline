@@ -1,11 +1,11 @@
 #!/bin/zsh
-# DESC: Register hooks/event.zsh in Claude Code's settings, so Agent Bar Hopping hears session events
+# DESC: Register hooks/event.zsh in Claude Code's settings, so CC Sessions hears session events
 set -euo pipefail
 
 if [[ ${1:-} == (-h|--help) ]]; then
   print "usage: ${0:t} [--remove]"
   print "Links this checkout's hooks/event.zsh into \${CLAUDE_CONFIG_DIR:-~/.claude}/hooks/ and adds it"
-  print "as an async hook on the events Agent Bar Hopping turns into sounds and states, in settings.json."
+  print "as an async hook on the events CC Sessions turns into sounds and states, in settings.json."
   print "Running it again changes nothing; --remove takes the entries out again."
   print "The previous settings are kept next to the file as settings.json.bak."
   exit 0

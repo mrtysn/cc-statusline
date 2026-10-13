@@ -1249,7 +1249,7 @@ function peerNames() {
   return names;
 }
 
-// Every spooled session, drawn and tabulated, for the Agent Bar Hopping app:
+// Every spooled session, drawn and tabulated, for the CC Sessions app:
 // `cc-statusline.js live [--columns N]` prints one JSON document and exits.
 
 function liveSnapshot(columns) {

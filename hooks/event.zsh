@@ -1,5 +1,5 @@
 #!/bin/zsh -f
-# DESC: Claude Code hook: hand each event to Agent Bar Hopping as a file in the cache
+# DESC: Claude Code hook: hand each event to CC Sessions as a file in the cache
 #
 # Registered as an async command hook, so Claude Code never waits on it. It does
 # no parsing: the event's JSON is written whole to a file named by the time it

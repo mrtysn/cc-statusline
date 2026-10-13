@@ -1,4 +1,4 @@
-// Agent Bar Hopping — every Claude Code session's status line in one window.
+// CC Sessions — every Claude Code session's status line in one window.
 //
 // The status line spools its render arguments on each redraw; `cc-statusline.js
 // live` turns that spool into drawn rows plus parsed fields. This app watches the
@@ -36,7 +36,7 @@ let cacheDir: URL = {
     return xdgDir("XDG_CACHE_HOME", fallback: ".cache").appendingPathComponent("cc-statusline")
 }()
 let spoolDir = cacheDir.appendingPathComponent("live")
-let logURL = home.appendingPathComponent("Library/Logs/agent-bar-hopping.log")
+let logURL = home.appendingPathComponent("Library/Logs/cc-sessions.log")
 
 /// system-one's per-session shadow log (agents-shared/notebook/2026-09-24-system-one-
 /// decision-model-integration.md, section 9): one JSONL file per session, read for
@@ -523,7 +523,7 @@ final class SelfCost {
 /// The app's own files: the sound packs and their settings.
 let supportDir: URL =
     (fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? home.appendingPathComponent("Library"))
-    .appendingPathComponent("Agent Bar Hopping")
+    .appendingPathComponent("Agent Bar Hopping")  // the app's original name, kept so existing tags and packs stay found
 /// Where hooks/event.zsh leaves one file per Claude Code event.
 let eventsDir = cacheDir.appendingPathComponent("events")
 
@@ -1105,7 +1105,7 @@ final class RepoTags {
     private(set) var hasAPI: Bool?
     /// One run at a time, in order: a snapshot applied is never older than
     /// one applied before it.
-    private let queue = DispatchQueue(label: "agent-bar-hopping.local-repos-list", qos: .utility)
+    private let queue = DispatchQueue(label: "cc-sessions.local-repos-list", qos: .utility)
     private var watcher: DispatchSourceFileSystemObject?
     private var watchedDir: String?
     private var pendingRead: DispatchWorkItem?
@@ -4034,7 +4034,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// Memory and CPU per Claude Code pid, from the latest reading.
     private var loads: [pid_t: ProcessSampler.Reading] = [:]
     /// Snapshots run one at a time, so the sampler's CPU deltas stay in order.
-    private let worker = DispatchQueue(label: "agent-bar-hopping.reload", qos: .userInitiated)
+    private let worker = DispatchQueue(label: "cc-sessions.reload", qos: .userInitiated)
     private let sampler = ProcessSampler()
     private let selfCost = SelfCost()
     private let events = EventCenter()
@@ -4085,7 +4085,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             contentRect: NSRect(x: 0, y: 0, width: 1560, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
-        window.title = "Agent Bar Hopping"
+        window.title = "CC Sessions"
+        window.subtitle = "Agent Bar Hopping"
         window.titlebarAppearsTransparent = true
         window.backgroundColor = Palette.background
         super.init(window: window)
@@ -6275,7 +6276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.controller?.window?.makeKeyAndOrderFront(nil)
         }
         // The receiver hears a launch and every stop; no heartbeat, the app is opened and quit by hand.
-        Reporter.start(tool: "agent-bar-hopping")
+        Reporter.start(tool: "cc-sessions")
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -6299,14 +6300,14 @@ func buildMenu() {
     let appItem = NSMenuItem()
     let appMenu = NSMenu()
     appMenu.addItem(
-        withTitle: "About Agent Bar Hopping",
+        withTitle: "About CC Sessions",
         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
     appMenu.addItem(NSMenuItem.separator())
     appMenu.addItem(
-        withTitle: "Hide Agent Bar Hopping", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        withTitle: "Hide CC Sessions", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
     appMenu.addItem(NSMenuItem.separator())
     appMenu.addItem(
-        withTitle: "Quit Agent Bar Hopping", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        withTitle: "Quit CC Sessions", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     appItem.submenu = appMenu
     main.addItem(appItem)
 

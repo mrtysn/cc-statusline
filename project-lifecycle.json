@@ -1,15 +1,15 @@
 {
   "kind": "mac-app",
-  "name": "Agent Bar Hopping",
-  "tool": "agent-bar-hopping",
+  "name": "CC Sessions",
+  "tool": "cc-sessions",
   "version": "1.0",
   "mac_app": {
-    "bundle_id": "local.agent-bar-hopping",
-    "swift_package": {"product": "AgentBarHopping"},
+    "bundle_id": "local.cc-sessions",
+    "swift_package": {"product": "CCSessions"},
     "icon": "assets/AppIcon.icns",
     "signing": "local-certificate",
     "info_plist": {
-      "NSAppleEventsUsageDescription": "Agent Bar Hopping brings a session's iTerm tab to the front when you click its row.",
+      "NSAppleEventsUsageDescription": "CC Sessions brings a session's iTerm tab to the front when you click its row.",
       "CCStatuslineRepo": "{repo}"
     }
   }

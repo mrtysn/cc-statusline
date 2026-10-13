@@ -26,7 +26,7 @@ let package = Package(
     dependencies: [shared],
     targets: [
         .executableTarget(
-            name: "AgentBarHopping",
+            name: "CCSessions",
             dependencies: [.product(name: "MacAppBase", package: "project-lifecycle")],
             path: "src",
             sources: ["main.swift"]
