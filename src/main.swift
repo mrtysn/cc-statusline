@@ -5136,7 +5136,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "CC Sessions"
-        // Closing the list can leave the app running (see applicationShouldTerminateAfterLastWindowClosed).
+        // Closing the list leaves the app running (see applicationShouldTerminateAfterLastWindowClosed).
         window.isReleasedWhenClosed = false
         window.subtitle = "Agent Bar Hopping"
         window.titlebarAppearsTransparent = true
@@ -5451,8 +5451,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 tags: tagStore.marks(nil, dir).tags.map(\.name))
         }
     }
-
-    var hasNewSessionShortcut: Bool { hotKey.active != nil }
 
     /// Registers the recorded shortcut, if there is one, and answers its presses.
     private func startHotKey() {
@@ -7556,6 +7554,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.controller?.window?.makeKeyAndOrderFront(nil)
         }
+        AppLifecycle.install(reopen: { [weak self] in
+            if let window = self?.controller?.window { AppWindow.show(window) }
+        })
         // The receiver hears a launch and every stop; no heartbeat, the app is opened and quit by hand.
         Reporter.start(tool: "cc-sessions")
     }
@@ -7603,17 +7604,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         exit(problems.isEmpty ? 0 : 1)
     }
 
-    /// With a New Session shortcut set, closing the list leaves the app running so the
-    /// shortcut keeps working; without one, closing the last window quits as it always did.
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        controller?.hasNewSessionShortcut != true
-    }
-
-    /// A click on the Dock icon brings the list back after it was closed.
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { controller?.showWindow(nil) }
-        return true
-    }
+    /// Closing the list leaves the app running, so the New Session shortcut keeps working.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     /// One copy at a time, the newest: a rebuild, a copy started from
     /// elsewhere and one opened from the Applications folder are separate
