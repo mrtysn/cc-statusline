@@ -6542,8 +6542,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// and the words VoiceOver reads. One line per guard.
     private func bypassTags(_ id: String) -> [(short: String, spoken: String)] {
         var tags: [(short: String, spoken: String)] = []
-        if sshGuard.bypassed(id) { tags.append(("ssh⚠", "ssh guard")) }
-        if SpawnGuard.bypassed(id) { tags.append(("sbgnt⚠", "subagent spawn guard")) }
+        // ⚠ is not in the text font: the selector asks for its plain text form, and the
+        // word joiner keeps it on its word's line.
+        let warn = "\u{2060}⚠\u{FE0E}"
+        if sshGuard.bypassed(id) { tags.append(("ssh" + warn, "ssh guard")) }
+        if SpawnGuard.bypassed(id) { tags.append(("sbgnt" + warn, "subagent spawn guard")) }
         return tags
     }
 
@@ -6639,7 +6642,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                     // orange, so the warning is coloured on its own range.
                     if !bottom.isEmpty {
                         highlights.append((NSRange(location: (bottom as NSString).length + 1, length: 1), Palette.dim))
-                        bottom += " · "
+                        // No-break space after the dot: it wraps with the next tag, never alone.
+                        bottom += " ·\u{00A0}"
                     }
                     highlights.append((NSRange(location: (bottom as NSString).length, length: (tag.short as NSString).length), Palette.yellow))
                     bottom += tag.short
