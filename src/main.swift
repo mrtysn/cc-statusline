@@ -3668,8 +3668,8 @@ struct CloMenu: Decodable {
     }
 }
 
-/// A key and the modifiers held with it: the system-wide shortcut that opens
-/// New Session. There is no default; it is whatever the owner recorded.
+/// A key and the modifiers held with it: a system-wide shortcut, for New Session or
+/// for showing the list. There is no default; it is whatever the owner recorded.
 struct Shortcut: Codable, Equatable {
     var keyCode: Int
     /// Any of "control", "option", "shift", "command".
@@ -3727,29 +3727,48 @@ struct Shortcut: Codable, Equatable {
     }
 }
 
-/// shortcut.json beside sounds.json: the one global shortcut, or none. A missing
+/// shortcut.json beside sounds.json: the global shortcuts, or none. A missing
 /// or unreadable file means none; the app never invents one.
 final class ShortcutStore {
     private struct File: Codable {
+        /// New Session.
         var shortcut: Shortcut?
+        /// Show or hide the sessions list.
+        var listShortcut: Shortcut?
+
+        enum CodingKeys: String, CodingKey {
+            case shortcut
+            case listShortcut = "list_shortcut"
+        }
     }
 
     private let url = supportDir.appendingPathComponent("shortcut.json")
     private(set) var current: Shortcut?
+    private(set) var list: Shortcut?
 
     init() {
         if let data = try? Data(contentsOf: url), let file = try? JSONDecoder().decode(File.self, from: data) {
             current = file.shortcut
+            list = file.listShortcut
         }
     }
 
     func save(_ shortcut: Shortcut?) {
         current = shortcut
+        write()
+    }
+
+    func saveList(_ shortcut: Shortcut?) {
+        list = shortcut
+        write()
+    }
+
+    private func write() {
         try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // Atomic, like the other settings files.
-        try? encoder.encode(File(shortcut: shortcut)).write(to: url, options: .atomic)
+        try? encoder.encode(File(shortcut: current, listShortcut: list)).write(to: url, options: .atomic)
     }
 }
 
@@ -3760,15 +3779,25 @@ final class GlobalHotKey {
     var onPress: (() -> Void)?
     private(set) var active: Shortcut?
     private var reference: EventHotKeyRef?
-    private static weak var instance: GlobalHotKey?
+    private let id: UInt32
+    /// Every hot key by its id: one Carbon handler serves them all.
+    private static var instances: [UInt32: GlobalHotKey] = [:]
+    private static var handlerInstalled = false
 
-    init() {
-        Self.instance = self
+    init(id: UInt32) {
+        self.id = id
+        Self.instances[id] = self
+        guard !Self.handlerInstalled else { return }
+        Self.handlerInstalled = true
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, _ in
-                DispatchQueue.main.async { GlobalHotKey.instance?.onPress?() }
+            { _, event, _ in
+                var pressed = EventHotKeyID()
+                GetEventParameter(
+                    event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                    MemoryLayout<EventHotKeyID>.size, nil, &pressed)
+                DispatchQueue.main.async { GlobalHotKey.instances[pressed.id]?.onPress?() }
                 return noErr
             }, 1, &spec, nil, nil)
     }
@@ -3788,9 +3817,9 @@ final class GlobalHotKey {
 
     private func register(_ shortcut: Shortcut) -> String? {
         var made: EventHotKeyRef?
-        let id = EventHotKeyID(signature: OSType(0x4343_5353), id: 1)
+        let hotKeyID = EventHotKeyID(signature: OSType(0x4343_5353), id: id)
         let status = RegisterEventHotKey(
-            UInt32(shortcut.keyCode), shortcut.carbonModifiers, id, GetApplicationEventTarget(), 0, &made)
+            UInt32(shortcut.keyCode), shortcut.carbonModifiers, hotKeyID, GetApplicationEventTarget(), 0, &made)
         guard status == noErr, let made = made else {
             return status == OSStatus(eventHotKeyExistsErr)
                 ? "\(shortcut.display) is already taken by another app."
@@ -4049,13 +4078,16 @@ final class ShortcutWindow: NSWindowController {
     private let apply: (Shortcut?) -> String?
     private let recorder = ShortcutRecorder()
     private let note = NSTextField(wrappingLabelWithString: "")
+    private let purpose: String
 
-    init(current: Shortcut?, apply: @escaping (Shortcut?) -> String?) {
+    /// `title` names the window; `purpose` finishes "Press this from any app to ".
+    init(title: String, purpose: String, current: Shortcut?, apply: @escaping (Shortcut?) -> String?) {
         self.apply = apply
+        self.purpose = purpose
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: 170),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "New Session Shortcut"
+        window.title = title
         window.appearance = NSAppearance(named: .darkAqua)
         window.isReleasedWhenClosed = false
         super.init(window: window)
@@ -4068,7 +4100,7 @@ final class ShortcutWindow: NSWindowController {
     private func build() {
         guard let content = window?.contentView else { return }
         let intro = NSTextField(wrappingLabelWithString:
-            "Press this from any app to open the New Session window. "
+            "Press this from any app to \(purpose). "
             + "Click the box, then type a combination that includes Control, Option or Command. Esc cancels.")
         intro.font = NSFont.systemFont(ofSize: 12)
         intro.textColor = .secondaryLabelColor
@@ -5106,8 +5138,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var newSessionWindow: NewSessionWindow?
     /// The system-wide shortcut for New Session, and the window that sets it.
     private let shortcutStore = ShortcutStore()
-    private let hotKey = GlobalHotKey()
+    private let hotKey = GlobalHotKey(id: 1)
     private var shortcutWindow: ShortcutWindow?
+    /// The system-wide shortcut that shows and hides this list, and the window that sets it.
+    private let listHotKey = GlobalHotKey(id: 2)
+    private var listShortcutWindow: ShortcutWindow?
     private var usageWindow: UsageWindow?
     /// The info icon beside the quotas that opens the Usage window.
     private let usageButton = NSButton(title: "", target: nil, action: nil)
@@ -5456,6 +5491,42 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private func startHotKey() {
         hotKey.onPress = { [weak self] in self?.openNewSession() }
         if let error = hotKey.set(shortcutStore.current) { log("new session shortcut: \(error)") }
+        listHotKey.onPress = { [weak self] in self?.toggleSessionsList() }
+        if let error = listHotKey.set(shortcutStore.list) { log("sessions list shortcut: \(error)") }
+    }
+
+    /// The list shortcut, like a hotkey window: brings the list forward, and hides the
+    /// app again, returning focus to the one before, when the list is already in front.
+    @objc func toggleSessionsList() {
+        guard let window = window else { return }
+        if NSApp.isActive, window.isVisible, window.isKeyWindow {
+            NSApp.hide(nil)
+            return
+        }
+        NSApp.unhide(nil)
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        AppWindow.show(window)
+    }
+
+    /// Session ▸ Show Sessions Shortcut…
+    @objc func openListShortcutSettings() {
+        if listShortcutWindow == nil {
+            listShortcutWindow = ShortcutWindow(
+                title: "Show Sessions Shortcut", purpose: "show this list, and again to hide it",
+                current: listHotKey.active
+            ) { [weak self] shortcut in
+                self?.applyListShortcut(shortcut)
+            }
+        }
+        listShortcutWindow?.showWindow(nil)
+        listShortcutWindow?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Makes `shortcut` the list's hot key and keeps it; the reason it was refused otherwise.
+    private func applyListShortcut(_ shortcut: Shortcut?) -> String? {
+        if let refusal = listHotKey.set(shortcut) { return refusal }
+        shortcutStore.saveList(shortcut)
+        return nil
     }
 
     /// Session ▸ Usage…, and a click on the quota bar: shows the Usage window with the
@@ -5476,7 +5547,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// Session ▸ New Session Shortcut…
     @objc func openShortcutSettings() {
         if shortcutWindow == nil {
-            shortcutWindow = ShortcutWindow(current: hotKey.active) { [weak self] shortcut in
+            shortcutWindow = ShortcutWindow(
+                title: "New Session Shortcut", purpose: "open the New Session window", current: hotKey.active
+            ) { [weak self] shortcut in
                 self?.applyShortcut(shortcut)
             }
         }
@@ -6117,6 +6190,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(openShortcutSettings) {
             item.title = "New Session Shortcut\u{2026} (\(hotKey.active?.display ?? "Unset"))"
+            return true
+        }
+        if item.action == #selector(openListShortcutSettings) {
+            item.title = "Show Sessions Shortcut\u{2026} (\(listHotKey.active?.display ?? "Unset"))"
             return true
         }
         guard item.action == #selector(showSelectedTerminal) else { return true }
@@ -7621,7 +7698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         exit(problems.isEmpty ? 0 : 1)
     }
 
-    /// Closing the list leaves the app running, so the New Session shortcut keeps working.
+    /// Closing the list leaves the app running, so the global shortcuts keep working.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     /// One copy at a time, the newest: a rebuild, a copy started from
@@ -7672,6 +7749,9 @@ func buildMenu() {
     sessionMenu.addItem(withTitle: "Usage…", action: #selector(SessionsWindow.openUsage), keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "New Session Shortcut…", action: #selector(SessionsWindow.openShortcutSettings),
+        keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "Show Sessions Shortcut…", action: #selector(SessionsWindow.openListShortcutSettings),
         keyEquivalent: "")
     sessionItem.submenu = sessionMenu
     main.addItem(sessionItem)
