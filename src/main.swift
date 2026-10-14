@@ -7554,7 +7554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.controller?.window?.makeKeyAndOrderFront(nil)
         }
-        AppLifecycle.install(reopen: { [weak self] in
+        AppLifecycle.install(hideFromDock: false, reopen: { [weak self] in
             if let window = self?.controller?.window { AppWindow.show(window) }
         })
         // The receiver hears a launch and every stop; no heartbeat, the app is opened and quit by hand.
