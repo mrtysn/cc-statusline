@@ -6538,6 +6538,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     /// A line of feedback for an action that changes nothing on screen.
+    /// The guards switched off for a session: the tag the sessions table shows
+    /// and the words VoiceOver reads. One line per guard.
+    private func bypassTags(_ id: String) -> [(short: String, spoken: String)] {
+        var tags: [(short: String, spoken: String)] = []
+        if sshGuard.bypassed(id) { tags.append(("ssh⚠", "ssh guard")) }
+        if SpawnGuard.bypassed(id) { tags.append(("spawn⚠", "subagent spawn guard")) }
+        return tags
+    }
+
     func note(_ message: String) {
         statusLabel.stringValue = message
         let token = UUID()
@@ -6622,17 +6631,19 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 bottom = "✻ \(running == 1 ? "1 agent" : "\(running) agents")"
                 captionColour = Palette.orange
             }
-            // A standing permission is shown where it is used: the guard that
-            // asks before network code runs over ssh is off for this session.
-            if !past, let id = s.session_id, sshGuard.bypassed(id) {
-                // Yellow in either case: beside the agent count the caption is
-                // orange, so the warning is coloured on its own range.
-                if !bottom.isEmpty {
-                    highlights.append((NSRange(location: (bottom as NSString).length + 1, length: 1), Palette.dim))
-                    bottom += " · "
+            // A standing permission is shown where it is used: each guard that
+            // is off for this session adds its tag.
+            if !past, let id = s.session_id {
+                for tag in bypassTags(id) {
+                    // Yellow in either case: beside the agent count the caption is
+                    // orange, so the warning is coloured on its own range.
+                    if !bottom.isEmpty {
+                        highlights.append((NSRange(location: (bottom as NSString).length + 1, length: 1), Palette.dim))
+                        bottom += " · "
+                    }
+                    highlights.append((NSRange(location: (bottom as NSString).length, length: (tag.short as NSString).length), Palette.yellow))
+                    bottom += tag.short
                 }
-                highlights.append((NSRange(location: (bottom as NSString).length, length: ("ssh⚠" as NSString).length), Palette.yellow))
-                bottom += "ssh⚠"
             }
         case "tokens":
             top = mono(session.transcript?.tokens.map { tokens($0.total) } ?? "—", Palette.text)
@@ -7301,8 +7312,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 + (s.session_name.map { ", named \($0)" } ?? "")
         case "state":
             var caption = stateCaption(session.transcript)
-            if !past, let id = s.session_id, sshGuard.bypassed(id) {
-                caption += caption.isEmpty ? "ssh guard bypassed" : ", ssh guard bypassed"
+            if !past, let id = s.session_id {
+                for tag in bypassTags(id) {
+                    caption += (caption.isEmpty ? "" : ", ") + "\(tag.spoken) bypassed"
+                }
             }
             return "State \(stateWords(session, past: past).0)" + (caption.isEmpty ? "" : ", \(caption)")
         case "tokens":
