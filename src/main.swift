@@ -6543,7 +6543,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private func bypassTags(_ id: String) -> [(short: String, spoken: String)] {
         var tags: [(short: String, spoken: String)] = []
         if sshGuard.bypassed(id) { tags.append(("ssh⚠", "ssh guard")) }
-        if SpawnGuard.bypassed(id) { tags.append(("spawn⚠", "subagent spawn guard")) }
+        if SpawnGuard.bypassed(id) { tags.append(("sbgnt⚠", "subagent spawn guard")) }
         return tags
     }
 
