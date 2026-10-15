@@ -48,37 +48,6 @@ let logURL = selfTest
     ? selfTestRoot.appendingPathComponent("cc-sessions.log")
     : home.appendingPathComponent("Library/Logs/cc-sessions.log")
 
-/// system-one's per-session shadow log (agents-shared/notebook/2026-09-24-system-one-
-/// decision-model-integration.md, section 9): one JSONL file per session, read for
-/// the Verdicts view. Resolved the same way cc-statusline.js resolves it.
-let systemOneShadowDir: URL = {
-    if let v = ProcessInfo.processInfo.environment["SYSTEM_ONE_STATE_DIR"], !v.isEmpty {
-        return URL(fileURLWithPath: (v as NSString).expandingTildeInPath).appendingPathComponent("shadow")
-    }
-    return xdgDir("XDG_STATE_HOME", fallback: ".local/state").appendingPathComponent("system-one").appendingPathComponent("shadow")
-}()
-
-/// The three hooks with a shadow log, in the order the Verdicts window's hook
-/// selector lists them.
-let systemOneHooks = ["bash", "prompt", "stop"]
-
-/// Short labels for the questions each hook asks, in display order, mirroring
-/// cc-statusline.js's HOOK_LABELS so the status line row and this window agree
-/// (bash keeps the irr/for/net/ins order section 9 of the design doc fixed).
-/// A question outside the map still renders, at its position (q1, q2, ...).
-let systemOneHookLabels: [String: [(key: String, label: String)]] = [
-    "bash": [("irreversible", "Irr"), ("foreign_process", "For"), ("leaves_machine", "Net"), ("network_install", "Ins")],
-    "prompt": [("kind", "Knd"), ("wants_action", "Act")],
-    "stop": [("overlong", "Lng"), ("needless_table", "Tbl")],
-]
-
-func systemOneShadowFile(for sessionId: String, hook: String) -> URL? {
-    let safeSession = sessionId.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
-    let safeHook = hook.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
-    guard !safeSession.isEmpty, !safeHook.isEmpty else { return nil }
-    return systemOneShadowDir.appendingPathComponent(safeHook).appendingPathComponent("\(safeSession).jsonl")
-}
-
 /// The checkout this bundle was built from; the build writes it into Info.plist.
 let repoDir: URL = {
     if let p = Checkout.directory(infoPlistKey: "CCStatuslineRepo") {
@@ -743,61 +712,6 @@ let vorbisDecodes: Bool = {
     return ids.contains(0x766F_7262)  // 'vorb'
 }()
 
-// MARK: - Display settings (system-one verdict row)
-
-/// display.json in the support directory, beside sounds.json: what the status
-/// line draws beyond the segments Claude Code's own input carries. Written
-/// with the default (off) when absent; the status line script reads it on
-/// every redraw the same way it reads sounds.json and the usage cache.
-struct DisplaySettings: Codable {
-    var verdictRow = false
-    /// Which hook's shadow log the status line row draws ('bash' | 'prompt' |
-    /// 'stop'); empty is off, even when verdictRow is on. Default empty: a
-    /// session that never picked a hook draws nothing.
-    var verdictHook = ""
-
-    init() {}
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        verdictRow = try c.decodeIfPresent(Bool.self, forKey: .verdictRow) ?? false
-        verdictHook = try c.decodeIfPresent(String.self, forKey: .verdictHook) ?? ""
-    }
-}
-
-/// Owns display.json: the app's single writer, same pattern as sounds.json.
-final class DisplayStore {
-    private(set) var settings = DisplaySettings()
-    private let file = supportDir.appendingPathComponent("display.json")
-
-    init() {
-        load()
-    }
-
-    private func load() {
-        if let data = try? Data(contentsOf: file),
-            let s = try? JSONDecoder().decode(DisplaySettings.self, from: data)
-        {
-            settings = s
-        }
-        save()
-    }
-
-    func update(_ change: (inout DisplaySettings) -> Void) {
-        change(&settings)
-        save()
-    }
-
-    private func save() {
-        try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        // Atomic: the status line script reads this file on every redraw and
-        // must never see half of it.
-        try? encoder.encode(settings).write(to: file, options: .atomic)
-    }
-}
-
 /// The colours a tag can take: few enough to tell apart at a glance down a
 /// column, each light enough to read on the dark background.
 struct TagColour {
@@ -1028,7 +942,7 @@ enum TagFilter: Equatable {
     case tag(String)
 }
 
-/// Owns tags.json beside display.json: the app is its single writer, and the
+/// Owns tags.json beside sounds.json: the app is its single writer, and the
 /// status line script reads it on every redraw.
 final class TagStore {
     private(set) var file = TagFile()
@@ -3209,250 +3123,6 @@ final class SessionRowView: NSTableRowView {
     }
 }
 
-// MARK: - Verdicts (per-session system-one log)
-
-/// One line of a session's shadow log, parsed for the Verdicts view.
-private struct VerdictRow {
-    let time: String
-    let excerpt: String
-    /// Keyed by question name: the cell text (a two-decimal probability for
-    /// noul and score answers, the chosen option's first three letters for a
-    /// choice answer); absent when the log line lacks the question.
-    let cells: [String: String]
-    let fired: Set<String>
-}
-
-/// The on-demand view of one session's system-one shadow log, opened from its
-/// Directory cell's right-click menu: no permanent column, just a read of the
-/// file on open and again on a 2-second timer while the window stays up.
-final class VerdictsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
-    private let sessionId: String
-    private let table = NSTableView()
-    private let status = NSTextField(labelWithString: "")
-    private let hookSelector = NSPopUpButton(frame: .zero, pullsDown: false)
-    private var rows: [VerdictRow] = []
-    private var timer: Timer?
-    /// Size and mtime of the log at the last parse: a tick that finds them
-    /// unchanged does nothing. Reset on a hook switch, so the next reload
-    /// always re-parses the newly chosen log.
-    private var seen: (size: UInt64, modified: Date)?
-    /// How much of the log's tail is read: a shadow log grows without bound
-    /// over a long session, and the view shows its recent calls, not all of it.
-    private static let tailBytes: UInt64 = 512 * 1024
-    private static let maxRows = 500
-    /// Told to the opener so it can drop its reference once the window closes.
-    var onClose: (() -> Void)?
-
-    /// The hook currently shown; drives both the file read and the column
-    /// set. Columns are the chosen hook's known questions (systemOneHookLabels),
-    /// in that fixed order, so headers do not reshuffle row to row.
-    private var hook: String
-    private var order: [(key: String, label: String)] { systemOneHookLabels[hook] ?? [] }
-
-    init(sessionId: String, hook: String = "bash") {
-        self.sessionId = sessionId
-        self.hook = systemOneHooks.contains(hook) ? hook : "bash"
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 420),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered, defer: false)
-        window.title = "Verdicts \u{2014} \(sessionId.prefix(8))"
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.contentMinSize = NSSize(width: 480, height: 240)
-        super.init(window: window)
-        window.delegate = self
-        build()
-        reload()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.reload() }
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    private func build() {
-        guard let content = window?.contentView else { return }
-        content.wantsLayer = true
-        content.layer?.backgroundColor = Palette.background.cgColor
-
-        status.textColor = Palette.dim
-        status.font = NSFont.systemFont(ofSize: 11)
-        status.translatesAutoresizingMaskIntoConstraints = false
-        status.lineBreakMode = .byTruncatingMiddle
-
-        hookSelector.addItems(withTitles: systemOneHooks)
-        hookSelector.selectItem(withTitle: hook)
-        hookSelector.target = self
-        hookSelector.action = #selector(hookChanged)
-        hookSelector.translatesAutoresizingMaskIntoConstraints = false
-
-        rebuildColumns()
-        table.dataSource = self
-        table.delegate = self
-        table.backgroundColor = Palette.background
-        table.gridColor = Palette.frame
-        table.gridStyleMask = [.solidHorizontalGridLineMask]
-        table.usesAlternatingRowBackgroundColors = false
-        table.rowHeight = 18
-        table.intercellSpacing = NSSize(width: 6, height: 0)
-
-        let scroll = NSScrollView()
-        scroll.documentView = table
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-
-        content.addSubview(status)
-        content.addSubview(hookSelector)
-        content.addSubview(scroll)
-        NSLayoutConstraint.activate([
-            status.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
-            status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: hookSelector.leadingAnchor, constant: -12),
-            hookSelector.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
-            hookSelector.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            scroll.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 8),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-        ])
-    }
-
-    /// Rebuilds the table's columns for the current hook: Time, Command, one
-    /// column per known question (from `order`), then Fired.
-    private func rebuildColumns() {
-        for column in table.tableColumns { table.removeTableColumn(column) }
-        var columns: [(String, String, CGFloat)] = [("time", "Time", 150), ("cmd", "Command", 300)]
-        for (key, label) in order { columns.append((key, label, 50)) }
-        columns.append(("fired", "Fired", 110))
-        for (key, title, width) in columns {
-            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
-            column.title = title
-            column.width = width
-            table.addTableColumn(column)
-        }
-    }
-
-    @objc private func hookChanged() {
-        guard let title = hookSelector.titleOfSelectedItem, title != hook else { return }
-        hook = title
-        seen = nil
-        rebuildColumns()
-        reload()
-    }
-
-    /// The command excerpt, first 80 characters: the Bash hook's own `state`
-    /// field ("cwd: ...\ncommand:\n<cmd>") with the cwd line dropped, or
-    /// another caller's already-80-character `state_excerpt`.
-    private static func excerpt(of entry: [String: Any]) -> String {
-        if let state = entry["state"] as? String {
-            let body = state.range(of: "command:\n").map { String(state[$0.upperBound...]) } ?? state
-            return String(body.prefix(80)).replacingOccurrences(of: "\n", with: "\u{23CE}")
-        }
-        if let e = entry["state_excerpt"] as? String { return String(e.prefix(80)) }
-        return ""
-    }
-
-    private func reload() {
-        guard let file = systemOneShadowFile(for: sessionId, hook: hook) else {
-            status.stringValue = "No session id"
-            rows = []
-            table.reloadData()
-            return
-        }
-        guard let attrs = try? fm.attributesOfItem(atPath: file.path),
-            let size = attrs[.size] as? UInt64, let modified = attrs[.modificationDate] as? Date
-        else {
-            status.stringValue = "No log yet \u{2014} \(file.path)"
-            rows = []
-            seen = nil
-            table.reloadData()
-            return
-        }
-        if let seen, seen.size == size, seen.modified == modified { return }
-        // The last tailBytes only, seeking past the rest; the first line of a
-        // cut tail is partial and dropped, and a last line still being
-        // appended fails to parse and is skipped the same way.
-        guard let handle = try? FileHandle(forReadingFrom: file) else { return }
-        defer { try? handle.close() }
-        let cut = size > Self.tailBytes
-        if cut { try? handle.seek(toOffset: size - Self.tailBytes) }
-        guard let data = try? handle.readToEnd() else { return }
-        seen = (size, modified)
-        var lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
-        if cut, !lines.isEmpty { lines.removeFirst() }
-        var parsed: [VerdictRow] = []
-        for line in lines.suffix(Self.maxRows) {
-            guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
-            // Outcome receipts (design doc section 13) share these files with
-            // the verdict rows they label; they carry no answers and would
-            // render as blank rows, so they are skipped like cc-statusline.js does.
-            if (obj["kind"] as? String) == "outcome" { continue }
-            let answers = obj["answers"] as? [String: Any] ?? [:]
-            var cells: [String: String] = [:]
-            for (key, _) in order {
-                guard let a = answers[key] as? [String: Any] else { continue }
-                if let v = a["noul"] as? Double {
-                    cells[key] = String(format: "%.2f", v)
-                } else if let v = a["score"] as? Double {
-                    let levels = (a["probabilities"] as? [String: Any])?.count ?? 0
-                    cells[key] = String(format: "%.2f", v / Double(max(levels - 1, 1)))
-                } else if let c = a["choice"] as? String {
-                    cells[key] = String(c.prefix(3))
-                }
-            }
-            let fired = Set((obj["fired"] as? [[String: Any]])?.compactMap { $0["q"] as? String } ?? [])
-            parsed.append(VerdictRow(time: (obj["ts"] as? String) ?? "", excerpt: Self.excerpt(of: obj), cells: cells, fired: fired))
-        }
-        rows = parsed.reversed()
-        status.stringValue = "\(sessionId)  \u{00B7}  \(rows.count) call(s)\(cut ? ", most recent" : "")  \u{00B7}  \(file.path)"
-        table.reloadData()
-    }
-
-    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard let key = tableColumn?.identifier.rawValue, row < rows.count else { return nil }
-        let r = rows[row]
-        var colour = Palette.text
-        let text: String
-        switch key {
-        case "time": text = r.time
-        case "cmd": text = r.excerpt
-        case "fired":
-            text = r.fired.isEmpty ? "" : r.fired.joined(separator: ",")
-            colour = r.fired.isEmpty ? Palette.dim : Palette.yellow
-        default:
-            if let v = r.cells[key] {
-                text = v
-                colour = r.fired.contains(key) ? Palette.yellow : Palette.dim
-            } else if order.contains(where: { $0.key == key }) {
-                text = "--"
-                colour = Palette.dim
-            } else {
-                text = ""
-            }
-        }
-        let field = NSTextField(labelWithString: text)
-        field.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        field.textColor = colour
-        field.lineBreakMode = .byTruncatingTail
-        let cell = NSView()
-        cell.addSubview(field)
-        field.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
-            field.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -2),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-        return cell
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        timer?.invalidate()
-        timer = nil
-        onClose?()
-    }
-}
-
 /// A tag's colour as a swatch to click: ringed when it is the one in use.
 func colourSwatch(_ color: NSColor, ringed: Bool) -> NSImage {
     NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
@@ -3481,111 +3151,6 @@ final class StatusLabel: NSTextField {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
-}
-
-/// Verdicts settings: which of system-one's verdicts the app reads, as a sheet
-/// over the list. One choice, each kind with the questions it scores, so the
-/// button on the list only has to say what is chosen.
-final class VerdictSettingsWindow: NSWindowController {
-    private let store: DisplayStore
-    private let onChange: () -> Void
-    private var radios: [String: NSButton] = [:]
-
-    /// "" is off; the others are the hooks that have a shadow log.
-    private static let choices: [(hook: String, title: String, detail: String)] = [
-        ("", "Off", "Reads no verdicts. A session's Verdicts window then opens on bash."),
-        ("bash", "Bash commands",
-         "Scores every shell command Claude runs, on four questions: irr (irreversible), for (foreign process), "
-         + "net (leaves the machine), ins (network install)."),
-        ("prompt", "Your prompts",
-         "Scores every prompt you send, on two questions: knd (what kind of prompt it is) and act (whether it asks for action)."),
-        ("stop", "Finished replies",
-         "Scores every reply Claude finishes, on two questions: lng (overlong) and tbl (a table that was not needed)."),
-    ]
-
-    init(store: DisplayStore, onChange: @escaping () -> Void) {
-        self.store = store
-        self.onChange = onChange
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),
-            styleMask: [.titled], backing: .buffered, defer: false)
-        window.title = "Verdicts"
-        window.appearance = NSAppearance(named: .darkAqua)
-        super.init(window: window)
-        build()
-        redraw()
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    private func build() {
-        guard let content = window?.contentView else { return }
-        let intro = NSTextField(wrappingLabelWithString:
-            "system-one scores what happens in each session; a score is a verdict. Choose which kind this app reads. "
-            + "Right-click a session's Directory cell and pick Verdicts to see its calls, newest first, "
-            + "with the scores on the chosen kind. A score in yellow crossed its threshold.")
-        intro.font = NSFont.systemFont(ofSize: 12)
-        intro.textColor = .secondaryLabelColor
-
-        let list = NSStackView()
-        list.orientation = .vertical
-        list.alignment = .leading
-        list.spacing = 14
-        for choice in Self.choices {
-            let radio = NSButton(radioButtonWithTitle: choice.title, target: self, action: #selector(picked(_:)))
-            radio.identifier = NSUserInterfaceItemIdentifier(choice.hook)
-            radio.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-            radios[choice.hook] = radio
-            let detail = NSTextField(wrappingLabelWithString: choice.detail)
-            detail.font = NSFont.systemFont(ofSize: 11)
-            detail.textColor = .secondaryLabelColor
-            detail.preferredMaxLayoutWidth = 440
-            let item = NSStackView(views: [radio, detail])
-            item.orientation = .vertical
-            item.alignment = .leading
-            item.spacing = 3
-            list.addArrangedSubview(item)
-        }
-
-        let done = NSButton(title: "Done", target: self, action: #selector(finish))
-        done.keyEquivalent = "\r"
-        for view in [intro, list, done] as [NSView] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(view)
-        }
-        NSLayoutConstraint.activate([
-            intro.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
-            intro.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            list.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 18),
-            list.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
-            list.trailingAnchor.constraint(lessThanOrEqualTo: intro.trailingAnchor),
-            done.topAnchor.constraint(greaterThanOrEqualTo: list.bottomAnchor, constant: 16),
-            done.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
-            done.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
-        ])
-    }
-
-    private func redraw() {
-        let s = store.settings
-        let current = s.verdictRow ? s.verdictHook : ""
-        for (hook, radio) in radios { radio.state = hook == current ? .on : .off }
-    }
-
-    @objc private func picked(_ sender: NSButton) {
-        let hook = sender.identifier?.rawValue ?? ""
-        store.update {
-            $0.verdictHook = hook
-            $0.verdictRow = !hook.isEmpty
-        }
-        redraw()
-        onChange()
-    }
-
-    @objc private func finish() {
-        guard let window = window else { return }
-        window.sheetParent?.endSheet(window)
-    }
 }
 
 /// `clo`, found on the PATH the other CLIs get (`scriptProcess`): nil when it
@@ -5116,10 +4681,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let packStore = PackStore()
     private var packBrowser: PackBrowser?
     private let latest = LatestVersion()
-    /// display.json: the verdict row toggle beside the sound controls, and the
-    /// on-demand Verdicts view opened from a session's Directory cell.
-    private let displayStore = DisplayStore()
-    private let verdictsToggle = NSButton(title: "", target: nil, action: nil)
     /// tags.json: the labels put on sessions from their right-click menu.
     private let tagStore = TagStore()
     /// Shows only the sessions with one dot or tag; nil shows every session.
@@ -5131,8 +4692,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private lazy var repoTags = RepoTags(store: tagStore)
     /// Repo Tags, while it is open as a sheet over the list.
     private var repoTagsSheet: RepoTagsWindow?
-    /// The verdicts choice, while it is open as a sheet over the list.
-    private var verdictsSheet: VerdictSettingsWindow?
     /// Opens Repo Tags, beside the filter it feeds.
     private let repoTagsButton = NSButton(title: "", target: nil, action: nil)
     private var newSessionWindow: NewSessionWindow?
@@ -5148,13 +4707,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let usageButton = NSButton(title: "", target: nil, action: nil)
     /// The newest usage reading, kept so the window opens with it at once.
     private var lastUsage: UsageSummary?
-    /// The tag filter and the verdicts toggle: what the list and the
+    /// The tag filter and repo tags: what the list
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// Every session in the last snapshot; `rows` is what the filter lets through.
     private var allRows: [(session: Session, past: Bool)] = []
-    private var verdictsWindows: [String: VerdictsWindow] = [:]
     private var watcher: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
     private var sessionsWatcher: DispatchSourceFileSystemObject?
@@ -5405,10 +4963,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         packButton.alignment = .right
         packButton.lineBreakMode = .byTruncatingTail
         drawPackButton()
-        verdictsToggle.isBordered = false
-        verdictsToggle.target = self
-        verdictsToggle.action = #selector(verdictsToggled)
-        drawVerdictsToggle()
         // The switch changes the Sound column; a new pack changes the button.
         NotificationCenter.default.addObserver(
             forName: SoundControls.changed, object: nil, queue: .main
@@ -5435,7 +4989,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         repoTagsButton.action = #selector(openRepoTags)
         repoTagsButton.toolTip = "Repo Tags: every tag in local-repos-list, its colour and its folders"
         let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
-        listControls.setViews([filterPopup, repoTagsButton, verdictsToggle], in: .leading)
+        listControls.setViews([filterPopup, repoTagsButton], in: .leading)
         listControls.spacing = 12
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
@@ -5580,30 +5134,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         created.show()
     }
 
-    /// system-one's verdict row on the status line: a text toggle in the
-    /// ● on / ○ off style the event boxes use, bound to display.json so the
-    /// status line script picks the change up on its next redraw. A click
-    /// cycles off -> bash -> prompt -> stop -> off, since the row draws at
-    /// most one hook's scores at a time.
-    private func drawVerdictsToggle() {
-        let hook = displayStore.settings.verdictHook
-        let on = displayStore.settings.verdictRow && !hook.isEmpty
-        verdictsToggle.attributedTitle = NSAttributedString(
-            string: (on ? "\u{25CF} " : "\u{25CB} ") + "verdicts: " + (on ? hook : "off"),
-            attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: on ? Palette.text : Palette.dim])
-        verdictsToggle.toolTip =
-            on ? "The app reads system-one's \(hook) verdicts. Click to choose which kind."
-            : "No system-one verdicts are read. Click to choose which kind."
-        verdictsToggle.setAccessibilityLabel("Verdicts, \(on ? hook : "off"). Opens the choice")
-    }
-
-    @objc private func verdictsToggled() {
-        guard let window = window, window.attachedSheet == nil else { return }
-        let sheet = VerdictSettingsWindow(store: displayStore) { [weak self] in self?.drawVerdictsToggle() }
-        verdictsSheet = sheet
-        window.beginSheet(sheet.window!) { [weak self] _ in self?.verdictsSheet = nil }
-    }
-
     /// "All sessions", then one entry per tag with its dot. A filter on a tag
     /// that has since been deleted falls back to all.
     private func drawFilterPopup() {
@@ -5687,24 +5217,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         packButton.toolTip = "\(events.current.pack): hear, choose and install sound packs"
     }
 
-    /// The per-session Verdicts view, from a session's Directory cell menu: an
-    /// on-demand read of its shadow log, newest first, no permanent column.
-    /// One window per session id; asking again just brings it forward.
-    private func openVerdicts(sessionId: String) {
-        if let existing = verdictsWindows[sessionId] {
-            existing.showWindow(nil)
-            existing.window?.makeKeyAndOrderFront(nil)
-            return
-        }
-        let defaultHook = displayStore.settings.verdictHook
-        let window = VerdictsWindow(sessionId: sessionId, hook: defaultHook.isEmpty ? "bash" : defaultHook)
-        verdictsWindows[sessionId] = window
-        window.onClose = { [weak self] in self?.verdictsWindows[sessionId] = nil }
-        window.window?.center()
-        window.showWindow(nil)
-        window.window?.makeKeyAndOrderFront(nil)
-    }
-
     @objc private func openPacks() {
         if packBrowser == nil {
             packBrowser = PackBrowser(store: packStore, events: events)
@@ -5773,7 +5285,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         apply(fixture, loads: [:], reused: [], cost: nil, footprint: 0)
 
         // Buttons: each has a target that answers its action.
-        for (name, button) in [("pack", packButton), ("repo tags", repoTagsButton), ("verdicts", verdictsToggle)] {
+        for (name, button) in [("pack", packButton), ("repo tags", repoTagsButton)] {
             guard let action = button.action, let target = button.target, target.responds(to: action) else {
                 problems.append("the \(name) button is not wired to an action")
                 continue
@@ -6265,7 +5777,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     /// What a right-click on a session offers: copies of what names it, its
-    /// tag, its verdicts, and opening it again.
+    /// tag, and opening it again.
     private func fillSessionMenu(_ menu: NSMenu, _ entry: (session: Session, past: Bool), flash: (() -> Void)?) {
         let (session, past) = entry
         let s = session.summary
@@ -6288,9 +5800,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             menu.addItem(tagItem)
         }
         let sid = s.session_id
-        menu.addItem(ActionItem("Verdicts", enabled: sid != nil) { [weak self] in
-            sid.map { self?.openVerdicts(sessionId: $0) }
-        })
         if let id = sid, !past {
             let on = sshGuard.bypassed(id)
             let item = ActionItem("Bypass ssh guard for this session") { [weak self] in
