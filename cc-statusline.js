@@ -1379,7 +1379,9 @@ const CAP_MIN_STEP = 3;
 // sessions disagree and the log would flap between them.
 function logQuotaReading(weekly) {
   if (typeof weekly?.percent !== 'number') return;
-  const reading = { seven: weekly.percent, seven_resets: weekly.resets_at ?? null };
+  // The endpoint's reset time carries a few changing sub-second digits: to the minute.
+  const resets = Date.parse(weekly.resets_at);
+  const reading = { seven: weekly.percent, seven_resets: resets ? Math.round(resets / 60000) * 60000 : null };
   try {
     let last = null;
     try {
