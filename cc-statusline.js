@@ -508,6 +508,7 @@ async function refreshUsage(sevenArg) {
     // kept, so a rename shows in the cache instead of silently missing.
     const weekly = body.limits.find((l) => /weekly|seven/.test(l?.kind ?? '') && !/scoped/.test(l.kind) && !l.scope?.model);
     next.weekly = weekly && typeof weekly.percent === 'number' ? { percent: weekly.percent, resets_at: weekly.resets_at ?? null } : null;
+    logQuotaReading(next.weekly);
     next.limit_kinds = body.limits.map((l) => `${l?.kind}${l?.scope?.model?.display_name ? ':' + l.scope.model.display_name : ''}`);
     checkFormat('usage/response', true);
     Object.assign(next, extraUsage(body, entry));
@@ -1370,26 +1371,21 @@ const LEADERBOARD_FOLDERS = 8;
 // points apart before it says anything about the cap.
 const CAP_MIN_STEP = 3;
 
-// One line in quota-readings.jsonl for every change of the 5-hour or 7-day
-// reading, from the status line input: { t, five, five_resets, seven,
-// seven_resets }. The cap is worked out from how many tokens passed between two
-// readings, which holds across an early reset where one reading alone does not.
-function logQuotaReading(limits) {
-  const five = limits?.five_hour;
-  const seven = limits?.seven_day;
-  const reading = {
-    five: five?.used_percentage ?? null,
-    five_resets: five?.resets_at ?? null,
-    seven: seven?.used_percentage ?? null,
-    seven_resets: seven?.resets_at ?? null,
-  };
-  if (reading.five == null && reading.seven == null) return;
+// One line in quota-readings.jsonl for every change of the account's 7-day
+// reading, from the usage endpoint: { t, seven, seven_resets }. The cap is worked
+// out from how many tokens passed between two readings, which holds across an early
+// reset where one reading alone does not. Status line readings are not used: a
+// session that has not redrawn since a reset still reports the old percentage, so
+// sessions disagree and the log would flap between them.
+function logQuotaReading(weekly) {
+  if (typeof weekly?.percent !== 'number') return;
+  const reading = { seven: weekly.percent, seven_resets: weekly.resets_at ?? null };
   try {
     let last = null;
     try {
       last = JSON.parse(readFileSync(READINGS_LAST, 'utf8'));
     } catch {}
-    if (last && Object.keys(reading).every((k) => last[k] === reading[k])) return;
+    if (last && last.seven === reading.seven && last.seven_resets === reading.seven_resets) return;
     mkdirSync(CACHE_DIR, { recursive: true });
     appendFileSync(READINGS_FILE, JSON.stringify({ t: Date.now(), ...reading }) + '\n');
     writeFileSync(READINGS_LAST, JSON.stringify(reading));
@@ -1413,7 +1409,8 @@ function readQuotaReadings() {
 // percentage fell (a reset granted mid-week) or the first reading. Pairs of
 // them at least CAP_MIN_STEP points apart: [{ from, to, points }] in ms.
 function capPairs(readings) {
-  const seven = readings.filter((r) => typeof r.seven === 'number');
+  const current = readings.at(-1)?.seven_resets;
+  const seven = readings.filter((r) => typeof r.seven === 'number' && r.seven_resets === current);
   let start = 0;
   for (let i = 1; i < seven.length; i++) if (seven[i].seven < seven[i - 1].seven) start = i;
   const window = seven.slice(start);
@@ -1591,7 +1588,6 @@ function main() {
   if (out) process.stdout.write(out);
   // After the line is out, so the terminal never waits on it.
   writeSpool(args, terminal, lastAt, repo.stamp);
-  logQuotaReading(input.rate_limits);
 }
 
 if (process.argv[2] === 'live') {
