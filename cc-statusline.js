@@ -1349,7 +1349,196 @@ function usageSummary(cached, now) {
     spend: cached.spend ?? null,
     surfaces: cached.surfaces ?? null,
     fable_share: cached.fable_share ?? null,
+    tokens: readLeaderboard(),
   };
+}
+
+// ---- Token leaderboard ---------------------------------------------------
+// What each session and folder spent this week, for the app's Usage window, and
+// the weekly token cap that the quota readings imply. The totals come from
+// agents-shared's report-token-use.py, the one reader of the transcripts' usage
+// blocks; it sums sub-agent transcripts into their session.
+const READINGS_FILE = join(CACHE_DIR, 'quota-readings.jsonl');
+const READINGS_LAST = join(CACHE_DIR, 'quota-readings-last.json');
+const LEADERBOARD_FILE = join(CACHE_DIR, 'leaderboard.json');
+const LEADERBOARD_LOCK = join(CACHE_DIR, 'leaderboard.lock');
+const LEADERBOARD_MS = 5 * 60000;
+const LEADERBOARD_STALE_MS = 120000;
+const LEADERBOARD_SESSIONS = 10;
+const LEADERBOARD_FOLDERS = 8;
+// The percentages move in whole steps, so a pair of readings must be this many
+// points apart before it says anything about the cap.
+const CAP_MIN_STEP = 3;
+
+// One line in quota-readings.jsonl for every change of the 5-hour or 7-day
+// reading, from the status line input: { t, five, five_resets, seven,
+// seven_resets }. The cap is worked out from how many tokens passed between two
+// readings, which holds across an early reset where one reading alone does not.
+function logQuotaReading(limits) {
+  const five = limits?.five_hour;
+  const seven = limits?.seven_day;
+  const reading = {
+    five: five?.used_percentage ?? null,
+    five_resets: five?.resets_at ?? null,
+    seven: seven?.used_percentage ?? null,
+    seven_resets: seven?.resets_at ?? null,
+  };
+  if (reading.five == null && reading.seven == null) return;
+  try {
+    let last = null;
+    try {
+      last = JSON.parse(readFileSync(READINGS_LAST, 'utf8'));
+    } catch {}
+    if (last && Object.keys(reading).every((k) => last[k] === reading[k])) return;
+    mkdirSync(CACHE_DIR, { recursive: true });
+    appendFileSync(READINGS_FILE, JSON.stringify({ t: Date.now(), ...reading }) + '\n');
+    writeFileSync(READINGS_LAST, JSON.stringify(reading));
+  } catch (err) {
+    logError(`readings: ${err.message}`);
+  }
+}
+
+function readQuotaReadings() {
+  try {
+    return readFileSync(READINGS_FILE, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+// The readings of the current 7-day window, starting at the last time the
+// percentage fell (a reset granted mid-week) or the first reading. Pairs of
+// them at least CAP_MIN_STEP points apart: [{ from, to, points }] in ms.
+function capPairs(readings) {
+  const seven = readings.filter((r) => typeof r.seven === 'number');
+  let start = 0;
+  for (let i = 1; i < seven.length; i++) if (seven[i].seven < seven[i - 1].seven) start = i;
+  const window = seven.slice(start);
+  const pairs = [];
+  let base = window[0];
+  for (const r of window.slice(1)) {
+    if (r.seven - base.seven >= CAP_MIN_STEP) {
+      pairs.push({ from: base.t, to: r.t, points: r.seven - base.seven });
+      base = r;
+    }
+  }
+  // `reset` is when the percentage last fell, null when it never has.
+  return { reset: start > 0 ? window[0].t : null, pairs };
+}
+
+// The agents-shared checkout, from the environment or the machine-local
+// paths.local.sh that the hooks read: AGENTS_SHARED_DIR="$HOME/...".
+function agentsSharedDir() {
+  if (process.env.AGENTS_SHARED_DIR) return process.env.AGENTS_SHARED_DIR;
+  const file = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'paths.local.sh');
+  try {
+    const m = readFileSync(file, 'utf8').match(/^AGENTS_SHARED_DIR="?([^"\n]+)"?/m);
+    return m ? m[1].replace(/\$HOME|\$\{HOME\}/g, homedir()) : null;
+  } catch {
+    return null;
+  }
+}
+
+const tokenWeight = (t) => (t?.input ?? 0) + 1.25 * (t?.cache_write ?? 0) + 0.1 * (t?.cache_read ?? 0) + 5 * (t?.output ?? 0);
+
+function readLeaderboard() {
+  try {
+    return JSON.parse(readFileSync(LEADERBOARD_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function runReporter(script, args) {
+  return new Promise((resolve, reject) => {
+    require('child_process').execFile(
+      'python3',
+      [script, ...args],
+      { maxBuffer: 256 * 1024 * 1024, timeout: 120000 },
+      (err, stdout) => (err ? reject(err) : resolve(JSON.parse(stdout)))
+    );
+  });
+}
+
+async function refreshLeaderboard() {
+  const now = Date.now();
+  const previous = readLeaderboard();
+  if (previous?.read_at && now - previous.read_at < LEADERBOARD_MS) return;
+  try {
+    if (now - statSync(LEADERBOARD_LOCK).mtimeMs > LEADERBOARD_STALE_MS) unlinkSync(LEADERBOARD_LOCK);
+  } catch {}
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    closeSync(openSync(LEADERBOARD_LOCK, 'wx'));
+  } catch {
+    return;
+  }
+  const save = (body) => {
+    const tmp = `${LEADERBOARD_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ read_at: Date.now(), ...body }));
+    renameSync(tmp, LEADERBOARD_FILE);
+  };
+  try {
+    const dir = agentsSharedDir();
+    if (!dir) throw new Error('AGENTS_SHARED_DIR is not set in paths.local.sh');
+    const readings = readQuotaReadings();
+    const { reset, pairs } = capPairs(readings);
+    const weekly = readUsageCache()?.weekly?.resets_at;
+    const windowStart = Date.parse(weekly) ? Date.parse(weekly) - 7 * 86400000 : now - 7 * 86400000;
+    // A weekly reset granted mid-window starts the week over from that moment.
+    const since = Math.max(windowStart, reset ?? 0);
+    const cuts = [...new Set(pairs.flatMap((p) => [p.from, p.to]))].sort((a, b) => a - b);
+    const args = ['--since', new Date(since).toISOString()];
+    if (cuts.length >= 2) args.push('--cuts', cuts.map((c) => new Date(c).toISOString()).join(','));
+    const out = await runReporter(join(dir, 'scripts', 'report-token-use.py'), args);
+    const sub = (t) => tokenWeight(t?.sub);
+    let cap = null;
+    if (pairs.length && Array.isArray(out.intervals)) {
+      // Pairs are consecutive, so each pair's tokens are the intervals between its two cuts.
+      let tokens = 0;
+      let points = 0;
+      for (const p of pairs) {
+        const lo = cuts.indexOf(p.from);
+        const hi = cuts.indexOf(p.to);
+        for (let i = lo; i < hi; i++) tokens += out.intervals[i]?.weighted ?? 0;
+        points += p.points;
+      }
+      if (points > 0) cap = { tokens: (tokens / points) * 100, points, pairs: pairs.length };
+    }
+    save({
+      error: null,
+      since,
+      readings: readings.length,
+      total: out.sessions.reduce((n, s) => n + s.weighted, 0),
+      sub: out.sessions.reduce((n, s) => n + sub(s), 0),
+      cap,
+      sessions: out.sessions.slice(0, LEADERBOARD_SESSIONS).map((s) => ({
+        project: s.project,
+        session: s.session,
+        requests: s.total.requests,
+        weighted: s.weighted,
+        sub: sub(s),
+      })),
+      folders: out.projects.slice(0, LEADERBOARD_FOLDERS).map((p) => ({
+        project: p.project,
+        sessions: p.sessions,
+        weighted: p.weighted,
+        sub: sub(p),
+      })),
+    });
+  } catch (err) {
+    logError(`leaderboard: ${err.message}`);
+    try {
+      save({ ...(previous ?? {}), error: err.message });
+    } catch {}
+  } finally {
+    try {
+      unlinkSync(LEADERBOARD_LOCK);
+    } catch {}
+  }
 }
 
 function main() {
@@ -1402,6 +1591,7 @@ function main() {
   if (out) process.stdout.write(out);
   // After the line is out, so the terminal never waits on it.
   writeSpool(args, terminal, lastAt, repo.stamp);
+  logQuotaReading(input.rate_limits);
 }
 
 if (process.argv[2] === 'live') {
@@ -1415,6 +1605,8 @@ if (process.argv[2] === 'live') {
   // while another refresh holds the lock.
   const age = Date.now() - (readUsageCache()?.fetched_at ?? 0);
   if (age >= REFRESH_MS && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
+} else if (process.argv[2] === 'refresh-leaderboard') {
+  refreshLeaderboard().catch((err) => logError(`leaderboard: ${err.message}`));
 } else if (process.argv[2] === '--refresh-usage') {
   refreshUsage(process.argv[3]).catch((err) => logError(`refresh: ${err.message}`));
 } else if (process.argv[2] === 'session-end') {

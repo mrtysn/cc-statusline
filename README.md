@@ -105,6 +105,12 @@ Everything the tool reads comes from formats Anthropic can change without notice
 
 Any recorded problem puts a red `!` at the end of every session's last status line row and turns the app's `cc-statusline` row red with the problem in words; its tooltip lists them all. `error.log` gets a `format:` line when a problem appears and a `format ok again:` line when it clears, which it does by itself on the next reading that passes.
 
+## Token leaderboard
+
+The Usage window ends with where this week's tokens went: all sessions, the biggest ten sessions and eight folders, each with the share that came from sub-agents. `cc-statusline.js refresh-leaderboard` builds it with agents-shared's `report-token-use.py`, found through `AGENTS_SHARED_DIR` in the environment or in `~/.claude/paths.local.sh`; it takes about ten seconds, runs when the window opens (and every five minutes while it stays open), and a failure keeps the last reading with the error shown. Tokens are input-equivalent: input + 1.25 x cache write + 0.1 x cache read + 5 x output. Output is the transcript's streaming snapshot, so it undercounts.
+
+The implied weekly cap is tokens per percentage point between two readings of `quota-readings.jsonl`, not one reading over the window's start: an early reset granted on claude.ai makes the percentage fall mid-week, which breaks the one-point sum. Readings are paired once they are 3 points apart, since the percentage moves in whole steps; a fall in the percentage restarts the week's token count from that reading. Until two such readings exist the window says `calibrating`.
+
 ## Fable quota
 
 Claude Code does not pass per-model limits to the status line, so the Fable weekly figure comes from the account usage endpoint (`/api/oauth/usage`, the same one `/usage` reads). The script reads Claude Code's OAuth token from the macOS Keychain, never renews it, and makes the request in a detached background process so a redraw never waits on it. Sessions on other models neither show the bar nor make the request. Agent Bar Hopping shows the Fable quota whatever the sessions run: it fetches at launch and then on every 30-second tick (`cc-statusline.js refresh-usage`), skipped while the cache is under five minutes old. The same response gives the account's overall weekly figure (`weekly` in `usage.json`, with the kinds seen in `limit_kinds`); the 7-day bar uses it when it is newer than every session's reading, so a reset pressed on claude.ai shows without a session redrawing. A reading past its reset shows as 0%. It is shown whether or not the server marks it `is_active`, as claude.ai's usage page shows it.
@@ -115,6 +121,8 @@ One cache is shared by every session in `~/.cache/cc-statusline/` (override with
 
 | File | Purpose |
 |---|---|
+| `quota-readings.jsonl` | One line per change of the 5-hour or 7-day percentage the status line receives: `t`, `five`, `five_resets`, `seven`, `seven_resets` |
+| `leaderboard.json` | Last token leaderboard for the Usage window: this week's tokens per session and folder with the sub-agent share, and the implied weekly cap |
 | `usage.json` | Last reading and the error of the last refresh, if any |
 | `refresh.lock` | Held while a refresh runs, so sessions never fetch in parallel |
 | `error.log` | One timestamped line per failed refresh: `keychain`, `network`, `auth`, `http <status>`, or `parse` |

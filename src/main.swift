@@ -225,6 +225,37 @@ struct FableShare: Decodable {
     let allowance: Double
 }
 
+/// One line of the token leaderboard: a session (`session` set) or a folder (`sessions` set), with
+/// its weighted tokens and the part of them that came from sub-agents.
+struct TokenRow: Decodable {
+    let project: String
+    let session: String?
+    let sessions: Int?
+    let requests: Int?
+    let weighted: Double
+    let sub: Double
+}
+
+/// The weekly token cap the quota readings imply: tokens between two readings per point gained.
+struct TokenCap: Decodable {
+    let tokens: Double
+    let points: Double
+    let pairs: Int
+}
+
+/// What this week's tokens went to, from `cc-statusline.js refresh-leaderboard`.
+struct TokenBoard: Decodable {
+    let read_at: Double?
+    let error: String?
+    let since: Double?
+    let readings: Int?
+    let total: Double?
+    let sub: Double?
+    let cap: TokenCap?
+    let sessions: [TokenRow]?
+    let folders: [TokenRow]?
+}
+
 /// What the Usage window shows beyond the quota bar, from the shared usage cache.
 /// Every field is optional: a cache written before they existed has none.
 struct UsageSummary: Decodable {
@@ -234,6 +265,7 @@ struct UsageSummary: Decodable {
     let spend: SpendCap?
     let surfaces: [SurfaceShare]?
     let fable_share: FableShare?
+    let tokens: TokenBoard?
 }
 
 /// An outside format that stopped matching what the tool reads; see health.json.
@@ -326,6 +358,22 @@ func scriptProcess(_ script: URL, _ arguments: [String]) -> Process {
     env["PATH"] = (shims + [env["PATH"] ?? ""]).filter { !$0.isEmpty }.joined(separator: ":")
     task.environment = env
     return task
+}
+
+/// Rebuilds the token leaderboard once; the script gates it to one run per five minutes and
+/// takes about ten seconds, so call it off the main thread.
+func refreshLeaderboardOnce() {
+    let script = repoDir.appendingPathComponent("cc-statusline.js")
+    guard fm.isExecutableFile(atPath: script.path) else { return }
+    let task = scriptProcess(script, ["refresh-leaderboard"])
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        log("leaderboard refresh failed: \(error.localizedDescription)")
+    }
 }
 
 /// Fetches the account's usage once, for the Fable quota: it only moves while
@@ -3573,6 +3621,50 @@ final class UsageWindow: NSWindowController {
         }
     }
 
+    /// 1.2B, 144M, 8.5M: tokens in the unit that keeps two or three digits.
+    static func tokenText(_ tokens: Double) -> String {
+        if tokens >= 1e9 { return String(format: "%.1fB", tokens / 1e9) }
+        if tokens >= 1e7 { return String(format: "%.0fM", tokens / 1e6) }
+        if tokens >= 1e6 { return String(format: "%.1fM", tokens / 1e6) }
+        return String(format: "%.0fk", tokens / 1e3)
+    }
+
+    private func tokenRows(_ rows: [TokenRow], name: (TokenRow) -> String) {
+        let top = rows.map(\.weighted).max() ?? 1
+        for r in rows {
+            let share = r.weighted > 0 ? Int((r.sub / r.weighted * 100).rounded()) : 0
+            row(name(r), bar: top > 0 ? r.weighted / top * 100 : nil, limit: false,
+                UsageWindow.tokenText(r.weighted), "\(share)% sub-agents")
+        }
+    }
+
+    /// Where this week's tokens went, in input-equivalent tokens (input + 1.25 x cache write +
+    /// 0.1 x cache read + 5 x output), and the weekly cap the readings imply.
+    private func drawTokens(_ board: TokenBoard) {
+        guard let total = board.total else { return }
+        heading("TOKENS THIS WEEK")
+        let subShare = total > 0 ? Int(((board.sub ?? 0) / total * 100).rounded()) : 0
+        row("all sessions", bar: nil, UsageWindow.tokenText(total), "\(subShare)% from sub-agents")
+        if let cap = board.cap {
+            row("implied weekly cap", bar: nil, "~" + UsageWindow.tokenText(cap.tokens),
+                "from \(cap.pairs) reading pair\(cap.pairs == 1 ? "" : "s"), \(Int(cap.points)) points")
+        } else {
+            row("implied weekly cap", bar: nil, "calibrating",
+                "needs two readings 3 points apart (\(board.readings ?? 0) logged)")
+        }
+        if let sessions = board.sessions, !sessions.isEmpty {
+            heading("BIGGEST SESSIONS")
+            tokenRows(sessions) { "\($0.project.replacingOccurrences(of: "dev-", with: "", options: .anchored)) \(String(($0.session ?? "").prefix(8)))" }
+        }
+        if let folders = board.folders, !folders.isEmpty {
+            heading("BIGGEST FOLDERS")
+            tokenRows(folders) { "\($0.project.replacingOccurrences(of: "dev-", with: "", options: .anchored)) · \($0.sessions ?? 0) session\($0.sessions == 1 ? "" : "s")" }
+        }
+        if let error = board.error {
+            grid.addRow(with: [label("leaderboard refresh failed: \(error)", Palette.yellow, size: 11)])
+        }
+    }
+
     func update(_ usage: UsageSummary?) {
         // removeRow leaves a row's views in the grid as subviews; they would draw over the next reading.
         for _ in 0..<grid.numberOfRows { grid.removeRow(at: 0) }
@@ -3605,6 +3697,7 @@ final class UsageWindow: NSWindowController {
             heading("THIS WEEK BY SURFACE")
             for surface in surfaces { row(surface.name, bar: surface.percent, limit: false, "\(Int(surface.percent.rounded()))%") }
         }
+        if let board = usage.tokens { drawTokens(board) }
         heading("")
         var footer = usage.read_at.map { "read \(ago($0)) ago" } ?? "never read"
         if let error = usage.error { footer += " · refresh failed: \(error)" }
@@ -3625,7 +3718,13 @@ final class UsageWindow: NSWindowController {
              "credits": [{"limit": 250, "used": 62.5, "remaining": 187.5, "expires_at": \(Date().timeIntervalSince1970 * 1000 + 3 * 86400000)}],
              "spend": {"used": 0, "limit": 60, "enabled": false, "disabled_reason": "out_of_credits", "user_disabled": false},
              "surfaces": [{"name": "Claude Code", "percent": 92}, {"name": "Chats", "percent": 8}],
-             "fable_share": {"used": 7, "allowance": 50}}
+             "fable_share": {"used": 7, "allowance": 50},
+             "tokens": {"read_at": \(Date().timeIntervalSince1970 * 1000 - 60000), "error": null, "readings": 6,
+                        "total": 810000000, "sub": 420000000,
+                        "cap": {"tokens": 807000000, "points": 12, "pairs": 3},
+                        "sessions": [{"project": "dev-fixture", "session": "7386be92-0000", "requests": 2235, "weighted": 144000000, "sub": 128000000},
+                                     {"project": "dev-fixture", "session": "2370cc4b-0000", "requests": 4681, "weighted": 129000000, "sub": 100000000}],
+                        "folders": [{"project": "dev-fixture", "sessions": 13, "weighted": 411000000, "sub": 300000000}]}}
             """
         guard let usage = try? JSONDecoder().decode(UsageSummary.self, from: Data(json.utf8)) else {
             return ["usage fixture did not decode"]
@@ -3633,7 +3732,7 @@ final class UsageWindow: NSWindowController {
         let window = UsageWindow()
         window.update(usage)
         var problems: [String] = []
-        if window.grid.numberOfRows < 8 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 8 or more") }
+        if window.grid.numberOfRows < 18 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 18 or more") }
         if let content = window.window?.contentView {
             content.layoutSubtreeIfNeeded()
             if window.grid.frame.maxX > content.bounds.maxX || window.grid.frame.minY < 0 {
@@ -5138,6 +5237,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         DispatchQueue.global(qos: .utility).async { [weak self] in
             refreshUsageOnce()
             DispatchQueue.main.async { self?.reload() }
+            refreshLeaderboardOnce()
+            DispatchQueue.main.async { self?.reload() }
         }
     }
 
@@ -5571,6 +5672,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // The account's quotas, so a reset made on claude.ai reaches the bar with no
             // session redrawing: the script gates it to one request per five minutes.
             DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
+            // The leaderboard only matters while the Usage window is on screen.
+            if self?.usageWindow?.window?.isVisible == true {
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    refreshLeaderboardOnce()
+                    DispatchQueue.main.async { self?.reload() }
+                }
+            }
         }
     }
 
