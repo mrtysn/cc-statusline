@@ -3300,21 +3300,26 @@ final class ShortcutStore {
         var shortcut: Shortcut?
         /// Show or hide the sessions list.
         var listShortcut: Shortcut?
+        /// A second shortcut for the same.
+        var listShortcut2: Shortcut?
 
         enum CodingKeys: String, CodingKey {
             case shortcut
             case listShortcut = "list_shortcut"
+            case listShortcut2 = "list_shortcut_2"
         }
     }
 
     private let url = supportDir.appendingPathComponent("shortcut.json")
     private(set) var current: Shortcut?
     private(set) var list: Shortcut?
+    private(set) var list2: Shortcut?
 
     init() {
         if let data = try? Data(contentsOf: url), let file = try? JSONDecoder().decode(File.self, from: data) {
             current = file.shortcut
             list = file.listShortcut
+            list2 = file.listShortcut2
         }
     }
 
@@ -3328,12 +3333,17 @@ final class ShortcutStore {
         write()
     }
 
+    func saveList2(_ shortcut: Shortcut?) {
+        list2 = shortcut
+        write()
+    }
+
     private func write() {
         try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // Atomic, like the other settings files.
-        try? encoder.encode(File(shortcut: current, listShortcut: list)).write(to: url, options: .atomic)
+        try? encoder.encode(File(shortcut: current, listShortcut: list, listShortcut2: list2)).write(to: url, options: .atomic)
     }
 }
 
@@ -3640,24 +3650,36 @@ final class UsageWindow: NSWindowController {
 }
 
 final class ShortcutWindow: NSWindowController {
-    private let apply: (Shortcut?) -> String?
-    private let recorder = ShortcutRecorder()
+    /// One recordable shortcut: what it is called, what it is now, and how it is applied.
+    struct Slot {
+        var current: Shortcut?
+        var apply: (Shortcut?) -> String?
+    }
+
+    private let slots: [Slot]
+    private let recorders: [ShortcutRecorder]
     private let note = NSTextField(wrappingLabelWithString: "")
     private let purpose: String
 
-    /// `title` names the window; `purpose` finishes "Press this from any app to ".
-    init(title: String, purpose: String, current: Shortcut?, apply: @escaping (Shortcut?) -> String?) {
-        self.apply = apply
+    /// `title` names the window; `purpose` finishes "Press this from any app to ". More
+    /// than one slot gives that many alternative shortcuts for the same purpose.
+    init(title: String, purpose: String, slots: [Slot]) {
+        self.slots = slots
         self.purpose = purpose
+        self.recorders = slots.map { _ in ShortcutRecorder() }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 170),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 150 + 30 * slots.count),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = title
         window.appearance = NSAppearance(named: .darkAqua)
         window.isReleasedWhenClosed = false
         super.init(window: window)
-        recorder.shortcut = current
+        for (recorder, slot) in zip(recorders, slots) { recorder.shortcut = slot.current }
         build()
+    }
+
+    convenience init(title: String, purpose: String, current: Shortcut?, apply: @escaping (Shortcut?) -> String?) {
+        self.init(title: title, purpose: purpose, slots: [Slot(current: current, apply: apply)])
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -3665,25 +3687,35 @@ final class ShortcutWindow: NSWindowController {
     private func build() {
         guard let content = window?.contentView else { return }
         let intro = NSTextField(wrappingLabelWithString:
-            "Press this from any app to \(purpose). "
-            + "Click the box, then type a combination that includes Control, Option or Command. Esc cancels.")
+            "Press \(slots.count > 1 ? "either" : "this") from any app to \(purpose). "
+            + "Click a box, then type a combination that includes Control, Option or Command. Esc cancels.")
         intro.font = NSFont.systemFont(ofSize: 12)
         intro.textColor = .secondaryLabelColor
-        recorder.onRecord = { [weak self] combination in
-            guard let self = self else { return nil }
-            if let refusal = self.apply(combination) { return refusal }
-            self.recorder.shortcut = combination
-            return nil
-        }
-        recorder.onMessage = { [weak self] message in self?.say(message) }
         note.font = NSFont.systemFont(ofSize: 11)
         note.textColor = Palette.red
-        let clear = NSButton(title: "Clear", target: self, action: #selector(clear))
         let done = NSButton(title: "Done", target: self, action: #selector(done))
         done.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [clear, done])
-        buttons.spacing = 10
-        for view in [intro, recorder, note, buttons] as [NSView] {
+        var rows: [NSView] = []
+        for (index, recorder) in recorders.enumerated() {
+            recorder.onRecord = { [weak self] combination in
+                guard let self = self else { return nil }
+                if let refusal = self.slots[index].apply(combination) { return refusal }
+                recorder.shortcut = combination
+                return nil
+            }
+            recorder.onMessage = { [weak self] message in self?.say(message) }
+            let clear = NSButton(title: "Clear", target: self, action: #selector(clear(_:)))
+            clear.tag = index
+            recorder.widthAnchor.constraint(equalToConstant: 200).isActive = true
+            let row = NSStackView(views: [recorder, clear])
+            row.spacing = 10
+            rows.append(row)
+        }
+        let list = NSStackView(views: rows)
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 8
+        for view in [intro, list, note, done] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -3691,22 +3723,22 @@ final class ShortcutWindow: NSWindowController {
             intro.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             intro.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             intro.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            recorder.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 14),
-            recorder.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
-            recorder.widthAnchor.constraint(equalToConstant: 200),
-            note.topAnchor.constraint(equalTo: recorder.bottomAnchor, constant: 8),
+            list.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 14),
+            list.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
+            note.topAnchor.constraint(equalTo: list.bottomAnchor, constant: 8),
             note.leadingAnchor.constraint(equalTo: intro.leadingAnchor),
             note.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
-            buttons.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
-            buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            done.trailingAnchor.constraint(equalTo: intro.trailingAnchor),
+            done.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
     }
 
     private func say(_ message: String) { note.stringValue = message }
 
-    /// Back to no shortcut at all.
-    @objc private func clear() {
-        if let refusal = apply(nil) { say(refusal) } else { say(""); recorder.shortcut = nil }
+    /// Back to no shortcut in that slot.
+    @objc private func clear(_ sender: NSButton) {
+        let index = sender.tag
+        if let refusal = slots[index].apply(nil) { say(refusal) } else { say(""); recorders[index].shortcut = nil }
     }
 
     @objc private func done() { window?.close() }
@@ -4701,6 +4733,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var shortcutWindow: ShortcutWindow?
     /// The system-wide shortcut that shows and hides this list, and the window that sets it.
     private let listHotKey = GlobalHotKey(id: 2)
+    private let listHotKey2 = GlobalHotKey(id: 3)
     private var listShortcutWindow: ShortcutWindow?
     private var usageWindow: UsageWindow?
     /// The info icon beside the quotas that opens the Usage window.
@@ -5047,6 +5080,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if let error = hotKey.set(shortcutStore.current) { log("new session shortcut: \(error)") }
         listHotKey.onPress = { [weak self] in self?.toggleSessionsList() }
         if let error = listHotKey.set(shortcutStore.list) { log("sessions list shortcut: \(error)") }
+        listHotKey2.onPress = { [weak self] in self?.toggleSessionsList() }
+        if let error = listHotKey2.set(shortcutStore.list2) { log("sessions list shortcut 2: \(error)") }
     }
 
     /// The list shortcut, like a hotkey window: brings the list forward, and hides the
@@ -5066,11 +5101,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     @objc func openListShortcutSettings() {
         if listShortcutWindow == nil {
             listShortcutWindow = ShortcutWindow(
-                title: "Show Sessions Shortcut", purpose: "show this list, and again to hide it",
-                current: listHotKey.active
-            ) { [weak self] shortcut in
-                self?.applyListShortcut(shortcut)
-            }
+                title: "Show Sessions Shortcuts", purpose: "show this list, and again to hide it",
+                slots: [
+                    .init(current: listHotKey.active) { [weak self] in self?.applyListShortcut($0) },
+                    .init(current: listHotKey2.active) { [weak self] in self?.applyListShortcut2($0) },
+                ])
         }
         listShortcutWindow?.showWindow(nil)
         listShortcutWindow?.window?.makeKeyAndOrderFront(nil)
@@ -5080,6 +5115,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private func applyListShortcut(_ shortcut: Shortcut?) -> String? {
         if let refusal = listHotKey.set(shortcut) { return refusal }
         shortcutStore.saveList(shortcut)
+        return nil
+    }
+
+    private func applyListShortcut2(_ shortcut: Shortcut?) -> String? {
+        if let refusal = listHotKey2.set(shortcut) { return refusal }
+        shortcutStore.saveList2(shortcut)
         return nil
     }
 
@@ -5705,7 +5746,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return true
         }
         if item.action == #selector(openListShortcutSettings) {
-            item.title = "Show Sessions Shortcut\u{2026} (\(listHotKey.active?.display ?? "Unset"))"
+            let shown = [listHotKey.active, listHotKey2.active].compactMap { $0?.display }
+            item.title = "Show Sessions Shortcuts\u{2026} (\(shown.isEmpty ? "Unset" : shown.joined(separator: ", ")))"
             return true
         }
         guard item.action == #selector(showSelectedTerminal) else { return true }
@@ -7260,7 +7302,7 @@ func buildMenu() {
         withTitle: "New Session Shortcut…", action: #selector(SessionsWindow.openShortcutSettings),
         keyEquivalent: "")
     sessionMenu.addItem(
-        withTitle: "Show Sessions Shortcut…", action: #selector(SessionsWindow.openListShortcutSettings),
+        withTitle: "Show Sessions Shortcuts…", action: #selector(SessionsWindow.openListShortcutSettings),
         keyEquivalent: "")
     sessionItem.submenu = sessionMenu
     main.addItem(sessionItem)
