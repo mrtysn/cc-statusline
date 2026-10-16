@@ -249,6 +249,8 @@ struct Snapshot: Decodable {
     let live: [Session]
     let history: [Session]
     let fable: FableQuota?
+    /// The account's overall weekly quota, from the same cache.
+    let weekly: FableQuota?
     let usage: UsageSummary?
     let health: [HealthIssue]?
 }
@@ -5319,7 +5321,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if rows.count != total { problems.append("All sessions shows \(rows.count), want \(total)") }
 
         // Empty snapshot: the label says no session has drawn a status line yet.
-        apply(Snapshot(live: [], history: [], fable: nil, usage: nil, health: nil), loads: [:], reused: [], cost: nil, footprint: 0)
+        apply(Snapshot(live: [], history: [], fable: nil, weekly: nil, usage: nil, health: nil), loads: [:], reused: [], cost: nil, footprint: 0)
         if emptyLabel.isHidden || emptyLabel.stringValue != "No session has drawn a status line yet." {
             problems.append("the empty snapshot shows \"\(emptyLabel.stringValue)\"")
         }
@@ -5564,7 +5566,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         // Countdowns keep running while nothing redraws, and a session only
         // becomes "finished" with the passage of time.
-        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.reload() }
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.reload()
+            // The account's quotas, so a reset made on claude.ai reaches the bar with no
+            // session redrawing: the script gates it to one request per five minutes.
+            DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
+        }
     }
 
     /// A redraw writes one file, but the watcher fires more than once for it.
@@ -6607,11 +6614,20 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         let five = source { $0.summary.five_hour }
         let seven = source { $0.summary.seven_day }
+        var sevenLimit = seven?.summary.seven_day
+        var sevenReadAt = seven?.updated_at
+        // The account's own reading wins when it is newer than every session's: a
+        // reset pressed on claude.ai lowers the quota, and no session says so until
+        // it next redraws, while the highest-reading rule above would hold 99%.
+        if let account = snapshot.weekly, let at = account.read_at, at > (sevenReadAt ?? 0) {
+            sevenLimit = Limit(percent: account.percent, resets_at: account.resets_at)
+            sevenReadAt = at
+        }
         let hour: Double = 3600
         quotaBar.addArrangedSubview(
             quotaItem("5-hour quota", readAt: five?.updated_at, five?.summary.five_hour, window: 5 * hour))
         quotaBar.addArrangedSubview(
-            quotaItem("7-day quota", readAt: seven?.updated_at, seven?.summary.seven_day, window: 168 * hour))
+            quotaItem("7-day quota", readAt: sevenReadAt, sevenLimit, window: 168 * hour))
         // Fable comes from the account's own reading, not from a session: only a
         // session running Fable reports it, and the quota matters without one.
         let fable = snapshot.fable.map { Limit(percent: $0.percent, resets_at: $0.resets_at) }

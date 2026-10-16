@@ -462,6 +462,10 @@ async function refreshUsage(sevenArg) {
     fetched_at: Date.now(),
     seven_day_seen: sevenArg != null && sevenArg !== '' ? Number(sevenArg) : previous?.seven_day_seen ?? null,
     fable: previous?.fable ?? null,
+    // The overall weekly quota: a manual reset on claude.ai only reaches a session's
+    // reading when that session next redraws, so the account's own is kept too.
+    weekly: previous?.weekly ?? null,
+    limit_kinds: previous?.limit_kinds ?? null,
     // The rest of the account's picture, for the app's Usage window. Each is kept
     // across a failed refresh like fable, so one bad fetch does not blank them.
     credits: previous?.credits ?? null,
@@ -500,6 +504,11 @@ async function refreshUsage(sevenArg) {
     next.fable = entry
       ? { percent: entry.percent, resets_at: entry.resets_at ?? null, is_active: entry.is_active === true }
       : null;
+    // The overall weekly entry: a weekly kind with no model scope. The kinds seen are
+    // kept, so a rename shows in the cache instead of silently missing.
+    const weekly = body.limits.find((l) => /weekly|seven/.test(l?.kind ?? '') && !/scoped/.test(l.kind) && !l.scope?.model);
+    next.weekly = weekly && typeof weekly.percent === 'number' ? { percent: weekly.percent, resets_at: weekly.resets_at ?? null } : null;
+    next.limit_kinds = body.limits.map((l) => `${l?.kind}${l?.scope?.model?.display_name ? ':' + l.scope.model.display_name : ''}`);
     checkFormat('usage/response', true);
     Object.assign(next, extraUsage(body, entry));
   } catch (err) {
@@ -1315,9 +1324,15 @@ function liveSnapshot(columns) {
     const over = resets != null && resets <= now;
     fable = { percent: over ? 0 : cached.fable.percent, resets_at: over ? null : resets, read_at: cached.fetched_at ?? null };
   }
+  let weekly = null;
+  if (cached?.weekly && typeof cached.weekly.percent === 'number') {
+    const resets = Date.parse(cached.weekly.resets_at) || null;
+    const over = resets != null && resets <= now;
+    weekly = { percent: over ? 0 : cached.weekly.percent, resets_at: over ? null : resets, read_at: cached.fetched_at ?? null };
+  }
   const usage = usageSummary(cached, now);
   const health = Object.entries(readHealth()).map(([key, value]) => ({ key, ...value }));
-  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).filter((e) => !empty.has(e)).map(strip), fable, usage, health };
+  return { live: live.map(strip), history: ended.slice(0, LIVE_HISTORY_MAX).filter((e) => !empty.has(e)).map(strip), fable, weekly, usage, health };
 }
 
 // The cache's extra readings as the app's Usage window draws them. A grant past
