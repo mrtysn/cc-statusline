@@ -1355,10 +1355,11 @@ function usageSummary(cached, now) {
 }
 
 // ---- Token leaderboard ---------------------------------------------------
-// What each session and folder spent this week, for the app's Usage window, and
-// the weekly token cap that the quota readings imply. The totals come from
-// agents-shared's report-token-use.py, the one reader of the transcripts' usage
-// blocks; it sums sub-agent transcripts into their session.
+// What each session and folder spent this week, in dollars at list price, for the
+// app's Usage window, and the weekly cap in the same dollars that the quota readings
+// imply. The totals come from agents-shared's report-token-use.py, the one reader of
+// the transcripts' usage blocks: it prices every message by its model and cache tier
+// and sums sub-agent transcripts into their session.
 const READINGS_FILE = join(CACHE_DIR, 'quota-readings.jsonl');
 const READINGS_LAST = join(CACHE_DIR, 'quota-readings-last.json');
 const LEADERBOARD_FILE = join(CACHE_DIR, 'leaderboard.json');
@@ -1373,7 +1374,7 @@ const CAP_MIN_STEP = 3;
 
 // One line in quota-readings.jsonl for every change of the account's 7-day
 // reading, from the usage endpoint: { t, seven, seven_resets }. The cap is worked
-// out from how many tokens passed between two readings, which holds across an early
+// out from how much was spent between two readings, which holds across an early
 // reset where one reading alone does not. Status line readings are not used: a
 // session that has not redrawn since a reset still reports the old percentage, so
 // sessions disagree and the log would flap between them.
@@ -1441,8 +1442,6 @@ function agentsSharedDir() {
   }
 }
 
-const tokenWeight = (t) => (t?.input ?? 0) + 1.25 * (t?.cache_write ?? 0) + 0.1 * (t?.cache_read ?? 0) + 5 * (t?.output ?? 0);
-
 function readLeaderboard() {
   try {
     return JSON.parse(readFileSync(LEADERBOARD_FILE, 'utf8'));
@@ -1493,38 +1492,38 @@ async function refreshLeaderboard() {
     const args = ['--since', new Date(since).toISOString()];
     if (cuts.length >= 2) args.push('--cuts', cuts.map((c) => new Date(c).toISOString()).join(','));
     const out = await runReporter(join(dir, 'scripts', 'report-token-use.py'), args);
-    const sub = (t) => tokenWeight(t?.sub);
+    const sub = (t) => t?.sub?.cost ?? 0;
     let cap = null;
     if (pairs.length && Array.isArray(out.intervals)) {
-      // Pairs are consecutive, so each pair's tokens are the intervals between its two cuts.
-      let tokens = 0;
+      // Pairs are consecutive, so each pair's spend is the intervals between its two cuts.
+      let dollars = 0;
       let points = 0;
       for (const p of pairs) {
         const lo = cuts.indexOf(p.from);
         const hi = cuts.indexOf(p.to);
-        for (let i = lo; i < hi; i++) tokens += out.intervals[i]?.weighted ?? 0;
+        for (let i = lo; i < hi; i++) dollars += out.intervals[i]?.cost ?? 0;
         points += p.points;
       }
-      if (points > 0) cap = { tokens: (tokens / points) * 100, points, pairs: pairs.length };
+      if (points > 0) cap = { dollars: (dollars / points) * 100, points, pairs: pairs.length };
     }
     save({
       error: null,
       since,
       readings: readings.length,
-      total: out.sessions.reduce((n, s) => n + s.weighted, 0),
+      total: out.sessions.reduce((n, s) => n + s.total.cost, 0),
       sub: out.sessions.reduce((n, s) => n + sub(s), 0),
       cap,
       sessions: out.sessions.slice(0, LEADERBOARD_SESSIONS).map((s) => ({
         project: s.project,
         session: s.session,
         requests: s.total.requests,
-        weighted: s.weighted,
+        cost: s.total.cost,
         sub: sub(s),
       })),
       folders: out.projects.slice(0, LEADERBOARD_FOLDERS).map((p) => ({
         project: p.project,
         sessions: p.sessions,
-        weighted: p.weighted,
+        cost: p.total.cost,
         sub: sub(p),
       })),
     });

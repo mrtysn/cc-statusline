@@ -225,25 +225,26 @@ struct FableShare: Decodable {
     let allowance: Double
 }
 
-/// One line of the token leaderboard: a session (`session` set) or a folder (`sessions` set), with
-/// its weighted tokens and the part of them that came from sub-agents.
+/// One line of the spend leaderboard: a session (`session` set) or a folder (`sessions` set), with
+/// its cost in dollars at list price and the part of it that came from sub-agents.
 struct TokenRow: Decodable {
     let project: String
     let session: String?
     let sessions: Int?
     let requests: Int?
-    let weighted: Double
-    let sub: Double
+    let cost: Double?
+    let sub: Double?
 }
 
-/// The weekly token cap the quota readings imply: tokens between two readings per point gained.
+/// The weekly cap, in list-price dollars, that the quota readings imply: dollars spent between
+/// two readings per point gained.
 struct TokenCap: Decodable {
-    let tokens: Double
+    let dollars: Double
     let points: Double
     let pairs: Int
 }
 
-/// What this week's tokens went to, from `cc-statusline.js refresh-leaderboard`.
+/// What this week's spend went to, from `cc-statusline.js refresh-leaderboard`.
 struct TokenBoard: Decodable {
     let read_at: Double?
     let error: String?
@@ -3621,32 +3622,38 @@ final class UsageWindow: NSWindowController {
         }
     }
 
-    /// 1.2B, 144M, 8.5M: tokens in the unit that keeps two or three digits.
-    static func tokenText(_ tokens: Double) -> String {
-        if tokens >= 1e9 { return String(format: "%.1fB", tokens / 1e9) }
-        if tokens >= 1e7 { return String(format: "%.0fM", tokens / 1e6) }
-        if tokens >= 1e6 { return String(format: "%.1fM", tokens / 1e6) }
-        return String(format: "%.0fk", tokens / 1e3)
+    /// $1,234 / $56.70 / $0.42: dollars with the precision that fits their size.
+    static func moneyText(_ dollars: Double) -> String {
+        if dollars >= 100 {
+            let grouped = NumberFormatter()
+            grouped.locale = Locale(identifier: "en_US")
+            grouped.numberStyle = .decimal
+            grouped.maximumFractionDigits = 0
+            return "$" + (grouped.string(from: NSNumber(value: dollars)) ?? String(format: "%.0f", dollars))
+        }
+        if dollars >= 10 { return String(format: "$%.0f", dollars) }
+        return String(format: "$%.2f", dollars)
     }
 
     private func tokenRows(_ rows: [TokenRow], name: (TokenRow) -> String) {
-        let top = rows.map(\.weighted).max() ?? 1
+        let top = rows.compactMap(\.cost).max() ?? 1
         for r in rows {
-            let share = r.weighted > 0 ? Int((r.sub / r.weighted * 100).rounded()) : 0
-            row(name(r), bar: top > 0 ? r.weighted / top * 100 : nil, limit: false,
-                UsageWindow.tokenText(r.weighted), "\(share)% sub-agents")
+            let cost = r.cost ?? 0
+            let share = cost > 0 ? Int(((r.sub ?? 0) / cost * 100).rounded()) : 0
+            row(name(r), bar: top > 0 ? cost / top * 100 : nil, limit: false,
+                UsageWindow.moneyText(cost), "\(share)% sub-agents")
         }
     }
 
-    /// Where this week's tokens went, in input-equivalent tokens (input + 1.25 x cache write +
-    /// 0.1 x cache read + 5 x output), and the weekly cap the readings imply.
+    /// Where this week's spend went, in dollars at list price (cache writes at the one-hour price,
+    /// output scaled up for what the transcripts leave out), and the weekly cap the readings imply.
     private func drawTokens(_ board: TokenBoard) {
         guard let total = board.total else { return }
-        heading("TOKENS THIS WEEK")
+        heading("SPEND THIS WEEK, AT LIST PRICE")
         let subShare = total > 0 ? Int(((board.sub ?? 0) / total * 100).rounded()) : 0
-        row("all sessions", bar: nil, UsageWindow.tokenText(total), "\(subShare)% from sub-agents")
+        row("all sessions", bar: nil, UsageWindow.moneyText(total), "\(subShare)% from sub-agents")
         if let cap = board.cap {
-            row("implied weekly cap", bar: nil, "~" + UsageWindow.tokenText(cap.tokens),
+            row("implied weekly cap", bar: nil, "~" + UsageWindow.moneyText(cap.dollars),
                 "from \(cap.pairs) reading pair\(cap.pairs == 1 ? "" : "s"), \(Int(cap.points)) points")
         } else {
             row("implied weekly cap", bar: nil, "calibrating",
@@ -3720,11 +3727,11 @@ final class UsageWindow: NSWindowController {
              "surfaces": [{"name": "Claude Code", "percent": 92}, {"name": "Chats", "percent": 8}],
              "fable_share": {"used": 7, "allowance": 50},
              "tokens": {"read_at": \(Date().timeIntervalSince1970 * 1000 - 60000), "error": null, "readings": 6,
-                        "total": 810000000, "sub": 420000000,
-                        "cap": {"tokens": 807000000, "points": 12, "pairs": 3},
-                        "sessions": [{"project": "dev-fixture", "session": "7386be92-0000", "requests": 2235, "weighted": 144000000, "sub": 128000000},
-                                     {"project": "dev-fixture", "session": "2370cc4b-0000", "requests": 4681, "weighted": 129000000, "sub": 100000000}],
-                        "folders": [{"project": "dev-fixture", "sessions": 13, "weighted": 411000000, "sub": 300000000}]}}
+                        "total": 1911, "sub": 990,
+                        "cap": {"dollars": 3900, "points": 12, "pairs": 3},
+                        "sessions": [{"project": "dev-fixture", "session": "7386be92-0000", "requests": 2235, "cost": 449.7, "sub": 400.1},
+                                     {"project": "dev-fixture", "session": "2370cc4b-0000", "requests": 4681, "cost": 315.1, "sub": 240.2}],
+                        "folders": [{"project": "dev-fixture", "sessions": 13, "cost": 900.5, "sub": 700.3}]}}
             """
         guard let usage = try? JSONDecoder().decode(UsageSummary.self, from: Data(json.utf8)) else {
             return ["usage fixture did not decode"]

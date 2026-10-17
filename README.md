@@ -107,9 +107,11 @@ Any recorded problem puts a red `!` at the end of every session's last status li
 
 ## Token leaderboard
 
-The Usage window ends with where this week's tokens went: all sessions, the biggest ten sessions and eight folders, each with the share that came from sub-agents. `cc-statusline.js refresh-leaderboard` builds it with agents-shared's `report-token-use.py`, found through `AGENTS_SHARED_DIR` in the environment or in `~/.claude/paths.local.sh`; it takes about ten seconds, runs when the window opens (and every five minutes while it stays open), and a failure keeps the last reading with the error shown. Tokens are input-equivalent: input + 1.25 x cache write + 0.1 x cache read + 5 x output. Output is the transcript's streaming snapshot, so it undercounts.
+The Usage window ends with where this week's money went: all sessions, the biggest ten sessions and eight folders, each with the share that came from sub-agents. `cc-statusline.js refresh-leaderboard` builds it with agents-shared's `report-token-use.py`, found through `AGENTS_SHARED_DIR` in the environment or in `~/.claude/paths.local.sh`; it takes about ten seconds, runs when the window opens (and every five minutes while it stays open), and a failure keeps the last reading with the error shown.
 
-The implied weekly cap is tokens per percentage point between two readings of `quota-readings.jsonl`, not one reading over the window's start: an early reset granted on claude.ai makes the percentage fall mid-week, which breaks the one-point sum. Readings come from the usage endpoint, not from the status line: a session that has not redrawn since a reset still reports the old percentage, so sessions disagree. Readings are paired once they are 3 points apart, since the percentage moves in whole steps; a fall in the percentage restarts the week's token count from that reading. Until two such readings exist the window says `calibrating`.
+Amounts are dollars at Anthropic's list price, per message by its model: cache writes at the one-hour price, cache reads at the model's own read price, and output tokens doubled, because transcripts keep the snapshot taken while a reply streamed and undercount it by about 2x. Across 62 sessions that came to 88% of the cost Claude Code itself reports for them (median session 97%); calls that leave no transcript row, like the status line's topic calls, are the likeliest rest. The plan quota's own formula is unpublished, so this is a ranking and calibration aid, not what the plan charges.
+
+The implied weekly cap is dollars spent per percentage point between two readings of `quota-readings.jsonl`, not one reading over the window's start: an early reset granted on claude.ai makes the percentage fall mid-week, which breaks the one-point sum. Readings come from the usage endpoint, not from the status line: a session that has not redrawn since a reset still reports the old percentage, so sessions disagree. Readings are paired once they are 3 points apart, since the percentage moves in whole steps; a fall in the percentage restarts the week's total from that reading. Until two such readings exist the window says `calibrating`.
 
 ## Fable quota
 
@@ -122,7 +124,7 @@ One cache is shared by every session in `~/.cache/cc-statusline/` (override with
 | File | Purpose |
 |---|---|
 | `quota-readings.jsonl` | One line per change of the account's 7-day percentage, read from the usage endpoint: `t`, `seven`, `seven_resets` |
-| `leaderboard.json` | Last token leaderboard for the Usage window: this week's tokens per session and folder with the sub-agent share, and the implied weekly cap |
+| `leaderboard.json` | Last token leaderboard for the Usage window: this week's list-price spend per session and folder with the sub-agent share, and the implied weekly cap in dollars |
 | `usage.json` | Last reading and the error of the last refresh, if any |
 | `refresh.lock` | Held while a refresh runs, so sessions never fetch in parallel |
 | `error.log` | One timestamped line per failed refresh: `keychain`, `network`, `auth`, `http <status>`, or `parse` |
