@@ -1350,7 +1350,6 @@ function usageSummary(cached, now) {
     spend: cached.spend ?? null,
     surfaces: cached.surfaces ?? null,
     fable_share: cached.fable_share ?? null,
-    tokens: readLeaderboard(),
   };
 }
 
@@ -1367,8 +1366,6 @@ const LEADERBOARD_LOCK = join(CACHE_DIR, 'leaderboard.lock');
 const LEADERBOARD_MS = 5 * 60000;
 const LEADERBOARD_STALE_MS = 180000;
 const ALL_TIME_MS = 30 * 60000;
-const LEADERBOARD_SESSIONS = 10;
-const LEADERBOARD_FOLDERS = 8;
 // The percentages move in whole steps, so a pair of readings must be this many
 // points apart before it says anything about the cap.
 const CAP_MIN_STEP = 3;
@@ -1504,22 +1501,37 @@ async function refreshLeaderboard() {
       keepAll ? null : runReporter(script, []),
     ]);
     const sub = (t) => t?.sub?.cost ?? 0;
+    // The model that cost the most in a record, by its short name: "opus-5-5", "sonnet-5-5".
+    const topModel = (x) => {
+      const best = Object.entries(x.models ?? {}).sort((a, c) => c[1].cost - a[1].cost)[0];
+      return best ? best[0].replace(/^claude-/, '') : null;
+    };
     const view = (out, since, until) => ({
       since,
       until,
       read_at: Date.now(),
+      // First and last message of any session in the view, ISO times.
+      first: out.sessions.map((x) => x.first).filter(Boolean).sort()[0] ?? null,
+      last: out.sessions.map((x) => x.last).filter(Boolean).sort().at(-1) ?? null,
       total: out.sessions.reduce((n, x) => n + x.total.cost, 0),
       sub: out.sessions.reduce((n, x) => n + sub(x), 0),
-      sessions: out.sessions.slice(0, LEADERBOARD_SESSIONS).map((x) => ({
+      sessions: out.sessions.map((x) => ({
         project: x.project,
         session: x.session,
+        title: x.title,
+        first: x.first,
+        last: x.last,
         requests: x.total.requests,
         cost: x.total.cost,
         sub: sub(x),
+        model: topModel(x),
       })),
-      folders: out.projects.slice(0, LEADERBOARD_FOLDERS).map((x) => ({
+      folders: out.projects.map((x) => ({
         project: x.project,
         sessions: x.sessions,
+        first: x.first,
+        last: x.last,
+        requests: x.total.requests,
         cost: x.total.cost,
         sub: sub(x),
       })),

@@ -225,45 +225,6 @@ struct FableShare: Decodable {
     let allowance: Double
 }
 
-/// One line of the spend leaderboard: a session (`session` set) or a folder (`sessions` set), with
-/// its cost in dollars at list price and the part of it that came from sub-agents.
-struct TokenRow: Decodable {
-    let project: String
-    let session: String?
-    let sessions: Int?
-    let requests: Int?
-    let cost: Double?
-    let sub: Double?
-}
-
-/// The weekly cap, in list-price dollars, that the quota readings imply: dollars spent between
-/// two readings per point gained.
-struct TokenCap: Decodable {
-    let dollars: Double
-    let points: Double
-    let pairs: Int
-}
-
-/// One window of the spend leaderboard: its time range in ms (`until` nil while it is still
-/// open, `since` nil for all time), the total and the sub-agent part, and the top rows.
-struct TokenView: Decodable {
-    let since: Double?
-    let until: Double?
-    let total: Double?
-    let sub: Double?
-    let sessions: [TokenRow]?
-    let folders: [TokenRow]?
-}
-
-/// What the spend went to, from `cc-statusline.js refresh-leaderboard`: the views are `week`,
-/// `last_week` and `all`; the cap belongs to the current week.
-struct TokenBoard: Decodable {
-    let read_at: Double?
-    let error: String?
-    let readings: Int?
-    let cap: TokenCap?
-    let views: [String: TokenView]?
-}
 
 /// What the Usage window shows beyond the quota bar, from the shared usage cache.
 /// Every field is optional: a cache written before they existed has none.
@@ -274,7 +235,6 @@ struct UsageSummary: Decodable {
     let spend: SpendCap?
     let surfaces: [SurfaceShare]?
     let fable_share: FableShare?
-    let tokens: TokenBoard?
 }
 
 /// An outside format that stopped matching what the tool reads; see health.json.
@@ -3548,10 +3508,6 @@ final class ShortcutRecorder: NSButton {
 /// window, not a popover, so the capture script can read it.
 final class UsageWindow: NSWindowController {
     fileprivate let grid = NSGridView()
-    /// Which leaderboard window is showing: `week`, `last_week` or `all`.
-    fileprivate var period = "week"
-    private var shown: UsageSummary?
-    private static let periods = [("week", "This week"), ("last_week", "Last week"), ("all", "All time")]
 
     init() {
         let window = NSWindow(
@@ -3634,76 +3590,7 @@ final class UsageWindow: NSWindowController {
         }
     }
 
-    /// $1,234 / $56.70 / $0.42: dollars with the precision that fits their size.
-    static func moneyText(_ dollars: Double) -> String {
-        if dollars >= 100 {
-            let grouped = NumberFormatter()
-            grouped.locale = Locale(identifier: "en_US")
-            grouped.numberStyle = .decimal
-            grouped.maximumFractionDigits = 0
-            return "$" + (grouped.string(from: NSNumber(value: dollars)) ?? String(format: "%.0f", dollars))
-        }
-        if dollars >= 10 { return String(format: "$%.0f", dollars) }
-        return String(format: "$%.2f", dollars)
-    }
-
-    private func tokenRows(_ rows: [TokenRow], name: (TokenRow) -> String) {
-        let top = rows.compactMap(\.cost).max() ?? 1
-        for r in rows {
-            let cost = r.cost ?? 0
-            let share = cost > 0 ? Int(((r.sub ?? 0) / cost * 100).rounded()) : 0
-            row(name(r), bar: top > 0 ? cost / top * 100 : nil, limit: false,
-                UsageWindow.moneyText(cost), "\(share)% sub-agents")
-        }
-    }
-
-    @objc private func periodChanged(_ sender: NSSegmentedControl) {
-        period = UsageWindow.periods[max(0, min(sender.selectedSegment, UsageWindow.periods.count - 1))].0
-        update(shown)
-    }
-
-    /// Where the spend went in the chosen window, in dollars at list price (cache writes at the
-    /// one-hour price, output scaled up for what the transcripts leave out), and for the current
-    /// week the weekly cap the quota readings imply.
-    private func drawTokens(_ board: TokenBoard) {
-        guard let views = board.views, let view = views[period] ?? views["week"], let total = view.total else { return }
-        heading("SPEND, AT LIST PRICE")
-        let switcher = NSSegmentedControl(
-            labels: UsageWindow.periods.map(\.1), trackingMode: .selectOne, target: self, action: #selector(periodChanged(_:)))
-        switcher.selectedSegment = UsageWindow.periods.firstIndex { $0.0 == period } ?? 0
-        switcher.controlSize = .small
-        grid.addRow(with: [switcher])
-        if let since = view.since {
-            row("window", bar: nil, "\(clock(since)) to \(view.until.map { clock($0) } ?? "now")")
-        } else {
-            row("window", bar: nil, "since the first transcript")
-        }
-        let subShare = total > 0 ? Int(((view.sub ?? 0) / total * 100).rounded()) : 0
-        row("all sessions", bar: nil, UsageWindow.moneyText(total), "\(subShare)% from sub-agents")
-        if period == "week" {
-            if let cap = board.cap {
-                row("implied weekly cap", bar: nil, "~" + UsageWindow.moneyText(cap.dollars),
-                    "from \(cap.pairs) reading pair\(cap.pairs == 1 ? "" : "s"), \(Int(cap.points)) points")
-            } else {
-                row("implied weekly cap", bar: nil, "calibrating",
-                    "needs two readings 3 points apart (\(board.readings ?? 0) logged)")
-            }
-        }
-        if let sessions = view.sessions, !sessions.isEmpty {
-            heading("BIGGEST SESSIONS")
-            tokenRows(sessions) { "\($0.project.replacingOccurrences(of: "dev-", with: "", options: .anchored)) \(String(($0.session ?? "").prefix(8)))" }
-        }
-        if let folders = view.folders, !folders.isEmpty {
-            heading("BIGGEST FOLDERS")
-            tokenRows(folders) { "\($0.project.replacingOccurrences(of: "dev-", with: "", options: .anchored)) · \($0.sessions ?? 0) session\($0.sessions == 1 ? "" : "s")" }
-        }
-        if let error = board.error {
-            grid.addRow(with: [label("leaderboard refresh failed: \(error)", Palette.yellow, size: 11)])
-        }
-    }
-
     func update(_ usage: UsageSummary?) {
-        shown = usage
         // removeRow leaves a row's views in the grid as subviews; they would draw over the next reading.
         for _ in 0..<grid.numberOfRows { grid.removeRow(at: 0) }
         for view in grid.subviews { view.removeFromSuperview() }
@@ -3735,7 +3622,6 @@ final class UsageWindow: NSWindowController {
             heading("THIS WEEK BY SURFACE")
             for surface in surfaces { row(surface.name, bar: surface.percent, limit: false, "\(Int(surface.percent.rounded()))%") }
         }
-        if let board = usage.tokens { drawTokens(board) }
         heading("")
         var footer = usage.read_at.map { "read \(ago($0)) ago" } ?? "never read"
         if let error = usage.error { footer += " · refresh failed: \(error)" }
@@ -3756,20 +3642,7 @@ final class UsageWindow: NSWindowController {
              "credits": [{"limit": 250, "used": 62.5, "remaining": 187.5, "expires_at": \(Date().timeIntervalSince1970 * 1000 + 3 * 86400000)}],
              "spend": {"used": 0, "limit": 60, "enabled": false, "disabled_reason": "out_of_credits", "user_disabled": false},
              "surfaces": [{"name": "Claude Code", "percent": 92}, {"name": "Chats", "percent": 8}],
-             "fable_share": {"used": 7, "allowance": 50},
-             "tokens": {"read_at": \(Date().timeIntervalSince1970 * 1000 - 60000), "error": null, "readings": 6,
-                        "cap": {"dollars": 3900, "points": 12, "pairs": 3},
-                        "views": {
-                          "week": {"since": \(Date().timeIntervalSince1970 * 1000 - 3 * 86400000), "until": null, "total": 1911, "sub": 990,
-                                   "sessions": [{"project": "dev-fixture", "session": "7386be92-0000", "requests": 2235, "cost": 449.7, "sub": 400.1},
-                                                {"project": "dev-fixture", "session": "2370cc4b-0000", "requests": 4681, "cost": 315.1, "sub": 240.2}],
-                                   "folders": [{"project": "dev-fixture", "sessions": 13, "cost": 900.5, "sub": 700.3}]},
-                          "last_week": {"since": \(Date().timeIntervalSince1970 * 1000 - 10 * 86400000), "until": \(Date().timeIntervalSince1970 * 1000 - 3 * 86400000), "total": 1486, "sub": 559,
-                                        "sessions": [{"project": "dev-fixture", "session": "aaaaaaaa-0000", "requests": 10, "cost": 379, "sub": 100}],
-                                        "folders": [{"project": "dev-fixture", "sessions": 2, "cost": 379, "sub": 100}]},
-                          "all": {"since": null, "until": null, "total": 11191, "sub": 3412,
-                                  "sessions": [{"project": "dev-fixture", "session": "bbbbbbbb-0000", "requests": 99, "cost": 703, "sub": 300}],
-                                  "folders": [{"project": "dev-fixture", "sessions": 40, "cost": 703, "sub": 300}]}}}}
+             "fable_share": {"used": 7, "allowance": 50}}
             """
         guard let usage = try? JSONDecoder().decode(UsageSummary.self, from: Data(json.utf8)) else {
             return ["usage fixture did not decode"]
@@ -3777,22 +3650,7 @@ final class UsageWindow: NSWindowController {
         let window = UsageWindow()
         window.update(usage)
         var problems: [String] = []
-        // The other leaderboard windows must draw their own rows too.
-        for other in ["last_week", "all"] {
-            window.period = other
-            window.update(usage)
-            if window.grid.numberOfRows < 14 { problems.append("usage window drew \(window.grid.numberOfRows) rows for \(other), want 14 or more") }
-            if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_USAGE_PNG"], let content = window.window?.contentView,
-                let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
-            {
-                content.layoutSubtreeIfNeeded()
-                content.cacheDisplay(in: content.bounds, to: rep)
-                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path + "." + other + ".png"))
-            }
-        }
-        window.period = "week"
-        window.update(usage)
-        if window.grid.numberOfRows < 18 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 18 or more") }
+        if window.grid.numberOfRows < 8 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 8 or more") }
         if let content = window.window?.contentView {
             content.layoutSubtreeIfNeeded()
             if window.grid.frame.maxX > content.bounds.maxX || window.grid.frame.minY < 0 {
@@ -3806,6 +3664,483 @@ final class UsageWindow: NSWindowController {
             }
         }
         window.update(nil)
+        return problems
+    }
+}
+
+// MARK: - Leaderboard
+
+/// The weekly cap, in list-price dollars, that the quota readings imply: dollars spent between two
+/// readings per point gained.
+struct LeaderboardCap: Decodable {
+    let dollars: Double
+    let points: Double
+    let pairs: Int
+}
+
+struct LeaderboardSession: Decodable {
+    let project: String
+    let session: String
+    let title: String?
+    let first: String?
+    let last: String?
+    let requests: Int?
+    let cost: Double?
+    let sub: Double?
+    let model: String?
+}
+
+struct LeaderboardFolder: Decodable {
+    let project: String
+    let sessions: Int?
+    let first: String?
+    let last: String?
+    let requests: Int?
+    let cost: Double?
+    let sub: Double?
+}
+
+/// One window of time: `since` and `until` in ms (the quota's week; nil `until` while it is still
+/// open, nil `since` for all time) and the earliest and latest message inside it.
+struct LeaderboardView: Decodable {
+    let since: Double?
+    let until: Double?
+    let first: String?
+    let last: String?
+    let total: Double?
+    let sub: Double?
+    let sessions: [LeaderboardSession]?
+    let folders: [LeaderboardFolder]?
+}
+
+/// `leaderboard.json`, written by `cc-statusline.js refresh-leaderboard`: the views are `week`,
+/// `last_week` and `all`; the cap belongs to the current week.
+struct LeaderboardFile: Decodable {
+    let read_at: Double?
+    let error: String?
+    let readings: Int?
+    let cap: LeaderboardCap?
+    let views: [String: LeaderboardView]?
+}
+
+/// $1,234 / $56 / $0.42: dollars with the precision that fits their size.
+func moneyText(_ dollars: Double) -> String {
+    if dollars >= 100 {
+        let grouped = NumberFormatter()
+        grouped.locale = Locale(identifier: "en_US")
+        grouped.numberStyle = .decimal
+        grouped.maximumFractionDigits = 0
+        return "$" + (grouped.string(from: NSNumber(value: dollars)) ?? String(format: "%.0f", dollars))
+    }
+    if dollars >= 10 { return String(format: "$%.0f", dollars) }
+    return String(format: "$%.2f", dollars)
+}
+
+/// The sessions or folders of one period, ranked by what they cost at list price.
+final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    /// One table row, a session or a folder.
+    struct Row {
+        let id: String
+        let name: String
+        let tip: String
+        let folder: String
+        let count: Int
+        let cost: Double
+        let subShare: Double
+        let requests: Int
+        let model: String
+        let last: Double
+    }
+
+    static let periods = [("week", "This week"), ("last_week", "Last week"), ("all", "All time")]
+    private static let sessionColumns: [(key: String, title: String, width: CGFloat, right: Bool)] = [
+        ("rank", "#", 36, true), ("name", "Session", 270, false), ("folder", "Folder", 110, false),
+        ("cost", "Spend", 70, true), ("share", "Share", 100, false), ("sub", "Sub-agents", 84, true),
+        ("requests", "Requests", 70, true), ("model", "Model", 90, false), ("last", "Last active", 100, false),
+    ]
+    private static let folderColumns: [(key: String, title: String, width: CGFloat, right: Bool)] = [
+        ("rank", "#", 36, true), ("name", "Folder", 300, false), ("count", "Sessions", 76, true),
+        ("cost", "Spend", 70, true), ("share", "Share", 120, false), ("sub", "Sub-agents", 84, true),
+        ("requests", "Requests", 76, true), ("last", "Last active", 100, false),
+    ]
+
+    private let table = NSTableView()
+    private let search = NSSearchField()
+    private let kind = NSSegmentedControl(labels: ["Sessions", "Folders"], trackingMode: .selectOne, target: nil, action: nil)
+    private let period = NSSegmentedControl(
+        labels: LeaderboardWindow.periods.map(\.1), trackingMode: .selectOne, target: nil, action: nil)
+    private let summary = NSTextField(labelWithString: "")
+    private let footer = NSTextField(wrappingLabelWithString: "")
+    private var file: LeaderboardFile?
+    private let fixture: LeaderboardFile?
+    private var all: [Row] = []
+    private var shown: [Row] = []
+    private var topCost = 1.0
+    private var showingFolders: Bool { kind.selectedSegment == 1 }
+    private var periodKey: String { LeaderboardWindow.periods[max(0, period.selectedSegment)].0 }
+    private var refreshTimer: Timer?
+    private var building = false
+
+    /// `fixture` stands in for the file in the self-test, which reads no Claude data.
+    init(fixture: LeaderboardFile? = nil) {
+        self.fixture = fixture
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1060, height: 680),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "Leaderboard"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.contentMinSize = NSSize(width: 820, height: 360)
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        build()
+        reload()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func build() {
+        guard let content = window?.contentView else { return }
+        content.wantsLayer = true
+        content.layer?.backgroundColor = Palette.background.cgColor
+        kind.selectedSegment = 0
+        period.selectedSegment = 0
+        for control in [kind, period] {
+            control.target = self
+            control.action = #selector(controlsChanged)
+            control.segmentStyle = .rounded
+        }
+        search.placeholderString = "Search a name, folder or model"
+        search.delegate = self
+        summary.textColor = Palette.dim
+        summary.font = NSFont.systemFont(ofSize: 12)
+        summary.alignment = .right
+        summary.lineBreakMode = .byTruncatingHead
+        footer.textColor = Palette.dim
+        footer.font = NSFont.systemFont(ofSize: 11)
+        footer.maximumNumberOfLines = 3
+        footer.preferredMaxLayoutWidth = 980
+
+        table.dataSource = self
+        table.delegate = self
+        table.backgroundColor = Palette.background
+        table.gridColor = Palette.frame
+        table.gridStyleMask = [.solidHorizontalGridLineMask]
+        table.usesAlternatingRowBackgroundColors = false
+        table.rowHeight = 26
+        table.intercellSpacing = NSSize(width: 6, height: 0)
+        table.allowsColumnReordering = false
+        table.columnAutoresizingStyle = .noColumnAutoresizing
+        buildColumns()
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.drawsBackground = true
+        scroll.backgroundColor = Palette.background
+        scroll.borderType = .noBorder
+
+        let top = NSStackView(views: [kind, period, search, summary])
+        top.orientation = .horizontal
+        top.spacing = 12
+        top.alignment = .centerY
+        search.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        summary.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        summary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for view in [top, scroll, footer] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            top.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
+            top.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            top.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            scroll.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            scroll.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -10),
+            footer.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            footer.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            footer.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+        ])
+    }
+
+    /// The columns of the current kind; the sort resets to spend, biggest first.
+    private func buildColumns() {
+        for column in table.tableColumns { table.removeTableColumn(column) }
+        let columns = showingFolders ? Self.folderColumns : Self.sessionColumns
+        for (key, title, width, right) in columns {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
+            column.title = title
+            let header = PaddedHeaderCell(textCell: title)
+            header.alignment = right ? .right : .left
+            column.headerCell = header
+            column.width = width
+            column.minWidth = 36
+            // The share bar is the spend again: only Spend carries the sort arrow.
+            if key != "rank" && key != "share" { column.sortDescriptorPrototype = NSSortDescriptor(key: key, ascending: false) }
+            table.addTableColumn(column)
+        }
+        table.sortDescriptors = [NSSortDescriptor(key: "cost", ascending: false)]
+    }
+
+    @objc private func controlsChanged(_ sender: NSSegmentedControl) {
+        if sender === kind { buildColumns() }
+        reload()
+    }
+
+    func controlTextDidChange(_ obj: Notification) { filterAndSort() }
+
+    func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) { filterAndSort() }
+
+    /// Shows the window, then asks the script for a fresher reading; it is age- and lock-gated,
+    /// so opening the window again and again costs no more than one rebuild per five minutes.
+    func present() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        reload()
+        refresh()
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard self?.window?.isVisible == true else { return }
+            self?.refresh()
+        }
+    }
+
+    private func refresh() {
+        guard fixture == nil, !building else { return }
+        building = true
+        updateFooter()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            refreshLeaderboardOnce()
+            DispatchQueue.main.async {
+                self?.building = false
+                self?.reload()
+            }
+        }
+    }
+
+    /// Re-reads the file and redraws the rows of the chosen kind and period.
+    func reload() {
+        file = fixture ?? (try? Data(contentsOf: cacheDir.appendingPathComponent("leaderboard.json")))
+            .flatMap { try? JSONDecoder().decode(LeaderboardFile.self, from: $0) }
+        let view = file?.views?[periodKey]
+        let stamp = ISO8601DateFormatter()
+        stamp.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        func millis(_ text: String?) -> Double {
+            text.flatMap { stamp.date(from: $0) }.map { $0.timeIntervalSince1970 * 1000 } ?? 0
+        }
+        func share(_ sub: Double?, _ cost: Double?) -> Double {
+            (cost ?? 0) > 0 ? (sub ?? 0) / (cost ?? 1) * 100 : 0
+        }
+        func folderName(_ project: String) -> String { project.replacingOccurrences(of: "dev-", with: "", options: .anchored) }
+        if showingFolders {
+            all = (view?.folders ?? []).map { f in
+                Row(id: f.project, name: folderName(f.project), tip: f.project, folder: "", count: f.sessions ?? 0,
+                    cost: f.cost ?? 0, subShare: share(f.sub, f.cost), requests: f.requests ?? 0, model: "",
+                    last: millis(f.last))
+            }
+        } else {
+            all = (view?.sessions ?? []).map { s in
+                let name = (s.title?.isEmpty == false ? s.title! : "(untitled) " + String(s.session.prefix(8)))
+                return Row(id: s.session, name: name, tip: "\(name)\n\(s.session)", folder: folderName(s.project), count: 0,
+                           cost: s.cost ?? 0, subShare: share(s.sub, s.cost), requests: s.requests ?? 0,
+                           model: s.model ?? "", last: millis(s.last))
+            }
+        }
+        topCost = max(all.map(\.cost).max() ?? 1, 0.01)
+        filterAndSort()
+    }
+
+    private func filterAndSort() {
+        let term = search.stringValue.lowercased()
+        var rows = all.filter { term.isEmpty || [$0.name, $0.folder, $0.model, $0.id].contains { $0.lowercased().contains(term) } }
+        if let descriptor = table.sortDescriptors.first, let key = descriptor.key {
+            func text(_ r: Row) -> String { key == "name" ? r.name : key == "folder" ? r.folder : r.model }
+            func number(_ r: Row) -> Double {
+                switch key {
+                case "sub": return r.subShare
+                case "requests": return Double(r.requests)
+                case "count": return Double(r.count)
+                case "last": return r.last
+                default: return r.cost
+                }
+            }
+            let isText = ["name", "folder", "model"].contains(key)
+            // Stable, so ties keep the biggest spender first.
+            rows = rows.enumerated().sorted { l, r in
+                let result: ComparisonResult = isText
+                    ? text(l.element).localizedStandardCompare(text(r.element))
+                    : number(l.element) < number(r.element) ? .orderedAscending
+                    : number(l.element) > number(r.element) ? .orderedDescending : .orderedSame
+                if result == .orderedSame { return l.offset < r.offset }
+                return (result == .orderedAscending) == descriptor.ascending
+            }.map(\.element)
+        }
+        shown = rows
+        table.reloadData()
+        updateFooter()
+    }
+
+    /// 4,681 whatever the system's separators are: the figures read the same as the dollars.
+    private static let grouped: NumberFormatter = {
+        let f = NumberFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.numberStyle = .decimal
+        return f
+    }()
+
+    private static let dateFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "MMM d HH:mm"
+        return f
+    }()
+
+    private static func date(_ ms: Double) -> String { dateFormat.string(from: Date(timeIntervalSince1970: ms / 1000)) }
+
+    private static func date(iso: String?) -> String? {
+        let stamp = ISO8601DateFormatter()
+        stamp.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return iso.flatMap { stamp.date(from: $0) }.map { dateFormat.string(from: $0) }
+    }
+
+    /// What the rows are, and how they were counted: the same note a Skill Tree table carries.
+    private func updateFooter() {
+        guard let file = file, let view = file.views?[periodKey], let total = view.total else {
+            summary.stringValue = ""
+            footer.stringValue = building ? "Building the leaderboard from the transcripts, about ten seconds…"
+                : "No leaderboard yet. It is built from the transcripts when this window opens."
+            return
+        }
+        let subShare = total > 0 ? Int(((view.sub ?? 0) / total * 100).rounded()) : 0
+        summary.stringValue = "\(moneyText(total)) at list price · \(subShare)% from sub-agents"
+        let count = view.sessions?.count ?? 0
+        var window = ""
+        if let since = view.since {
+            window = "the quota week from \(Self.date(since)) to \(view.until.map { Self.date($0) } ?? "now")"
+        } else if let first = Self.date(iso: view.first), let last = Self.date(iso: view.last) {
+            window = "all transcripts, from \(first) to \(last)"
+        } else {
+            window = "all transcripts"
+        }
+        var text = "\(count) session\(count == 1 ? "" : "s") in \(window). "
+        text += "Spend is list price per message by its model: cache writes at the one-hour price, cache reads at the model's read price, "
+        text += "output counted twice because transcripts keep only a streaming snapshot of it. It is a ranking, not what the plan charges. "
+        text += "Sub-agents = the share of a row's spend that came from the agents it spawned."
+        if periodKey == "week" {
+            if let cap = file.cap {
+                text += " Weekly cap ~\(moneyText(cap.dollars)) from \(cap.pairs) pair\(cap.pairs == 1 ? "" : "s") of quota readings."
+            } else {
+                text += " Weekly cap: calibrating, it needs two quota readings 3 points apart (\(file.readings ?? 0) logged)."
+            }
+        }
+        if let read = file.read_at { text += " Read \(ago(read)) ago." }
+        if let error = file.error { text += " Refresh failed: \(error)" }
+        footer.stringValue = text
+        footer.textColor = file.error == nil ? Palette.dim : Palette.yellow
+    }
+
+    // MARK: Table
+
+    func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let key = tableColumn?.identifier.rawValue, row < shown.count else { return nil }
+        let r = shown[row]
+        if key == "share" {
+            let cell = NSView()
+            let bar = BarView()
+            bar.fraction = r.cost / topCost
+            bar.colour = Palette.text
+            bar.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(bar)
+            NSLayoutConstraint.activate([
+                bar.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                bar.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
+                bar.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                bar.heightAnchor.constraint(equalToConstant: 12),
+            ])
+            return cell
+        }
+        let text: String
+        var colour = Palette.text
+        var right = false
+        switch key {
+        case "rank": text = String(row + 1); colour = Palette.dim; right = true
+        case "name": text = r.name
+        case "folder": text = r.folder; colour = Palette.dim
+        case "count": text = String(r.count); right = true
+        case "cost": text = moneyText(r.cost); right = true
+        case "sub": text = "\(Int(r.subShare.rounded()))%"; colour = Palette.dim; right = true
+        case "requests": text = Self.grouped.string(from: NSNumber(value: r.requests)) ?? String(r.requests); colour = Palette.dim; right = true
+        case "model": text = r.model; colour = Palette.dim
+        default: text = r.last > 0 ? ago(r.last) + " ago" : ""; colour = Palette.dim
+        }
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: key == "cost" ? .medium : .regular)
+        field.textColor = colour
+        field.alignment = right ? .right : .left
+        field.lineBreakMode = .byTruncatingTail
+        field.toolTip = key == "name" ? r.tip : nil
+        return field
+    }
+
+    // MARK: Self-test
+
+    /// The window over a fixture file, for the self-test: every kind and period must decode and draw
+    /// rows. `CC_SESSIONS_LEADERBOARD_PNG=<path>` saves each picture, which is how the layout is read.
+    static func selfTestProblems() -> [String] {
+        let now = Date().timeIntervalSince1970 * 1000
+        func iso(_ daysAgo: Double) -> String {
+            let f = ISO8601DateFormatter()
+            f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return f.string(from: Date(timeIntervalSinceNow: -daysAgo * 86400))
+        }
+        func session(_ id: String, _ title: String, _ cost: Double, _ sub: Double, _ model: String) -> String {
+            "{\"project\": \"dev-fixture\", \"session\": \"\(id)-0000\", \"title\": \"\(title)\", \"first\": \"\(iso(3))\", \"last\": \"\(iso(1))\", \"requests\": 1200, \"cost\": \(cost), \"sub\": \(sub), \"model\": \"\(model)\"}"
+        }
+        func view(since: String, until: String, first: String, last: String) -> String {
+            """
+            {"since": \(since), "until": \(until), "first": "\(first)", "last": "\(last)", "total": 1911, "sub": 990,
+             "sessions": [\(session("7386be92", "Puppet body build", 449.7, 400.1, "opus-5-5")),
+                          \(session("2370cc4b", "Character roster and variant generator", 315.1, 240.2, "sonnet-5-5")),
+                          \(session("aaaaaaaa", "A third fixture", 90.5, 12, "fable-5-1"))],
+             "folders": [{"project": "dev-fixture", "sessions": 13, "first": "\(first)", "last": "\(last)", "requests": 4000, "cost": 900.5, "sub": 700.3},
+                         {"project": "dev-other", "sessions": 2, "first": "\(first)", "last": "\(last)", "requests": 40, "cost": 12.5, "sub": 1.3}]}
+            """
+        }
+        let json = """
+            {"read_at": \(now - 90000), "error": null, "readings": 6, "cap": {"dollars": 3900, "points": 12, "pairs": 3},
+             "views": {"week": \(view(since: String(now - 3 * 86400000), until: "null", first: iso(3), last: iso(0.1))),
+                       "last_week": \(view(since: String(now - 10 * 86400000), until: String(now - 3 * 86400000), first: iso(9), last: iso(4))),
+                       "all": \(view(since: "null", until: "null", first: iso(36), last: iso(0.1)))}}
+            """
+        guard let fixture = try? JSONDecoder().decode(LeaderboardFile.self, from: Data(json.utf8)) else {
+            return ["leaderboard fixture did not decode"]
+        }
+        let board = LeaderboardWindow(fixture: fixture)
+        var problems: [String] = []
+        for folders in [false, true] {
+            for (key, _) in periods {
+                board.kind.selectedSegment = folders ? 1 : 0
+                board.buildColumns()
+                board.period.selectedSegment = periods.firstIndex { $0.0 == key } ?? 0
+                board.reload()
+                let want = folders ? 2 : 3
+                if board.table.numberOfRows != want {
+                    problems.append("leaderboard \(folders ? "folders" : "sessions") \(key) drew \(board.table.numberOfRows) rows, want \(want)")
+                }
+                if board.footer.stringValue.isEmpty { problems.append("leaderboard \(key) has no footer") }
+                if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_LEADERBOARD_PNG"], let content = board.window?.contentView,
+                    let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+                {
+                    content.layoutSubtreeIfNeeded()
+                    content.cacheDisplay(in: content.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?
+                        .write(to: URL(fileURLWithPath: "\(path).\(folders ? "folders" : "sessions").\(key).png"))
+                }
+            }
+        }
         return problems
     }
 }
@@ -4897,6 +5232,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let listHotKey2 = GlobalHotKey(id: 3)
     private var listShortcutWindow: ShortcutWindow?
     private var usageWindow: UsageWindow?
+    private var leaderboardWindow: LeaderboardWindow?
     /// The info icon beside the quotas that opens the Usage window.
     private let usageButton = NSButton(title: "", target: nil, action: nil)
     /// The newest usage reading, kept so the window opens with it at once.
@@ -5297,9 +5633,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         DispatchQueue.global(qos: .utility).async { [weak self] in
             refreshUsageOnce()
             DispatchQueue.main.async { self?.reload() }
-            refreshLeaderboardOnce()
-            DispatchQueue.main.async { self?.reload() }
         }
+    }
+
+    /// Session ▸ Leaderboard…: the sessions and folders ranked by what they cost, this week, last week or ever.
+    @objc func openLeaderboard() {
+        if leaderboardWindow == nil {
+            leaderboardWindow = LeaderboardWindow()
+            leaderboardWindow?.window?.center()
+        }
+        leaderboardWindow?.present()
     }
 
     /// Session ▸ New Session Shortcut…
@@ -5732,13 +6075,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // The account's quotas, so a reset made on claude.ai reaches the bar with no
             // session redrawing: the script gates it to one request per five minutes.
             DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
-            // The leaderboard only matters while the Usage window is on screen.
-            if self?.usageWindow?.window?.isVisible == true {
-                DispatchQueue.global(qos: .utility).async { [weak self] in
-                    refreshLeaderboardOnce()
-                    DispatchQueue.main.async { self?.reload() }
-                }
-            }
         }
     }
 
@@ -7418,6 +7754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             problems = ["fixture did not decode: \(error)"]
         }
         problems += UsageWindow.selfTestProblems()
+        problems += LeaderboardWindow.selfTestProblems()
         // CC_SESSIONS_WINDOW_PNG=<path> saves the list window's picture, to read its top row without opening the app.
         if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_PNG"],
             let content = controller?.window?.contentView,
@@ -7482,6 +7819,7 @@ func buildMenu() {
     sessionMenu.addItem(.separator())
     sessionMenu.addItem(withTitle: "Repo Tags…", action: #selector(SessionsWindow.openRepoTags), keyEquivalent: "")
     sessionMenu.addItem(withTitle: "Usage…", action: #selector(SessionsWindow.openUsage), keyEquivalent: "")
+    sessionMenu.addItem(withTitle: "Leaderboard…", action: #selector(SessionsWindow.openLeaderboard), keyEquivalent: "l")
     sessionMenu.addItem(
         withTitle: "New Session Shortcut…", action: #selector(SessionsWindow.openShortcutSettings),
         keyEquivalent: "")

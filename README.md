@@ -105,13 +105,15 @@ Everything the tool reads comes from formats Anthropic can change without notice
 
 Any recorded problem puts a red `!` at the end of every session's last status line row and turns the app's `cc-statusline` row red with the problem in words; its tooltip lists them all. `error.log` gets a `format:` line when a problem appears and a `format ok again:` line when it clears, which it does by itself on the next reading that passes.
 
-## Token leaderboard
+## Leaderboard
 
-The Usage window ends with where the money went: all sessions, the biggest ten sessions and eight folders, each with the share that came from sub-agents. A switch picks the window: this week, last week, or all time. The weeks are the quota's own, the seven days before the weekly reset time and the seven before those; the all-time view reads every transcript, so it is kept for 30 minutes while the other two refresh every five. `cc-statusline.js refresh-leaderboard` builds it with agents-shared's `report-token-use.py`, found through `AGENTS_SHARED_DIR` in the environment or in `~/.claude/paths.local.sh`; it takes about ten seconds, runs when the window opens (and every five minutes while it stays open), and a failure keeps the last reading with the error shown.
+Session ▸ Leaderboard… (⌘L) opens a window that ranks what the sessions cost: **Sessions** or **Folders**, for **This week**, **Last week** or **All time**. A row is a session's title (Claude Code's own `ai-title`), folder, spend, a bar for its share of the biggest row, the share of its spend that came from the sub-agents it spawned, requests, the model that cost it most, and when it was last active. Every header sorts, the search box filters, and the footer says what the rows are: how many sessions, the exact window (the quota week from one date to the next, or the first and last message of all transcripts) and how the spend was counted. The Usage window is unchanged.
+
+`cc-statusline.js refresh-leaderboard` builds `leaderboard.json` with agents-shared's `report-token-use.py`, found through `AGENTS_SHARED_DIR` in the environment or in `~/.claude/paths.local.sh`. It takes about ten seconds, runs when the window opens and every minute while it is open (the script gates it to one rebuild per five minutes), and a failure keeps the last file with the error in the footer. The weeks are the quota's own, the seven days before the weekly reset time and the seven before those; the all-time view reads every transcript, so it is kept for 30 minutes.
 
 Amounts are dollars at Anthropic's list price, per message by its model: cache writes at the one-hour price, cache reads at the model's own read price, and output tokens doubled, because transcripts keep the snapshot taken while a reply streamed and undercount it by about 2x. Across 62 sessions that came to 88% of the cost Claude Code itself reports for them (median session 97%); calls that leave no transcript row, like the status line's topic calls, are the likeliest rest. The plan quota's own formula is unpublished, so this is a ranking and calibration aid, not what the plan charges.
 
-The implied weekly cap is dollars spent per percentage point between two readings of `quota-readings.jsonl`, not one reading over the window's start: an early reset granted on claude.ai makes the percentage fall mid-week, which breaks the one-point sum. Readings come from the usage endpoint, not from the status line: a session that has not redrawn since a reset still reports the old percentage, so sessions disagree. Readings are paired once they are 3 points apart, since the percentage moves in whole steps; a fall in the percentage starts the pairing over from that reading, while the week itself stays the quota's. Until two such readings exist the window says `calibrating`.
+The weekly cap in the footer of This week is dollars spent per percentage point between two readings of `quota-readings.jsonl`, not one reading over the window's start: an early reset granted on claude.ai makes the percentage fall mid-week, which breaks the one-point sum. Readings come from the usage endpoint, not from the status line: a session that has not redrawn since a reset still reports the old percentage, so sessions disagree. Readings are paired once they are 3 points apart, since the percentage moves in whole steps; a fall in the percentage starts the pairing over from that reading, while the week itself stays the quota's. Until two such readings exist the footer says `calibrating`.
 
 ## Fable quota
 
@@ -124,7 +126,7 @@ One cache is shared by every session in `~/.cache/cc-statusline/` (override with
 | File | Purpose |
 |---|---|
 | `quota-readings.jsonl` | One line per change of the account's 7-day percentage, read from the usage endpoint: `t`, `seven`, `seven_resets` |
-| `leaderboard.json` | Last leaderboard for the Usage window: list-price spend per session and folder with the sub-agent share for this week, last week and all time, and the implied weekly cap in dollars |
+| `leaderboard.json` | Last leaderboard for the Leaderboard window: list-price spend for every session and folder, with the sub-agent share, for this week, last week and all time, and the implied weekly cap in dollars |
 | `usage.json` | Last reading and the error of the last refresh, if any |
 | `refresh.lock` | Held while a refresh runs, so sessions never fetch in parallel |
 | `error.log` | One timestamped line per failed refresh: `keychain`, `network`, `auth`, `http <status>`, or `parse` |
