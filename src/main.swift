@@ -2477,17 +2477,7 @@ final class PackBrowser: NSWindowController, NSTableViewDataSource, NSTableViewD
             field.textColor = .secondaryLabelColor
         }
         field.toolTip = key == "name" ? [pack.name, pack.description].compactMap { $0 }.joined(separator: "\n") : nil
-        field.translatesAutoresizingMaskIntoConstraints = false
-        // In a cell of its own the text sits at the top of a taller row; centred
-        // in a holder it sits on the row's middle line.
-        let cell = NSView()
-        cell.addSubview(field)
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
-            field.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -2),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-        return cell
+        return CentredCell(field, leading: 2, trailing: 2)
     }
 
     /// Return, a double-click and the button: use an installed pack, install
@@ -3723,6 +3713,94 @@ struct LeaderboardFile: Decodable {
     let views: [String: LeaderboardView]?
 }
 
+/// What every table cell is built from. A view returned from `viewFor` on its own fills the row,
+/// and a label in it draws at the row's top; held here the content sits on the row's middle line.
+/// `textCellProblems` fails the self-test for a table that returns a bare label.
+final class CentredCell: NSView {
+    let content: NSView
+
+    init(_ content: NSView, leading: CGFloat = 4, trailing: CGFloat = 4) {
+        self.content = content
+        super.init(frame: .zero)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leading),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -trailing),
+            content.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("CentredCell is built in code") }
+}
+
+/// The two ways a row's text goes off-centre that a view check can see: a bare label returned as the
+/// cell, and a held label whose middle is not the cell's. `inkProblems` covers what these cannot.
+func textCellProblems(_ table: NSTableView, name: String) -> [String] {
+    table.layoutSubtreeIfNeeded()
+    var problems: [String] = []
+    for row in 0..<table.numberOfRows {
+        for column in 0..<table.numberOfColumns {
+            guard let cell = table.view(atColumn: column, row: row, makeIfNecessary: true) else { continue }
+            let id = table.tableColumns[column].identifier.rawValue
+            if cell is NSTextField {
+                problems.append("\(name) row \(row) column \(id) returns a bare label; wrap it in CentredCell")
+            } else if let held = cell as? CentredCell {
+                cell.layoutSubtreeIfNeeded()
+                if abs(held.content.frame.midY - cell.bounds.midY) > 1 {
+                    problems.append("\(name) row \(row) column \(id) content is off the cell's middle")
+                }
+                if let label = held.content as? NSTextField,
+                    abs(label.frame.height - label.intrinsicContentSize.height) > 1
+                {
+                    problems.append("\(name) row \(row) column \(id) label is \(label.frame.height) pt tall, its text \(label.intrinsicContentSize.height)")
+                }
+            }
+        }
+    }
+    return problems
+}
+
+/// Reads the picture of a table: for each row, the vertical middle of the text's ink in `column`
+/// against the row's middle. `tolerance` is in points; correctly centred text sits a point or two
+/// high because of its descent, a label drawn at the row's top sits several points high.
+func inkProblems(_ table: NSTableView, column: Int, in content: NSView, rep: NSBitmapImageRep,
+                 tolerance: CGFloat, name: String) -> [String] {
+    var problems: [String] = []
+    let scale = CGFloat(rep.pixelsHigh) / content.bounds.height
+    let columnX = table.convert(table.rect(ofColumn: column), to: content)
+    for row in 0..<table.numberOfRows {
+        let rect = table.convert(table.rect(ofRow: row), to: content)
+        let top = Int(((content.bounds.height - rect.maxY) * scale).rounded()) + 3
+        let bottom = Int(((content.bounds.height - rect.minY) * scale).rounded()) - 3
+        let left = Int((columnX.minX * scale).rounded()), right = Int((columnX.maxX * scale).rounded())
+        guard top < bottom, right <= rep.pixelsWide, bottom <= rep.pixelsHigh,
+            let ground = rep.colorAt(x: left + 1, y: top)?.usingColorSpace(.deviceRGB)
+        else { continue }
+        var first = Int.max, last = Int.min
+        for y in top..<bottom {
+            for x in stride(from: left + 2, to: right - 2, by: 1) {
+                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                if abs(c.brightnessComponent - ground.brightnessComponent) > 0.25 {
+                    first = min(first, y)
+                    last = max(last, y)
+                    break
+                }
+            }
+        }
+        guard first <= last else {
+            problems.append("\(name) row \(row) shows no text in column \(column)")
+            continue
+        }
+        let offset = (CGFloat(first + last) / 2 - CGFloat(top + bottom) / 2) / scale
+        if abs(offset) > tolerance {
+            problems.append(String(format: "%@ row %d text sits %.1f pt %@ the row's middle", name, row,
+                                   abs(offset), offset < 0 ? "above" : "below"))
+        }
+    }
+    return problems
+}
+
 /// $1,234 / $56 / $0.42: dollars with the precision that fits their size.
 func moneyText(_ dollars: Double) -> String {
     if dollars >= 100 {
@@ -4048,19 +4126,11 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         guard let key = tableColumn?.identifier.rawValue, row < shown.count else { return nil }
         let r = shown[row]
         if key == "share" {
-            let cell = NSView()
             let bar = BarView()
             bar.fraction = r.cost / topCost
             bar.colour = Palette.text
-            bar.translatesAutoresizingMaskIntoConstraints = false
-            cell.addSubview(bar)
-            NSLayoutConstraint.activate([
-                bar.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-                bar.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
-                bar.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                bar.heightAnchor.constraint(equalToConstant: 12),
-            ])
-            return cell
+            bar.heightAnchor.constraint(equalToConstant: 12).isActive = true
+            return CentredCell(bar, leading: 4, trailing: 8)
         }
         let text: String
         var colour = Palette.text
@@ -4082,7 +4152,7 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         field.alignment = right ? .right : .left
         field.lineBreakMode = .byTruncatingTail
         field.toolTip = key == "name" ? r.tip : nil
-        return field
+        return CentredCell(field)
     }
 
     // MARK: Self-test
@@ -4131,13 +4201,20 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
                     problems.append("leaderboard \(folders ? "folders" : "sessions") \(key) drew \(board.table.numberOfRows) rows, want \(want)")
                 }
                 if board.footer.stringValue.isEmpty { problems.append("leaderboard \(key) has no footer") }
-                if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_LEADERBOARD_PNG"], let content = board.window?.contentView,
-                    let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
-                {
+                let name = "leaderboard \(folders ? "folders" : "sessions") \(key)"
+                problems += textCellProblems(board.table, name: name)
+                if let content = board.window?.contentView, let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
                     content.layoutSubtreeIfNeeded()
                     content.cacheDisplay(in: content.bounds, to: rep)
-                    try? rep.representation(using: .png, properties: [:])?
-                        .write(to: URL(fileURLWithPath: "\(path).\(folders ? "folders" : "sessions").\(key).png"))
+                    // The Spend column holds digits only, so its ink has no descenders to pull it off the middle.
+                    let spend = board.table.column(withIdentifier: NSUserInterfaceItemIdentifier("cost"))
+                    if spend >= 0 {
+                        problems += inkProblems(board.table, column: spend, in: content, rep: rep, tolerance: 3, name: name)
+                    }
+                    if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_LEADERBOARD_PNG"] {
+                        try? rep.representation(using: .png, properties: [:])?
+                            .write(to: URL(fileURLWithPath: "\(path).\(folders ? "folders" : "sessions").\(key).png"))
+                    }
                 }
             }
         }
@@ -4546,9 +4623,9 @@ final class NewSessionWindow: NSWindowController, NSWindowDelegate, NSTextFieldD
                 string: "   " + item.folder.tags.joined(separator: " "),
                 attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Palette.dim]))
         }
-        let cell = NSTextField(labelWithAttributedString: text)
-        cell.lineBreakMode = .byTruncatingMiddle
-        return cell
+        let label = NSTextField(labelWithAttributedString: text)
+        label.lineBreakMode = .byTruncatingMiddle
+        return CentredCell(label, leading: 2, trailing: 2)
     }
 
     @objc private func rowClicked() {
@@ -5099,16 +5176,7 @@ final class RepoTagsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         default:
             return nil
         }
-        // A label alone sits at the top of a taller row: centre it in a cell.
-        field.translatesAutoresizingMaskIntoConstraints = false
-        let cell = NSView()
-        cell.addSubview(field)
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-        return cell
+        return CentredCell(field)
     }
 
     /// A folder carrying the selected tag, and a button to take it off unless
@@ -5797,6 +5865,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             problems.append("table columns read \(shown)")
         }
         if table.tableColumns.contains(where: { $0.width < 16 }) { problems.append("a column is narrower than 16pt") }
+        problems += textCellProblems(table, name: "sessions table")
 
         // Rows: the tool's own row, then one per fixture session.
         let total = fixture.live.count + fixture.history.count
@@ -5963,14 +6032,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         field.textColor = colour
         field.alignment = key == "memory" || key == "cpu" ? .right : .left
         field.lineBreakMode = .byTruncatingTail
-        field.translatesAutoresizingMaskIntoConstraints = false
-        let cell = NSView()
-        cell.addSubview(field)
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
+        let cell = CentredCell(field)
         if key == "topic", !healthIssues.isEmpty {
             cell.toolTip = healthIssues.map { issue in
                 let since = clock(issue.first_seen)
