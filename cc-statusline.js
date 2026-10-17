@@ -1365,7 +1365,8 @@ const READINGS_LAST = join(CACHE_DIR, 'quota-readings-last.json');
 const LEADERBOARD_FILE = join(CACHE_DIR, 'leaderboard.json');
 const LEADERBOARD_LOCK = join(CACHE_DIR, 'leaderboard.lock');
 const LEADERBOARD_MS = 5 * 60000;
-const LEADERBOARD_STALE_MS = 120000;
+const LEADERBOARD_STALE_MS = 180000;
+const ALL_TIME_MS = 30 * 60000;
 const LEADERBOARD_SESSIONS = 10;
 const LEADERBOARD_FOLDERS = 8;
 // The percentages move in whole steps, so a pair of readings must be this many
@@ -1425,8 +1426,7 @@ function capPairs(readings) {
       base = r;
     }
   }
-  // `reset` is when the percentage last fell, null when it never has.
-  return { reset: start > 0 ? window[0].t : null, pairs };
+  return { pairs };
 }
 
 // The agents-shared checkout, from the environment or the machine-local
@@ -1482,50 +1482,70 @@ async function refreshLeaderboard() {
   try {
     const dir = agentsSharedDir();
     if (!dir) throw new Error('AGENTS_SHARED_DIR is not set in paths.local.sh');
+    const script = join(dir, 'scripts', 'report-token-use.py');
     const readings = readQuotaReadings();
-    const { reset, pairs } = capPairs(readings);
+    const { pairs } = capPairs(readings);
     const weekly = readUsageCache()?.weekly?.resets_at;
-    const windowStart = Date.parse(weekly) ? Date.parse(weekly) - 7 * 86400000 : now - 7 * 86400000;
-    // A weekly reset granted mid-window starts the week over from that moment.
-    const since = Math.max(windowStart, reset ?? 0);
+    // The weeks are the quota's own: this one starts a week before the weekly reset. An early
+    // reset granted mid-week changes the cap's readings, not which week a session belongs to.
+    const weekStart = Date.parse(weekly) ? Date.parse(weekly) - 7 * 86400000 : now - 7 * 86400000;
+    const lastStart = weekStart - 7 * 86400000;
+    const iso = (ms) => new Date(ms).toISOString();
+    // Files not touched since a window opened cannot hold its messages: skip them.
+    const days = (from) => String(Math.ceil((now - from) / 86400000) + 1);
     const cuts = [...new Set(pairs.flatMap((p) => [p.from, p.to]))].sort((a, b) => a - b);
-    const args = ['--since', new Date(since).toISOString()];
-    if (cuts.length >= 2) args.push('--cuts', cuts.map((c) => new Date(c).toISOString()).join(','));
-    const out = await runReporter(join(dir, 'scripts', 'report-token-use.py'), args);
+    const weekArgs = ['--since', iso(weekStart), '--days', days(weekStart)];
+    if (cuts.length >= 2) weekArgs.push('--cuts', cuts.map(iso).join(','));
+    // The all-time view reads every transcript, so it is kept for ALL_TIME_MS.
+    const keepAll = previous?.views?.all && now - (previous.views.all.read_at ?? 0) < ALL_TIME_MS;
+    const [week, last, all] = await Promise.all([
+      runReporter(script, weekArgs),
+      runReporter(script, ['--since', iso(lastStart), '--until', iso(weekStart), '--days', days(lastStart)]),
+      keepAll ? null : runReporter(script, []),
+    ]);
     const sub = (t) => t?.sub?.cost ?? 0;
+    const view = (out, since, until) => ({
+      since,
+      until,
+      read_at: Date.now(),
+      total: out.sessions.reduce((n, x) => n + x.total.cost, 0),
+      sub: out.sessions.reduce((n, x) => n + sub(x), 0),
+      sessions: out.sessions.slice(0, LEADERBOARD_SESSIONS).map((x) => ({
+        project: x.project,
+        session: x.session,
+        requests: x.total.requests,
+        cost: x.total.cost,
+        sub: sub(x),
+      })),
+      folders: out.projects.slice(0, LEADERBOARD_FOLDERS).map((x) => ({
+        project: x.project,
+        sessions: x.sessions,
+        cost: x.total.cost,
+        sub: sub(x),
+      })),
+    });
     let cap = null;
-    if (pairs.length && Array.isArray(out.intervals)) {
+    if (pairs.length && Array.isArray(week.intervals)) {
       // Pairs are consecutive, so each pair's spend is the intervals between its two cuts.
       let dollars = 0;
       let points = 0;
       for (const p of pairs) {
         const lo = cuts.indexOf(p.from);
         const hi = cuts.indexOf(p.to);
-        for (let i = lo; i < hi; i++) dollars += out.intervals[i]?.cost ?? 0;
+        for (let i = lo; i < hi; i++) dollars += week.intervals[i]?.cost ?? 0;
         points += p.points;
       }
       if (points > 0) cap = { dollars: (dollars / points) * 100, points, pairs: pairs.length };
     }
     save({
       error: null,
-      since,
       readings: readings.length,
-      total: out.sessions.reduce((n, s) => n + s.total.cost, 0),
-      sub: out.sessions.reduce((n, s) => n + sub(s), 0),
       cap,
-      sessions: out.sessions.slice(0, LEADERBOARD_SESSIONS).map((s) => ({
-        project: s.project,
-        session: s.session,
-        requests: s.total.requests,
-        cost: s.total.cost,
-        sub: sub(s),
-      })),
-      folders: out.projects.slice(0, LEADERBOARD_FOLDERS).map((p) => ({
-        project: p.project,
-        sessions: p.sessions,
-        cost: p.total.cost,
-        sub: sub(p),
-      })),
+      views: {
+        week: view(week, weekStart, null),
+        last_week: view(last, lastStart, weekStart),
+        all: keepAll ? previous.views.all : view(all, null, null),
+      },
     });
   } catch (err) {
     logError(`leaderboard: ${err.message}`);

@@ -244,17 +244,25 @@ struct TokenCap: Decodable {
     let pairs: Int
 }
 
-/// What this week's spend went to, from `cc-statusline.js refresh-leaderboard`.
+/// One window of the spend leaderboard: its time range in ms (`until` nil while it is still
+/// open, `since` nil for all time), the total and the sub-agent part, and the top rows.
+struct TokenView: Decodable {
+    let since: Double?
+    let until: Double?
+    let total: Double?
+    let sub: Double?
+    let sessions: [TokenRow]?
+    let folders: [TokenRow]?
+}
+
+/// What the spend went to, from `cc-statusline.js refresh-leaderboard`: the views are `week`,
+/// `last_week` and `all`; the cap belongs to the current week.
 struct TokenBoard: Decodable {
     let read_at: Double?
     let error: String?
-    let since: Double?
     let readings: Int?
-    let total: Double?
-    let sub: Double?
     let cap: TokenCap?
-    let sessions: [TokenRow]?
-    let folders: [TokenRow]?
+    let views: [String: TokenView]?
 }
 
 /// What the Usage window shows beyond the quota bar, from the shared usage cache.
@@ -3540,6 +3548,10 @@ final class ShortcutRecorder: NSButton {
 /// window, not a popover, so the capture script can read it.
 final class UsageWindow: NSWindowController {
     fileprivate let grid = NSGridView()
+    /// Which leaderboard window is showing: `week`, `last_week` or `all`.
+    fileprivate var period = "week"
+    private var shown: UsageSummary?
+    private static let periods = [("week", "This week"), ("last_week", "Last week"), ("all", "All time")]
 
     init() {
         let window = NSWindow(
@@ -3645,25 +3657,43 @@ final class UsageWindow: NSWindowController {
         }
     }
 
-    /// Where this week's spend went, in dollars at list price (cache writes at the one-hour price,
-    /// output scaled up for what the transcripts leave out), and the weekly cap the readings imply.
+    @objc private func periodChanged(_ sender: NSSegmentedControl) {
+        period = UsageWindow.periods[max(0, min(sender.selectedSegment, UsageWindow.periods.count - 1))].0
+        update(shown)
+    }
+
+    /// Where the spend went in the chosen window, in dollars at list price (cache writes at the
+    /// one-hour price, output scaled up for what the transcripts leave out), and for the current
+    /// week the weekly cap the quota readings imply.
     private func drawTokens(_ board: TokenBoard) {
-        guard let total = board.total else { return }
-        heading("SPEND THIS WEEK, AT LIST PRICE")
-        let subShare = total > 0 ? Int(((board.sub ?? 0) / total * 100).rounded()) : 0
-        row("all sessions", bar: nil, UsageWindow.moneyText(total), "\(subShare)% from sub-agents")
-        if let cap = board.cap {
-            row("implied weekly cap", bar: nil, "~" + UsageWindow.moneyText(cap.dollars),
-                "from \(cap.pairs) reading pair\(cap.pairs == 1 ? "" : "s"), \(Int(cap.points)) points")
+        guard let views = board.views, let view = views[period] ?? views["week"], let total = view.total else { return }
+        heading("SPEND, AT LIST PRICE")
+        let switcher = NSSegmentedControl(
+            labels: UsageWindow.periods.map(\.1), trackingMode: .selectOne, target: self, action: #selector(periodChanged(_:)))
+        switcher.selectedSegment = UsageWindow.periods.firstIndex { $0.0 == period } ?? 0
+        switcher.controlSize = .small
+        grid.addRow(with: [switcher])
+        if let since = view.since {
+            row("window", bar: nil, "\(clock(since)) to \(view.until.map { clock($0) } ?? "now")")
         } else {
-            row("implied weekly cap", bar: nil, "calibrating",
-                "needs two readings 3 points apart (\(board.readings ?? 0) logged)")
+            row("window", bar: nil, "since the first transcript")
         }
-        if let sessions = board.sessions, !sessions.isEmpty {
+        let subShare = total > 0 ? Int(((view.sub ?? 0) / total * 100).rounded()) : 0
+        row("all sessions", bar: nil, UsageWindow.moneyText(total), "\(subShare)% from sub-agents")
+        if period == "week" {
+            if let cap = board.cap {
+                row("implied weekly cap", bar: nil, "~" + UsageWindow.moneyText(cap.dollars),
+                    "from \(cap.pairs) reading pair\(cap.pairs == 1 ? "" : "s"), \(Int(cap.points)) points")
+            } else {
+                row("implied weekly cap", bar: nil, "calibrating",
+                    "needs two readings 3 points apart (\(board.readings ?? 0) logged)")
+            }
+        }
+        if let sessions = view.sessions, !sessions.isEmpty {
             heading("BIGGEST SESSIONS")
             tokenRows(sessions) { "\($0.project.replacingOccurrences(of: "dev-", with: "", options: .anchored)) \(String(($0.session ?? "").prefix(8)))" }
         }
-        if let folders = board.folders, !folders.isEmpty {
+        if let folders = view.folders, !folders.isEmpty {
             heading("BIGGEST FOLDERS")
             tokenRows(folders) { "\($0.project.replacingOccurrences(of: "dev-", with: "", options: .anchored)) · \($0.sessions ?? 0) session\($0.sessions == 1 ? "" : "s")" }
         }
@@ -3673,6 +3703,7 @@ final class UsageWindow: NSWindowController {
     }
 
     func update(_ usage: UsageSummary?) {
+        shown = usage
         // removeRow leaves a row's views in the grid as subviews; they would draw over the next reading.
         for _ in 0..<grid.numberOfRows { grid.removeRow(at: 0) }
         for view in grid.subviews { view.removeFromSuperview() }
@@ -3727,11 +3758,18 @@ final class UsageWindow: NSWindowController {
              "surfaces": [{"name": "Claude Code", "percent": 92}, {"name": "Chats", "percent": 8}],
              "fable_share": {"used": 7, "allowance": 50},
              "tokens": {"read_at": \(Date().timeIntervalSince1970 * 1000 - 60000), "error": null, "readings": 6,
-                        "total": 1911, "sub": 990,
                         "cap": {"dollars": 3900, "points": 12, "pairs": 3},
-                        "sessions": [{"project": "dev-fixture", "session": "7386be92-0000", "requests": 2235, "cost": 449.7, "sub": 400.1},
-                                     {"project": "dev-fixture", "session": "2370cc4b-0000", "requests": 4681, "cost": 315.1, "sub": 240.2}],
-                        "folders": [{"project": "dev-fixture", "sessions": 13, "cost": 900.5, "sub": 700.3}]}}
+                        "views": {
+                          "week": {"since": \(Date().timeIntervalSince1970 * 1000 - 3 * 86400000), "until": null, "total": 1911, "sub": 990,
+                                   "sessions": [{"project": "dev-fixture", "session": "7386be92-0000", "requests": 2235, "cost": 449.7, "sub": 400.1},
+                                                {"project": "dev-fixture", "session": "2370cc4b-0000", "requests": 4681, "cost": 315.1, "sub": 240.2}],
+                                   "folders": [{"project": "dev-fixture", "sessions": 13, "cost": 900.5, "sub": 700.3}]},
+                          "last_week": {"since": \(Date().timeIntervalSince1970 * 1000 - 10 * 86400000), "until": \(Date().timeIntervalSince1970 * 1000 - 3 * 86400000), "total": 1486, "sub": 559,
+                                        "sessions": [{"project": "dev-fixture", "session": "aaaaaaaa-0000", "requests": 10, "cost": 379, "sub": 100}],
+                                        "folders": [{"project": "dev-fixture", "sessions": 2, "cost": 379, "sub": 100}]},
+                          "all": {"since": null, "until": null, "total": 11191, "sub": 3412,
+                                  "sessions": [{"project": "dev-fixture", "session": "bbbbbbbb-0000", "requests": 99, "cost": 703, "sub": 300}],
+                                  "folders": [{"project": "dev-fixture", "sessions": 40, "cost": 703, "sub": 300}]}}}}
             """
         guard let usage = try? JSONDecoder().decode(UsageSummary.self, from: Data(json.utf8)) else {
             return ["usage fixture did not decode"]
@@ -3739,6 +3777,21 @@ final class UsageWindow: NSWindowController {
         let window = UsageWindow()
         window.update(usage)
         var problems: [String] = []
+        // The other leaderboard windows must draw their own rows too.
+        for other in ["last_week", "all"] {
+            window.period = other
+            window.update(usage)
+            if window.grid.numberOfRows < 14 { problems.append("usage window drew \(window.grid.numberOfRows) rows for \(other), want 14 or more") }
+            if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_USAGE_PNG"], let content = window.window?.contentView,
+                let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+            {
+                content.layoutSubtreeIfNeeded()
+                content.cacheDisplay(in: content.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path + "." + other + ".png"))
+            }
+        }
+        window.period = "week"
+        window.update(usage)
         if window.grid.numberOfRows < 18 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 18 or more") }
         if let content = window.window?.contentView {
             content.layoutSubtreeIfNeeded()
