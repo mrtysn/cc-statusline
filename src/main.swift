@@ -6384,7 +6384,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             note("Resuming \(id ?? "session")")
         } else {
             // macOS drops the Automation grant whenever the app is reinstalled.
-            note("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation")
+            note("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation", seconds: 12)
         }
     }
 
@@ -6757,11 +6757,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return tags
     }
 
-    func note(_ message: String) {
+    func note(_ message: String, seconds: Double = 2.5) {
         statusLabel.stringValue = message
         let token = UUID()
         noteToken = token
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
             guard let self = self, self.noteToken == token else { return }
             self.statusLabel.stringValue = ""
         }
