@@ -2768,7 +2768,8 @@ func resumeCommand(_ s: Summary, mode: String?) -> String? {
 /// and a terminal reply landing in front of it garbled the first word. The shell
 /// is interactive so aliases and functions load, and replaces itself with a
 /// plain login shell afterwards so the tab outlives the command.
-func runInNewTab(_ command: String) {
+@discardableResult
+func runInNewTab(_ command: String) -> Bool {
     let shell = getpwuid(getuid()).flatMap { String(validatingUTF8: $0.pointee.pw_shell) } ?? "/bin/zsh"
     let quote = { (text: String) in "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     let launch = "\(shell) -lic \(quote("\(command); exec \(shell) -l"))"
@@ -2792,6 +2793,7 @@ func runInNewTab(_ command: String) {
         """
     let result = runScript(script, label: "resume")
     if result == "ok" { bringITermForward(label: "resume") }
+    return result == "ok" || result == "window"
 }
 
 /// Types a command into the iTerm session on this tty, as if at its prompt.
@@ -6378,8 +6380,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             note("Cannot resume: the session's launch directory was never recorded")
             return
         }
-        runInNewTab(command)
-        note("Resuming \(id ?? "session")")
+        if runInNewTab(command) {
+            note("Resuming \(id ?? "session")")
+        } else {
+            // macOS drops the Automation grant whenever the app is reinstalled.
+            note("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation")
+        }
     }
 
     // MARK: Session menu
