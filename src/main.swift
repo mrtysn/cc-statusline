@@ -2869,7 +2869,7 @@ func waitForQuietTerminal(_ tty: String, seconds: Double) {
 /// Runs an AppleScript and returns what it printed. Apple Events can be refused
 /// silently, so whatever osascript says is logged.
 @discardableResult
-func runScript(_ script: String, label: String) -> String {
+func runScript(_ script: String, label: String, retrying: Bool = false) -> String {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     task.arguments = ["-e", script]
@@ -2888,6 +2888,19 @@ func runScript(_ script: String, label: String) -> String {
     task.waitUntilExit()
     let result = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     log("\(label): exit \(task.terminationStatus) out=\(result) err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+    // -1743: macOS has this app's Automation grant down as refused and answers
+    // without asking again. Clearing the entry puts it back to "not asked", so
+    // the same call raises the permission prompt.
+    if stderr.contains("-1743"), !retrying, let bundle = Bundle.main.bundleIdentifier {
+        let reset = Process()
+        reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        reset.arguments = ["reset", "AppleEvents", bundle]
+        if (try? reset.run()) != nil {
+            reset.waitUntilExit()
+            log("\(label): reset the Automation grant to ask again")
+            return runScript(script, label: label, retrying: true)
+        }
+    }
     return result
 }
 
