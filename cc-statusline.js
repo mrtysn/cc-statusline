@@ -361,7 +361,10 @@ function takeLock() {
 function maybeRefreshUsage(cached, sevenPct) {
   if (Date.now() < (cached?.retry_after_at ?? 0)) return;
   const age = Date.now() - (cached?.fetched_at ?? 0);
-  const moved = sevenPct != null && cached?.seven_day_seen != null && sevenPct !== cached.seven_day_seen;
+  // Only a higher figure is news: a session that has not talked to the API lately
+  // reports an older, lower one, and answering each of those with a fetch made
+  // sessions with different stale figures trigger one another's refreshes.
+  const moved = sevenPct != null && cached?.seven_day_seen != null && sevenPct > cached.seven_day_seen;
   if (age < REFRESH_MS && !(moved && age >= MIN_REFRESH_MS)) return;
   if (!takeLock()) return;
   try {
@@ -464,7 +467,8 @@ async function refreshUsage(sevenArg) {
   const previous = readUsageCache();
   const next = {
     fetched_at: Date.now(),
-    seven_day_seen: sevenArg != null && sevenArg !== '' ? Number(sevenArg) : previous?.seven_day_seen ?? null,
+    // What the endpoint itself last said, not the caller's figure, which may be stale.
+    seven_day_seen: previous?.seven_day_seen ?? null,
     fable: previous?.fable ?? null,
     // The overall weekly quota: a manual reset on claude.ai only reaches a session's
     // reading when that session next redraws, so the account's own is kept too.
@@ -521,6 +525,7 @@ async function refreshUsage(sevenArg) {
     // kept, so a rename shows in the cache instead of silently missing.
     const weekly = body.limits.find((l) => /weekly|seven/.test(l?.kind ?? '') && !/scoped/.test(l.kind) && !l.scope?.model);
     next.weekly = weekly && typeof weekly.percent === 'number' ? { percent: weekly.percent, resets_at: weekly.resets_at ?? null } : null;
+    next.seven_day_seen = next.weekly ? Math.round(next.weekly.percent) : sevenArg != null && sevenArg !== '' ? Number(sevenArg) : next.seven_day_seen;
     logQuotaReading(next.weekly);
     next.limit_kinds = body.limits.map((l) => `${l?.kind}${l?.scope?.model?.display_name ? ':' + l.scope.model.display_name : ''}`);
     checkFormat('usage/response', true);
