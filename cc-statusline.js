@@ -19,6 +19,7 @@ const {
   renameSync,
   statSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } = require('fs');
 const { homedir, tmpdir } = require('os');
@@ -358,13 +359,18 @@ function takeLock() {
 
 // Starts a detached refresh when the cache is old, or when the free 7-day
 // figure has moved since the last fetch. Never waits for it.
-function maybeRefreshUsage(cached, sevenPct) {
+function maybeRefreshUsage(cached, sevenPct, sevenResetsAt = null) {
   if (Date.now() < (cached?.retry_after_at ?? 0)) return;
   const age = Date.now() - (cached?.fetched_at ?? 0);
   // Only a higher figure is news: a session that has not talked to the API lately
   // reports an older, lower one, and answering each of those with a fetch made
   // sessions with different stale figures trigger one another's refreshes.
-  const moved = sevenPct != null && cached?.seven_day_seen != null && sevenPct > cached.seven_day_seen;
+  // Only within the week the cache describes: after the weekly reset the endpoint
+  // reads near zero while a session that has not called the API since still carries
+  // last week's higher figure, which would otherwise fire on every redraw.
+  const week = Date.parse(cached?.weekly?.resets_at);
+  const sameWeek = sevenResetsAt != null && Number.isFinite(week) && Math.floor(week / 1000) === sevenResetsAt;
+  const moved = sameWeek && sevenPct != null && cached?.seven_day_seen != null && sevenPct > cached.seven_day_seen;
   if (age < REFRESH_MS && !(moved && age >= MIN_REFRESH_MS)) return;
   if (!takeLock()) return;
   try {
@@ -491,6 +497,10 @@ async function refreshUsage(sevenArg) {
     if (res.status === 401) {
       logError(`auth: http 401, retrying in ${AUTH_RETRY_MS / 1000}s with the keychain's current token`);
       await new Promise((resolve) => setTimeout(resolve, AUTH_RETRY_MS));
+      // Keeps the lock from going stale while the retry runs.
+      try {
+        utimesSync(LOCK_FILE, new Date(), new Date());
+      } catch {}
       res = await requestUsage();
       if (res.ok) logError('auth: recovered after retry');
     }
@@ -1605,7 +1615,7 @@ function main() {
   let usage = null;
   if (isFable(input)) {
     usage = readUsageCache();
-    maybeRefreshUsage(usage, input.rate_limits?.seven_day?.used_percentage ?? null);
+    maybeRefreshUsage(usage, input.rate_limits?.seven_day?.used_percentage ?? null, input.rate_limits?.seven_day?.resets_at ?? null);
   }
 
   let previous = null;
@@ -1650,8 +1660,9 @@ if (process.argv[2] === 'live') {
   // is younger than REFRESH_MS — a failed attempt stamps it too — so launching
   // the app again and again makes no more requests than one session would, and
   // while another refresh holds the lock.
-  const age = Date.now() - (readUsageCache()?.fetched_at ?? 0);
-  if (age >= REFRESH_MS && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
+  const cache = readUsageCache();
+  const age = Date.now() - (cache?.fetched_at ?? 0);
+  if (age >= REFRESH_MS && Date.now() >= (cache?.retry_after_at ?? 0) && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
 } else if (process.argv[2] === 'refresh-leaderboard') {
   refreshLeaderboard().catch((err) => logError(`leaderboard: ${err.message}`));
 } else if (process.argv[2] === '--refresh-usage') {
