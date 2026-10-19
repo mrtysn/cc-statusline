@@ -45,6 +45,9 @@ const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const REFRESH_MS = 5 * 60000;
 // Floor for the early refresh when the 7-day figure moves mid-turn.
 const MIN_REFRESH_MS = 60000;
+// Pause after a 429 that names no Retry-After; one that names one is waited out, capped.
+const RATE_LIMIT_PAUSE_MS = 15 * 60000;
+const RATE_LIMIT_MAX_PAUSE_MS = 60 * 60000;
 const LOCK_STALE_MS = 30000;
 // Wait before the one retry of a 401; 10s + this + 10s of timeouts stays under LOCK_STALE_MS.
 const AUTH_RETRY_MS = 8000;
@@ -356,6 +359,7 @@ function takeLock() {
 // Starts a detached refresh when the cache is old, or when the free 7-day
 // figure has moved since the last fetch. Never waits for it.
 function maybeRefreshUsage(cached, sevenPct) {
+  if (Date.now() < (cached?.retry_after_at ?? 0)) return;
   const age = Date.now() - (cached?.fetched_at ?? 0);
   const moved = sevenPct != null && cached?.seven_day_seen != null && sevenPct !== cached.seven_day_seen;
   if (age < REFRESH_MS && !(moved && age >= MIN_REFRESH_MS)) return;
@@ -473,6 +477,7 @@ async function refreshUsage(sevenArg) {
     surfaces: previous?.surfaces ?? null,
     fable_share: previous?.fable_share ?? null,
     error: null,
+    retry_after_at: null,
   };
   let authFailed = false;
   try {
@@ -488,6 +493,14 @@ async function refreshUsage(sevenArg) {
     if (res.status === 401 || res.status === 403) {
       authFailed = true;
       throw new Error(`auth: http ${res.status}, token expired or not yet renewed by Claude Code`);
+    }
+    if (res.status === 429) {
+      // Rate limited: the endpoint is fine and the format unchanged. Ask for nothing
+      // until the pause is over, in every session sharing this cache.
+      const asked = Number(res.headers.get('retry-after'));
+      const pause = Number.isFinite(asked) && asked > 0 ? Math.min(asked * 1000, RATE_LIMIT_MAX_PAUSE_MS) : RATE_LIMIT_PAUSE_MS;
+      next.retry_after_at = Date.now() + pause;
+      throw new Error(`rate: http 429, no requests for ${Math.round(pause / 60000)} min`);
     }
     if (!res.ok) throw new Error(`http ${res.status}`);
     let body;
@@ -515,8 +528,8 @@ async function refreshUsage(sevenArg) {
   } catch (err) {
     next.error = err.message;
     logError(err.message);
-    // A changed or moved endpoint, not an outage: no network or no keychain
-    // says nothing about the format.
+    // A changed or moved endpoint, not an outage: no network, no keychain and no
+    // rate limit says anything about the format.
     if (/^(parse|http)/.test(err.message)) checkFormat('usage/response', false, `usage endpoint: ${err.message}`);
     // Rejected twice is a login problem, not a format one: still loud, worded as such.
     else if (authFailed) checkFormat('usage/response', false, `usage endpoint rejected the login token: ${err.message}`);
