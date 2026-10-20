@@ -10,6 +10,9 @@ app that lists every live session (`src/main.swift`). `README.md` describes both
   newer APIs (`clearFocusAtLaunch`); ignore that error, or set `PROJECT_LIFECYCLE_PACKAGE`.
 - Rebuild and install after every app change, but never relaunch the running app: the user does.
 - Never click, press keys or bring windows forward to test the app while the user is at the machine.
+  To see the list window, run the built binary with `CC_SESSIONS_SELFTEST=1 CC_SESSIONS_WINDOW_PNG=<path>`
+  (add `CC_SESSIONS_WINDOW_BYPASS_ALL=1` for the Guards menu's state): it draws the fixture window
+  off screen to a PNG, with no window shown. Menus are not drawn.
 - A table cell is built through `CentredCell`, never returned as a bare `NSTextField`: a label that
   fills a taller row draws at its top. The self-test fails a bare label (`textCellProblems`) and
   reads the leaderboard's picture for text off the row's middle (`inkProblems`).

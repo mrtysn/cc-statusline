@@ -7919,6 +7919,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         problems += UsageWindow.selfTestProblems()
         problems += LeaderboardWindow.selfTestProblems()
         // CC_SESSIONS_WINDOW_PNG=<path> saves the list window's picture, to read its top row without opening the app.
+        // CC_SESSIONS_WINDOW_BYPASS_ALL=1 draws it with both guards bypassed for all sessions, as the Guards menu leaves it.
+        if ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_BYPASS_ALL"] == "1", let controller {
+            controller.toggleSSHBypassAll()
+            controller.toggleSpawnBypassAll()
+            controller.window?.layoutIfNeeded()
+        }
         if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_PNG"],
             let content = controller?.window?.contentView,
             let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
