@@ -5357,6 +5357,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
     private let guardsLabel = NSTextField(labelWithString: "")
+    /// The table reaches the window's bottom, or stops above the guards line while it shows.
+    private var tableToBottom: NSLayoutConstraint?
+    private var tableToGuards: NSLayoutConstraint?
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// Every session in the last snapshot; `rows` is what the filter lets through.
     private var allRows: [(session: Session, past: Bool)] = []
@@ -5503,8 +5506,19 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         content.addSubview(soundBar)
         content.addSubview(gridScroll)
         content.addSubview(emptyLabel)
+        // Its own strip under the table, so the controls at the top never move for it.
+        guardsLabel.textColor = Palette.yellow
+        guardsLabel.font = NSFont.systemFont(ofSize: 11)
+        guardsLabel.toolTip = "Turned off in the Guards menu; each stays off until turned back on there"
+        guardsLabel.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(guardsLabel)
+        tableToBottom = gridScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        tableToGuards = gridScroll.bottomAnchor.constraint(equalTo: guardsLabel.topAnchor, constant: -8)
 
         NSLayoutConstraint.activate([
+            guardsLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            guardsLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
+            guardsLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
             quotaBar.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             usageButton.leadingAnchor.constraint(equalTo: quotaBar.trailingAnchor, constant: 8),
@@ -5519,10 +5533,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             gridScroll.topAnchor.constraint(equalTo: quotaBar.bottomAnchor, constant: 12),
             gridScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             gridScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            gridScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             emptyLabel.centerXAnchor.constraint(equalTo: gridScroll.centerXAnchor),
             emptyLabel.topAnchor.constraint(equalTo: gridScroll.topAnchor, constant: 60),
         ])
+        drawGuardsLabel()
 
     }
 
@@ -5636,11 +5650,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         repoTagsButton.action = #selector(openRepoTags)
         repoTagsButton.toolTip = "Repo Tags: every tag in local-repos-list, its colour and its folders"
         let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
-        guardsLabel.textColor = Palette.yellow
-        guardsLabel.font = NSFont.systemFont(ofSize: 11)
-        guardsLabel.toolTip = "Turned off in the Guards menu; each stays off until turned back on there"
-        drawGuardsLabel()
-        listControls.setViews([filterPopup, repoTagsButton, guardsLabel], in: .leading)
+        listControls.setViews([filterPopup, repoTagsButton], in: .leading)
         listControls.spacing = 12
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
@@ -6419,6 +6429,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             .filter { GuardBypassAll.on($0.0) }.map(\.1)
         guardsLabel.stringValue = off.isEmpty ? "" : "\u{26A0}\u{FE0E} \(off.joined(separator: " and ")) bypassed for all sessions"
         guardsLabel.isHidden = off.isEmpty
+        // Off before on, so the two are never active together.
+        if off.isEmpty { tableToGuards?.isActive = false; tableToBottom?.isActive = true }
+        else { tableToBottom?.isActive = false; tableToGuards?.isActive = true }
     }
 
     @objc func copySelectedSessionId() {
@@ -7923,14 +7936,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_BYPASS_ALL"] == "1", let controller {
             controller.toggleSSHBypassAll()
             controller.toggleSpawnBypassAll()
-            controller.window?.layoutIfNeeded()
         }
         if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_PNG"],
-            let content = controller?.window?.contentView,
-            let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+            let content = controller?.window?.contentView
         {
-            content.cacheDisplay(in: content.bounds, to: rep)
-            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+            // Laid out first: without a pass the picture shows controls where the window never draws them.
+            content.layoutSubtreeIfNeeded()
+            if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+            }
         }
         try? fm.removeItem(at: selfTestRoot)
         for problem in problems { print("self-test: \(problem)") }
