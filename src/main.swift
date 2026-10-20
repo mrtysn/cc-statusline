@@ -564,6 +564,31 @@ let supportDir: URL = selfTest ? selfTestRoot.appendingPathComponent("support") 
 /// Where hooks/event.zsh leaves one file per Claude Code event.
 let eventsDir = cacheDir.appendingPathComponent("events")
 
+/// A guard switched off for every session: its hook skips the ask while
+/// <config>/<hook>/bypass-all-sessions exists. The Guards menu makes and removes
+/// the file, and it stays until removed, across sessions and restarts.
+enum GuardBypassAll {
+    static let ssh = "ssh-request-guard"
+    static let spawn = "subagent-guard"
+
+    static func file(_ hook: String) -> URL {
+        (selfTest ? selfTestRoot.appendingPathComponent("config") : xdgDir("CLAUDE_CONFIG_DIR", fallback: ".claude"))
+            .appendingPathComponent(hook).appendingPathComponent("bypass-all-sessions")
+    }
+
+    static func on(_ hook: String) -> Bool { fm.fileExists(atPath: file(hook).path) }
+
+    static func toggle(_ hook: String) {
+        let url = file(hook)
+        if on(hook) {
+            try? fm.removeItem(at: url)
+        } else {
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fm.createFile(atPath: url.path, contents: Data())
+        }
+    }
+}
+
 /// The subagent-guard hook's approval for a session. Past its spawn budget the
 /// hook asks once, then leaves /tmp/claude-spawn-asked-<session id> and asks no
 /// more for that session; making that file here is approving in advance, and
@@ -571,12 +596,13 @@ let eventsDir = cacheDir.appendingPathComponent("events")
 enum SpawnGuard {
     private static func file(_ session: String) -> String { "/tmp/claude-spawn-asked-\(session)" }
 
+    /// Off for this session, by its own file or for every session.
     static func bypassed(_ session: String) -> Bool {
-        FileManager.default.fileExists(atPath: file(session))
+        GuardBypassAll.on(GuardBypassAll.spawn) || FileManager.default.fileExists(atPath: file(session))
     }
 
     static func toggleBypass(for session: String) {
-        if bypassed(session) {
+        if FileManager.default.fileExists(atPath: file(session)) {
             try? FileManager.default.removeItem(atPath: file(session))
         } else {
             FileManager.default.createFile(atPath: file(session), contents: Data())
@@ -619,7 +645,7 @@ final class SSHGuard {
     }
 
     private func reload() {
-        let marks = ["asks": stamp(asksFile), "allow": stamp(allowDir)]
+        let marks = ["asks": stamp(asksFile), "allow": stamp(allowDir), "all": stamp(GuardBypassAll.file(GuardBypassAll.ssh))]
         var changed = false
         for (key, mark) in marks where seen[key] != mark {
             seen[key] = mark
@@ -651,9 +677,16 @@ final class SSHGuard {
         return found
     }
 
-    /// Whether the session has every ssh host cleared, a `*` line.
+    /// Whether the session has every ssh host cleared, a `*` line, or every session has.
     func bypassed(_ session: String) -> Bool {
-        clearedHosts(session).contains("*")
+        GuardBypassAll.on(GuardBypassAll.ssh) || clearedHosts(session).contains("*")
+    }
+
+    /// Clears every host in every session, or takes that back.
+    func toggleBypassAll() {
+        GuardBypassAll.toggle(GuardBypassAll.ssh)
+        seen = [:]
+        reload()
     }
 
     private func clearedHosts(_ session: String) -> [String] {
@@ -5323,6 +5356,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// The tag filter and repo tags: what the list
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
+    private let guardsLabel = NSTextField(labelWithString: "")
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// Every session in the last snapshot; `rows` is what the filter lets through.
     private var allRows: [(session: Session, past: Bool)] = []
@@ -5602,7 +5636,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         repoTagsButton.action = #selector(openRepoTags)
         repoTagsButton.toolTip = "Repo Tags: every tag in local-repos-list, its colour and its folders"
         let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
-        listControls.setViews([filterPopup, repoTagsButton], in: .leading)
+        guardsLabel.textColor = Palette.yellow
+        guardsLabel.font = NSFont.systemFont(ofSize: 11)
+        guardsLabel.toolTip = "Turned off in the Guards menu; each stays off until turned back on there"
+        drawGuardsLabel()
+        listControls.setViews([filterPopup, repoTagsButton, guardsLabel], in: .leading)
         listControls.spacing = 12
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
@@ -5924,6 +5962,19 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         if filterPopup.target == nil || filterPopup.action == nil { problems.append("the filter popup is not wired") }
 
+        // Guards: a bypass for all sessions covers each session and says so beside the list's controls.
+        for (hook, toggle, bypassed) in [
+            (GuardBypassAll.ssh, toggleSSHBypassAll, { self.sshGuard.bypassed(first) }),
+            (GuardBypassAll.spawn, toggleSpawnBypassAll, { SpawnGuard.bypassed(first) }),
+        ] as [(String, () -> Void, () -> Bool)] {
+            if bypassed() { problems.append("\(hook) is bypassed before the Guards menu turned it off") }
+            toggle()
+            if !bypassed() { problems.append("\(hook) bypassed for all sessions does not cover a session") }
+            if guardsLabel.isHidden { problems.append("\(hook) bypassed for all sessions shows no warning") }
+            toggle()
+            if bypassed() || !guardsLabel.isHidden { problems.append("\(hook) stays bypassed after the Guards menu turned it back on") }
+        }
+
         // Layout: resizes, fits the screen, shrinks to its minimum.
         problems += WindowChecks.verify(window).map { "window: \($0)" }
         return problems
@@ -6096,6 +6147,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// same sessions in the same order; anything else redraws the table. Most
     /// refreshes are one session's redraw, and every cell is a stack of views.
     private func refreshTable(full: Bool = false) {
+        drawGuardsLabel()
         let keys = table.tableColumns.map { $0.identifier.rawValue }
         let ids = rows.map { "\($0.session.summary.session_id ?? "")\($0.past ? "~" : "")" }
         let next = rows.indices.map { row in
@@ -6329,6 +6381,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(toggleSSHBypassAll) {
+            item.state = GuardBypassAll.on(GuardBypassAll.ssh) ? .on : .off
+            return true
+        }
+        if item.action == #selector(toggleSpawnBypassAll) {
+            item.state = GuardBypassAll.on(GuardBypassAll.spawn) ? .on : .off
+            return true
+        }
         if item.action == #selector(openShortcutSettings) {
             item.title = "New Session Shortcut\u{2026} (\(hotKey.active?.display ?? "Unset"))"
             return true
@@ -6341,6 +6401,24 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         guard item.action == #selector(showSelectedTerminal) else { return true }
         item.title = selected?.past == true ? "Resume Session" : "Show Terminal"
         return selected != nil
+    }
+
+    @objc func toggleSSHBypassAll() {
+        sshGuard.toggleBypassAll()
+        refreshTable()
+    }
+
+    @objc func toggleSpawnBypassAll() {
+        GuardBypassAll.toggle(GuardBypassAll.spawn)
+        refreshTable()
+    }
+
+    /// Says, beside the list's controls, which guards are off for every session.
+    private func drawGuardsLabel() {
+        let off = [(GuardBypassAll.ssh, "ssh guard"), (GuardBypassAll.spawn, "subagent spawn guard")]
+            .filter { GuardBypassAll.on($0.0) }.map(\.1)
+        guardsLabel.stringValue = off.isEmpty ? "" : "\u{26A0}\u{FE0E} \(off.joined(separator: " and ")) bypassed for all sessions"
+        guardsLabel.isHidden = off.isEmpty
     }
 
     @objc func copySelectedSessionId() {
@@ -6435,21 +6513,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         let sid = s.session_id
         if let id = sid, !past {
+            // Off for every session, a row cannot turn it back on: the Guards menu does.
+            let allTip = "Bypassed for all sessions; the Guards menu turns it back on"
+            let sshAll = GuardBypassAll.on(GuardBypassAll.ssh)
             let on = sshGuard.bypassed(id)
-            let item = ActionItem("Bypass ssh guard for this session") { [weak self] in
+            let item = ActionItem("Bypass ssh guard for this session", enabled: !sshAll) { [weak self] in
                 self?.sshGuard.toggleBypass(for: id)
             }
             item.state = on ? .on : .off
-            item.toolTip = on
+            item.toolTip = sshAll ? allTip : on
                 ? "ssh-request-guard does not ask about any host in this session; click to ask again"
                 : "Stops ssh-request-guard asking about any host in this session only; tunnels still ask"
             menu.addItem(item)
+            let spawnAll = GuardBypassAll.on(GuardBypassAll.spawn)
             let spawnOn = SpawnGuard.bypassed(id)
-            let spawn = ActionItem("Bypass subagent spawn guard for this session") {
+            let spawn = ActionItem("Bypass subagent spawn guard for this session", enabled: !spawnAll) {
                 SpawnGuard.toggleBypass(for: id)
             }
             spawn.state = spawnOn ? .on : .off
-            spawn.toolTip = spawnOn
+            spawn.toolTip = spawnAll ? allTip : spawnOn
                 ? "subagent-guard does not ask about spawns past its budget in this session; click to ask again"
                 : "Stops subagent-guard asking once this session passes its spawn budget; nesting is still refused"
             menu.addItem(spawn)
@@ -7909,6 +7991,19 @@ func buildMenu() {
         keyEquivalent: "")
     sessionItem.submenu = sessionMenu
     main.addItem(sessionItem)
+
+    let guardsItem = NSMenuItem()
+    let guardsMenu = NSMenu(title: "Guards")
+    guardsMenu.addItem(
+        withTitle: "Bypass ssh guard for all sessions", action: #selector(SessionsWindow.toggleSSHBypassAll),
+        keyEquivalent: ""
+    ).toolTip = "ssh-request-guard stops asking about any host in every session until this is turned off; tunnels still ask"
+    guardsMenu.addItem(
+        withTitle: "Bypass subagent spawn guard for all sessions", action: #selector(SessionsWindow.toggleSpawnBypassAll),
+        keyEquivalent: ""
+    ).toolTip = "subagent-guard stops asking past its spawn budget in every session until this is turned off; nesting is still refused"
+    guardsItem.submenu = guardsMenu
+    main.addItem(guardsItem)
 
     let editItem = NSMenuItem()
     let editMenu = NSMenu(title: "Edit")
