@@ -3738,6 +3738,14 @@ struct LeaderboardFolder: Decodable {
     let sub: Double?
 }
 
+/// One quota day of spend: the 24 hours from `from` to `to`, and what each model cost inside them.
+struct LeaderboardDay: Decodable {
+    let from: String?
+    let to: String?
+    let cost: Double?
+    let models: [String: Double]?
+}
+
 /// One window of time: `since` and `until` in ms (the quota's week; nil `until` while it is still
 /// open, nil `since` for all time) and the earliest and latest message inside it.
 struct LeaderboardView: Decodable {
@@ -3747,6 +3755,7 @@ struct LeaderboardView: Decodable {
     let last: String?
     let total: Double?
     let sub: Double?
+    let daily: [LeaderboardDay]?
     let sessions: [LeaderboardSession]?
     let folders: [LeaderboardFolder]?
 }
@@ -3863,6 +3872,163 @@ func moneyText(_ dollars: Double) -> String {
 }
 
 /// The sessions or folders of one period, ranked by what they cost at list price.
+/// One quota day of spend, split by model: the 24 hours from `start` to `end`, in ms.
+struct DailySlice {
+    let start: Double
+    let end: Double
+    let models: [(name: String, cost: Double)]
+    var total: Double { models.reduce(0) { $0 + $1.cost } }
+}
+
+/// The leaderboard's Daily view: one stacked bar per quota day, and a dashed line at a seventh of
+/// the weekly cap, which is what an even spend of the quota would cost a day.
+final class DailyChartView: NSView, NSViewToolTipOwner {
+    var days: [DailySlice] = [] { didSet { needsDisplay = true; needsLayout = true } }
+    var capLine: Double? { didSet { needsDisplay = true } }
+    override var isFlipped: Bool { true }
+
+    private static let families: [(key: String, colour: NSColor)] = [
+        ("opus", Palette.orange), ("sonnet", Palette.blue), ("fable", Palette.yellow),
+        ("haiku", NSColor(srgbRed: 0.553, green: 0.780, blue: 0.557, alpha: 1)),
+    ]
+
+    /// "claude-opus-5-5" is an opus; a model of no listed family ranks last, as "other".
+    private static func rank(_ model: String) -> Int { families.firstIndex { model.contains($0.key) } ?? families.count }
+    private static func colour(_ model: String) -> NSColor { families.first { model.contains($0.key) }?.colour ?? Palette.dim }
+
+    private static let gutter = (left: CGFloat(60), right: CGFloat(16), top: CGFloat(34), bottom: CGFloat(30))
+    private static let tipFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "EEE MMM d, HH:mm"
+        return f
+    }()
+
+    private var plot: NSRect {
+        let g = Self.gutter
+        return NSRect(x: g.left, y: g.top, width: max(bounds.width - g.left - g.right, 1),
+                      height: max(bounds.height - g.top - g.bottom, 1))
+    }
+
+    /// The top of the y axis and the gap between its gridlines: a round number just above the tallest bar.
+    private var axis: (top: Double, step: Double) {
+        let peak = max(days.map(\.total).max() ?? 0, capLine ?? 0, 1)
+        let raw = peak / 5
+        let magnitude = pow(10, floor(log10(raw)))
+        let step = [1.0, 2, 2.5, 5, 10].map { $0 * magnitude }.first { $0 >= raw } ?? raw
+        return (step * ceil(peak / step), step)
+    }
+
+    private func slot(_ index: Int) -> NSRect {
+        let width = plot.width / CGFloat(max(days.count, 1))
+        return NSRect(x: plot.minX + CGFloat(index) * width, y: plot.minY, width: width, height: plot.height)
+    }
+
+    private func text(_ string: String, colour: NSColor = Palette.dim) -> NSAttributedString {
+        NSAttributedString(string: string, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: colour,
+        ])
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Palette.background.setFill()
+        bounds.fill()
+        guard !days.isEmpty else {
+            let note = text("No daily figures yet.")
+            note.draw(at: NSPoint(x: bounds.midX - note.size().width / 2, y: bounds.midY - note.size().height / 2))
+            return
+        }
+        let (peak, step) = axis
+        func y(_ dollars: Double) -> CGFloat { plot.maxY - CGFloat(dollars / peak) * plot.height }
+        var tick = 0.0
+        while tick <= peak + step / 1000 {
+            Palette.frame.withAlphaComponent(tick == 0 ? 1 : 0.45).setFill()
+            NSRect(x: plot.minX, y: y(tick) - 0.5, width: plot.width, height: 1).fill()
+            let label = text(tick == 0 ? "$0" : moneyText(tick))
+            label.draw(at: NSPoint(x: plot.minX - 8 - label.size().width, y: y(tick) - label.size().height / 2))
+            tick += step
+        }
+
+        let dayWidth = plot.width / CGFloat(days.count)
+        let dateFormat = DateFormatter()
+        dateFormat.locale = Locale(identifier: "en_US")
+        dateFormat.dateFormat = days.count <= 8 ? "EEE d" : "MMM d"
+        let every = max(1, Int(ceil(56 / dayWidth)))
+        for (index, day) in days.enumerated() {
+            let cell = slot(index)
+            let width = min(cell.width * 0.7, 72)
+            var base = plot.maxY
+            let stack = day.models.sorted { (Self.rank($0.name), -$0.cost) < (Self.rank($1.name), -$1.cost) }
+            for (name, cost) in stack {
+                let height = CGFloat(cost / peak) * plot.height
+                guard height > 0 else { continue }
+                Self.colour(name).setFill()
+                NSRect(x: cell.midX - width / 2, y: base - height, width: width, height: max(height - 0.5, 0.5)).fill()
+                base -= height
+            }
+            if cell.width >= 46 {
+                let value = text(moneyText(day.total), colour: Palette.text)
+                value.draw(at: NSPoint(x: cell.midX - value.size().width / 2, y: base - value.size().height - 3))
+            }
+            if index % every == 0 {
+                let name = text(dateFormat.string(from: Date(timeIntervalSince1970: day.start / 1000)))
+                name.draw(at: NSPoint(x: cell.midX - name.size().width / 2, y: plot.maxY + 8))
+            }
+        }
+
+        if let line = capLine, line > 0 {
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: plot.minX, y: y(line)))
+            path.line(to: NSPoint(x: plot.maxX, y: y(line)))
+            path.setLineDash([5, 4], count: 2, phase: 0)
+            path.lineWidth = 1
+            Palette.text.withAlphaComponent(0.7).setStroke()
+            path.stroke()
+        }
+
+        var x = plot.minX
+        let present = Set(days.flatMap { $0.models.map { Self.rank($0.name) } })
+        for (rank, family) in (Self.families.map(\.key) + ["other"]).enumerated() where present.contains(rank) {
+            (rank < Self.families.count ? Self.families[rank].colour : Palette.dim).setFill()
+            NSRect(x: x, y: 11, width: 9, height: 9).fill()
+            let name = text(family)
+            name.draw(at: NSPoint(x: x + 14, y: 15 - name.size().height / 2))
+            x += 14 + name.size().width + 16
+        }
+        if let line = capLine, line > 0 {
+            let dash = NSBezierPath()
+            dash.move(to: NSPoint(x: x, y: 15.5))
+            dash.line(to: NSPoint(x: x + 16, y: 15.5))
+            dash.setLineDash([4, 3], count: 2, phase: 0)
+            Palette.text.withAlphaComponent(0.7).setStroke()
+            dash.stroke()
+            let name = text("weekly cap / 7 = \(moneyText(line))")
+            name.draw(at: NSPoint(x: x + 22, y: 15 - name.size().height / 2))
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        removeAllToolTips()
+        for index in days.indices {
+            addToolTip(slot(index), owner: self, userData: UnsafeMutableRawPointer(bitPattern: index + 1))
+        }
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        let index = Int(bitPattern: data) - 1
+        guard days.indices.contains(index) else { return "" }
+        let day = days[index]
+        let open = day.end > Date().timeIntervalSince1970 * 1000
+        let start = Self.tipFormat.string(from: Date(timeIntervalSince1970: day.start / 1000))
+        var lines = ["\(start) · \(moneyText(day.total))\(open ? " so far" : "")"]
+        for (name, cost) in day.models.sorted(by: { $0.cost > $1.cost }) where cost > 0 {
+            lines.append("\(name.replacingOccurrences(of: "claude-", with: ""))  \(moneyText(cost))")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
 final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     /// One table row, a session or a folder.
     struct Row {
@@ -3892,7 +4058,9 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
 
     private let table = NSTableView()
     private let search = NSSearchField()
-    private let kind = NSSegmentedControl(labels: ["Sessions", "Folders"], trackingMode: .selectOne, target: nil, action: nil)
+    private let kind = NSSegmentedControl(labels: ["Sessions", "Folders", "Daily"], trackingMode: .selectOne, target: nil, action: nil)
+    private let chart = DailyChartView()
+    private let scroll = NSScrollView()
     private let period = NSSegmentedControl(
         labels: LeaderboardWindow.periods.map(\.1), trackingMode: .selectOne, target: nil, action: nil)
     private let summary = NSTextField(labelWithString: "")
@@ -3903,6 +4071,7 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
     private var shown: [Row] = []
     private var topCost = 1.0
     private var showingFolders: Bool { kind.selectedSegment == 1 }
+    private var showingDaily: Bool { kind.selectedSegment == 2 }
     private var periodKey: String { LeaderboardWindow.periods[max(0, period.selectedSegment)].0 }
     private var refreshTimer: Timer?
     private var building = false
@@ -3957,7 +4126,6 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         table.allowsColumnReordering = false
         table.columnAutoresizingStyle = .noColumnAutoresizing
         buildColumns()
-        let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
@@ -3972,7 +4140,8 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         search.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         summary.setContentHuggingPriority(.defaultLow, for: .horizontal)
         summary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        for view in [top, scroll, footer] as [NSView] {
+        chart.isHidden = true
+        for view in [top, scroll, chart, footer] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -3984,6 +4153,10 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             scroll.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -10),
+            chart.topAnchor.constraint(equalTo: scroll.topAnchor),
+            chart.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            chart.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
+            chart.bottomAnchor.constraint(equalTo: scroll.bottomAnchor),
             footer.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             footer.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             footer.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
@@ -4010,8 +4183,16 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
     }
 
     @objc private func controlsChanged(_ sender: NSSegmentedControl) {
-        if sender === kind { buildColumns() }
+        if sender === kind { showKind() }
         reload()
+    }
+
+    /// The table for sessions and folders, the chart for days; the search box only filters the table.
+    private func showKind() {
+        if !showingDaily { buildColumns() }
+        scroll.isHidden = showingDaily
+        chart.isHidden = !showingDaily
+        search.isEnabled = !showingDaily
     }
 
     func controlTextDidChange(_ obj: Notification) { filterAndSort() }
@@ -4059,6 +4240,15 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
             (cost ?? 0) > 0 ? (sub ?? 0) / (cost ?? 1) * 100 : 0
         }
         func folderName(_ project: String) -> String { project.replacingOccurrences(of: "dev-", with: "", options: .anchored) }
+        if showingDaily {
+            chart.days = (view?.daily ?? []).map { d in
+                DailySlice(start: millis(d.from), end: millis(d.to),
+                           models: (d.models ?? [:]).map { (name: $0.key, cost: $0.value) })
+            }
+            chart.capLine = file?.cap.map { $0.dollars / 7 }
+            updateFooter()
+            return
+        }
         if showingFolders {
             all = (view?.folders ?? []).map { f in
                 Row(id: f.project, name: folderName(f.project), tip: f.project, folder: "", count: f.sessions ?? 0,
@@ -4141,6 +4331,7 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         let subShare = total > 0 ? Int(((view.sub ?? 0) / total * 100).rounded()) : 0
         summary.stringValue = "\(moneyText(total)) at list price · \(subShare)% from sub-agents"
         let count = view.sessions?.count ?? 0
+        let dayCount = view.daily?.count ?? 0
         var window = ""
         if let since = view.since {
             window = "the quota week from \(Self.date(since)) to \(view.until.map { Self.date($0) } ?? "now")"
@@ -4149,10 +4340,17 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         } else {
             window = "all transcripts"
         }
-        var text = "\(count) session\(count == 1 ? "" : "s") in \(window). "
-        text += "Spend is list price per message by its model: cache writes at the one-hour price, cache reads at the model's read price, "
-        text += "output counted twice because transcripts keep only a streaming snapshot of it. It is a ranking, not what the plan charges. "
-        text += "Sub-agents = the share of a row's spend that came from the agents it spawned."
+        var text = ""
+        if showingDaily {
+            text = "\(dayCount) quota day\(dayCount == 1 ? "" : "s") in \(window). "
+            text += "A bar is the 24 hours from the weekly reset time, split by model, at list price\(periodKey == "last_week" ? "" : "; the last bar is still filling"). "
+            text += "The dashed line is the weekly cap divided by seven, the cost of a day that spends the quota evenly."
+        } else {
+            text = "\(count) session\(count == 1 ? "" : "s") in \(window). "
+            text += "Spend is list price per message by its model: cache writes at the one-hour price, cache reads at the model's read price, "
+            text += "output counted twice because transcripts keep only a streaming snapshot of it. It is a ranking, not what the plan charges. "
+            text += "Sub-agents = the share of a row's spend that came from the agents it spawned."
+        }
         if periodKey == "week" {
             if let cap = file.cap {
                 text += " Weekly cap ~\(moneyText(cap.dollars)) from \(cap.pairs) pair\(cap.pairs == 1 ? "" : "s") of quota readings."
@@ -4160,7 +4358,10 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
                 text += " Weekly cap: calibrating, it needs two quota readings 3 points apart (\(file.readings ?? 0) logged)."
             }
         }
-        if let read = file.read_at { text += " Read \(ago(read)) ago." }
+        if let read = file.read_at {
+            text += " Read \(ago(read)) ago."
+            if building { text = "Refreshing: these figures are the snapshot read \(ago(read)) ago. " + text }
+        }
         if let error = file.error { text += " Refresh failed: \(error)" }
         footer.stringValue = text
         footer.textColor = file.error == nil ? Palette.dim : Palette.yellow
@@ -4217,9 +4418,18 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         func session(_ id: String, _ title: String, _ cost: Double, _ sub: Double, _ model: String) -> String {
             "{\"project\": \"dev-fixture\", \"session\": \"\(id)-0000\", \"title\": \"\(title)\", \"first\": \"\(iso(3))\", \"last\": \"\(iso(1))\", \"requests\": 1200, \"cost\": \(cost), \"sub\": \(sub), \"model\": \"\(model)\"}"
         }
-        func view(since: String, until: String, first: String, last: String) -> String {
+        func daily(_ count: Int) -> String {
+            let slices = (0..<count).map { i -> String in
+                let opus = 60 + Double((i * 37) % 90), sonnet = 20 + Double((i * 17) % 40), fable = Double((i * 11) % 25)
+                let models = "\"claude-opus-5-5\": \(opus), \"claude-sonnet-5-5\": \(sonnet), \"claude-fable-5-1\": \(fable)"
+                return "{\"from\": \"\(iso(Double(count - i)))\", \"to\": \"\(iso(Double(count - i - 1)))\", \"cost\": \(opus + sonnet + fable), \"models\": {\(models)}}"
+            }
+            return "[" + slices.joined(separator: ",") + "]"
+        }
+        func view(since: String, until: String, first: String, last: String, days: Int) -> String {
             """
             {"since": \(since), "until": \(until), "first": "\(first)", "last": "\(last)", "total": 1911, "sub": 990,
+             "daily": \(daily(days)),
              "sessions": [\(session("7386be92", "Puppet body build", 449.7, 400.1, "opus-5-5")),
                           \(session("2370cc4b", "Character roster and variant generator", 315.1, 240.2, "sonnet-5-5")),
                           \(session("aaaaaaaa", "A third fixture", 90.5, 12, "fable-5-1"))],
@@ -4229,9 +4439,9 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         }
         let json = """
             {"read_at": \(now - 90000), "error": null, "readings": 6, "cap": {"dollars": 3900, "points": 12, "pairs": 3},
-             "views": {"week": \(view(since: String(now - 3 * 86400000), until: "null", first: iso(3), last: iso(0.1))),
-                       "last_week": \(view(since: String(now - 10 * 86400000), until: String(now - 3 * 86400000), first: iso(9), last: iso(4))),
-                       "all": \(view(since: "null", until: "null", first: iso(36), last: iso(0.1)))}}
+             "views": {"week": \(view(since: String(now - 3 * 86400000), until: "null", first: iso(3), last: iso(0.1), days: 5)),
+                       "last_week": \(view(since: String(now - 10 * 86400000), until: String(now - 3 * 86400000), first: iso(9), last: iso(4), days: 7)),
+                       "all": \(view(since: "null", until: "null", first: iso(36), last: iso(0.1), days: 57))}}
             """
         guard let fixture = try? JSONDecoder().decode(LeaderboardFile.self, from: Data(json.utf8)) else {
             return ["leaderboard fixture did not decode"]
@@ -4241,7 +4451,7 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
         for folders in [false, true] {
             for (key, _) in periods {
                 board.kind.selectedSegment = folders ? 1 : 0
-                board.buildColumns()
+                board.showKind()
                 board.period.selectedSegment = periods.firstIndex { $0.0 == key } ?? 0
                 board.reload()
                 let want = folders ? 2 : 3
@@ -4264,6 +4474,25 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
                             .write(to: URL(fileURLWithPath: "\(path).\(folders ? "folders" : "sessions").\(key).png"))
                     }
                 }
+            }
+        }
+        board.kind.selectedSegment = 2
+        board.showKind()
+        for (key, _) in periods {
+            board.period.selectedSegment = periods.firstIndex { $0.0 == key } ?? 0
+            board.reload()
+            let want = ["week": 5, "last_week": 7, "all": 57][key] ?? 0
+            if board.chart.days.count != want {
+                problems.append("leaderboard daily \(key) drew \(board.chart.days.count) days, want \(want)")
+            }
+            if board.chart.capLine == nil { problems.append("leaderboard daily \(key) has no cap line") }
+            if board.footer.stringValue.isEmpty { problems.append("leaderboard daily \(key) has no footer") }
+            if let content = board.window?.contentView, let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds),
+               let path = ProcessInfo.processInfo.environment["CC_SESSIONS_LEADERBOARD_PNG"] {
+                content.layoutSubtreeIfNeeded()
+                content.cacheDisplay(in: content.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?
+                    .write(to: URL(fileURLWithPath: "\(path).daily.\(key).png"))
             }
         }
         return problems
