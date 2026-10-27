@@ -3883,7 +3883,7 @@ struct DailySlice {
 /// The leaderboard's Daily view: one stacked bar per quota day, and a dashed line at a seventh of
 /// the weekly cap, which is what an even spend of the quota would cost a day.
 final class DailyChartView: NSView, NSViewToolTipOwner {
-    var days: [DailySlice] = [] { didSet { needsDisplay = true; needsLayout = true } }
+    var days: [DailySlice] = [] { didSet { needsDisplay = true; rebuildToolTips() } }
     var capLine: Double? { didSet { needsDisplay = true } }
     override var isFlipped: Bool { true }
 
@@ -4007,12 +4007,22 @@ final class DailyChartView: NSView, NSViewToolTipOwner {
         }
     }
 
-    override func layout() {
-        super.layout()
+    /// The hover rectangle of each day, in the order of `days`.
+    private(set) var tipRects: [NSRect] = []
+
+    /// Registered again whenever the days or the size change: a rectangle registered while the view
+    /// is still zero-sized, or before a resize, would cover nothing.
+    private func rebuildToolTips() {
         removeAllToolTips()
-        for index in days.indices {
-            addToolTip(slot(index), owner: self, userData: UnsafeMutableRawPointer(bitPattern: index + 1))
+        tipRects = days.indices.map { slot($0) }
+        for (index, rect) in tipRects.enumerated() {
+            addToolTip(rect, owner: self, userData: UnsafeMutableRawPointer(bitPattern: index + 1))
         }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        rebuildToolTips()
     }
 
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
@@ -4486,6 +4496,15 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
                 problems.append("leaderboard daily \(key) drew \(board.chart.days.count) days, want \(want)")
             }
             if board.chart.capLine == nil { problems.append("leaderboard daily \(key) has no cap line") }
+            board.window?.contentView?.layoutSubtreeIfNeeded()
+            let rects = board.chart.tipRects
+            if rects.count != want || rects.contains(where: { $0.width < 8 || $0.height < 50 || !board.chart.bounds.contains($0) }) {
+                problems.append("leaderboard daily \(key) has hover rectangles that do not cover its bars: \(rects.count) of \(want)")
+            }
+            if let last = rects.indices.last {
+                let tip = board.chart.view(board.chart, stringForToolTip: 0, point: .zero, userData: UnsafeMutableRawPointer(bitPattern: last + 1))
+                if !tip.contains("opus") || !tip.contains("$") { problems.append("leaderboard daily \(key) tooltip has no model breakdown: \(tip)") }
+            }
             if board.footer.stringValue.isEmpty { problems.append("leaderboard daily \(key) has no footer") }
             if let content = board.window?.contentView, let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds),
                let path = ProcessInfo.processInfo.environment["CC_SESSIONS_LEADERBOARD_PNG"] {
