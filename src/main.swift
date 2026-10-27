@@ -3882,9 +3882,17 @@ struct DailySlice {
 
 /// The leaderboard's Daily view: one stacked bar per quota day, and a dashed line at a seventh of
 /// the weekly cap, which is what an even spend of the quota would cost a day.
-final class DailyChartView: NSView, NSViewToolTipOwner {
-    var days: [DailySlice] = [] { didSet { needsDisplay = true; rebuildToolTips() } }
+final class DailyChartView: NSView {
+    var days: [DailySlice] = [] {
+        didSet {
+            needsDisplay = true
+            if let index = hovered, !days.indices.contains(index) { hovered = nil }
+        }
+    }
     var capLine: Double? { didSet { needsDisplay = true } }
+    /// The day under the pointer, which draws a card listing what each model cost.
+    private(set) var hovered: Int?
+    private var hoverPoint = NSPoint.zero
     override var isFlipped: Bool { true }
 
     private static let families: [(key: String, colour: NSColor)] = [
@@ -3957,6 +3965,10 @@ final class DailyChartView: NSView, NSViewToolTipOwner {
         for (index, day) in days.enumerated() {
             let cell = slot(index)
             let width = min(cell.width * 0.7, 72)
+            if hovered == index {
+                Palette.frame.withAlphaComponent(0.3).setFill()
+                NSRect(x: cell.minX, y: cell.minY, width: cell.width, height: cell.height + Self.gutter.bottom).fill()
+            }
             var base = plot.maxY
             let stack = day.models.sorted { (Self.rank($0.name), -$0.cost) < (Self.rank($1.name), -$1.cost) }
             for (name, cost) in stack {
@@ -4005,38 +4017,75 @@ final class DailyChartView: NSView, NSViewToolTipOwner {
             let name = text("weekly cap / 7 = \(moneyText(line))")
             name.draw(at: NSPoint(x: x + 22, y: 15 - name.size().height / 2))
         }
+        if let index = hovered, days.indices.contains(index) { drawCard(for: index) }
     }
 
-    /// The hover rectangle of each day, in the order of `days`.
-    private(set) var tipRects: [NSRect] = []
-
-    /// Registered again whenever the days or the size change: a rectangle registered while the view
-    /// is still zero-sized, or before a resize, would cover nothing.
-    private func rebuildToolTips() {
-        removeAllToolTips()
-        tipRects = days.indices.map { slot($0) }
-        for (index, rect) in tipRects.enumerated() {
-            addToolTip(rect, owner: self, userData: UnsafeMutableRawPointer(bitPattern: index + 1))
-        }
-    }
-
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        rebuildToolTips()
-    }
-
-    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
-        let index = Int(bitPattern: data) - 1
-        guard days.indices.contains(index) else { return "" }
+    /// What the hovered day cost: its start, the total, and each model's dollars and share.
+    private func drawCard(for index: Int) {
         let day = days[index]
         let open = day.end > Date().timeIntervalSince1970 * 1000
         let start = Self.tipFormat.string(from: Date(timeIntervalSince1970: day.start / 1000))
-        var lines = ["\(start) · \(moneyText(day.total))\(open ? " so far" : "")"]
-        for (name, cost) in day.models.sorted(by: { $0.cost > $1.cost }) where cost > 0 {
-            lines.append("\(name.replacingOccurrences(of: "claude-", with: ""))  \(moneyText(cost))")
+        let header = text("\(start) · \(moneyText(day.total))\(open ? " so far" : "")", colour: Palette.text)
+        let rows = day.models.filter { $0.cost > 0 }.sorted { $0.cost > $1.cost }
+        let names = rows.map { text($0.name.replacingOccurrences(of: "claude-", with: "")) }
+        let costs = rows.map { text(moneyText($0.cost), colour: Palette.text) }
+        let shares = rows.map { text("\(Int(($0.cost / max(day.total, 0.01) * 100).rounded()))%") }
+        func widest(_ strings: [NSAttributedString]) -> CGFloat { strings.map { $0.size().width }.max() ?? 0 }
+        let pad: CGFloat = 10
+        let lineHeight: CGFloat = 16
+        let nameWidth = widest(names), costWidth = widest(costs), shareWidth = widest(shares)
+        let width = max(header.size().width, 14 + nameWidth + 14 + costWidth + 12 + shareWidth) + pad * 2
+        let height = pad * 2 + lineHeight * CGFloat(rows.count + 1) + 2
+        var origin = NSPoint(x: hoverPoint.x + 16, y: hoverPoint.y + 12)
+        if origin.x + width > bounds.maxX - 4 { origin.x = hoverPoint.x - 16 - width }
+        origin.x = max(4, origin.x)
+        origin.y = min(max(4, origin.y), bounds.maxY - height - 4)
+        let card = NSRect(x: origin.x, y: origin.y, width: width, height: height)
+        let shape = NSBezierPath(roundedRect: card, xRadius: 6, yRadius: 6)
+        Palette.panel.setFill()
+        shape.fill()
+        Palette.frame.setStroke()
+        shape.stroke()
+        header.draw(at: NSPoint(x: card.minX + pad, y: card.minY + pad))
+        for (row, model) in rows.enumerated() {
+            let y = card.minY + pad + lineHeight * CGFloat(row + 1) + 2
+            Self.colour(model.name).setFill()
+            NSRect(x: card.minX + pad, y: y + 3, width: 9, height: 9).fill()
+            names[row].draw(at: NSPoint(x: card.minX + pad + 14, y: y))
+            let costRight = card.minX + pad + 14 + nameWidth + 14 + costWidth
+            costs[row].draw(at: NSPoint(x: costRight - costs[row].size().width, y: y))
+            shares[row].draw(at: NSPoint(x: card.maxX - pad - shares[row].size().width, y: y))
         }
-        return lines.joined(separator: "\n")
     }
+
+    /// The day under `point`, or none: a column of the plot, from its top down to the date labels.
+    func hover(at point: NSPoint?) {
+        var index: Int?
+        if let p = point, !days.isEmpty, p.x >= plot.minX, p.x < plot.maxX, p.y >= plot.minY,
+           p.y <= plot.maxY + Self.gutter.bottom {
+            index = min(Int((p.x - plot.minX) / (plot.width / CGFloat(days.count))), days.count - 1)
+        }
+        if let p = point { hoverPoint = p }
+        hovered = index
+        needsDisplay = true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(
+            rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil))
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+    }
+
+    override func mouseEntered(with event: NSEvent) { hover(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseMoved(with event: NSEvent) { hover(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseExited(with event: NSEvent) { hover(at: nil) }
 }
 
 final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
@@ -4497,14 +4546,24 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
             }
             if board.chart.capLine == nil { problems.append("leaderboard daily \(key) has no cap line") }
             board.window?.contentView?.layoutSubtreeIfNeeded()
-            let rects = board.chart.tipRects
-            if rects.count != want || rects.contains(where: { $0.width < 8 || $0.height < 50 || !board.chart.bounds.contains($0) }) {
-                problems.append("leaderboard daily \(key) has hover rectangles that do not cover its bars: \(rects.count) of \(want)")
+            // A pointer move over the last column reaches the chart as a real event and lights that day.
+            let chart = board.chart
+            let over = NSPoint(x: chart.bounds.maxX - 20, y: 150)
+            if let event = NSEvent.mouseEvent(
+                with: .mouseMoved, location: chart.convert(over, to: nil), modifierFlags: [], timestamp: 0,
+                windowNumber: board.window?.windowNumber ?? 0, context: nil, eventNumber: 0, clickCount: 0, pressure: 0) {
+                chart.mouseMoved(with: event)
             }
-            if let last = rects.indices.last {
-                let tip = board.chart.view(board.chart, stringForToolTip: 0, point: .zero, userData: UnsafeMutableRawPointer(bitPattern: last + 1))
-                if !tip.contains("opus") || !tip.contains("$") { problems.append("leaderboard daily \(key) tooltip has no model breakdown: \(tip)") }
+            if chart.hovered != want - 1 { problems.append("leaderboard daily \(key) hover found day \(String(describing: chart.hovered)), want \(want - 1)") }
+            if let content = board.window?.contentView, let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds),
+               let path = ProcessInfo.processInfo.environment["CC_SESSIONS_LEADERBOARD_PNG"] {
+                content.layoutSubtreeIfNeeded()
+                content.cacheDisplay(in: content.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?
+                    .write(to: URL(fileURLWithPath: "\(path).daily.\(key).hover.png"))
             }
+            chart.hover(at: NSPoint(x: 2, y: 2))
+            if chart.hovered != nil { problems.append("leaderboard daily \(key) hover stays on a day outside the plot") }
             if board.footer.stringValue.isEmpty { problems.append("leaderboard daily \(key) has no footer") }
             if let content = board.window?.contentView, let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds),
                let path = ProcessInfo.processInfo.environment["CC_SESSIONS_LEADERBOARD_PNG"] {
