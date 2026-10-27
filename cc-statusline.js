@@ -1394,6 +1394,8 @@ const LEADERBOARD_LOCK = join(CACHE_DIR, 'leaderboard.lock');
 const LEADERBOARD_MS = 5 * 60000;
 const LEADERBOARD_STALE_MS = 180000;
 const ALL_TIME_MS = 30 * 60000;
+// The all-time view's daily chart reaches back this many whole quota weeks, so its days stay on the quota's day edges.
+const ALL_DAILY_WEEKS = 8;
 // The percentages move in whole steps, so a pair of readings must be this many
 // points apart before it says anything about the cap.
 const CAP_MIN_STEP = 3;
@@ -1519,14 +1521,14 @@ async function refreshLeaderboard() {
     // Files not touched since a window opened cannot hold its messages: skip them.
     const days = (from) => String(Math.ceil((now - from) / 86400000) + 1);
     const cuts = [...new Set(pairs.flatMap((p) => [p.from, p.to]))].sort((a, b) => a - b);
-    const weekArgs = ['--since', iso(weekStart), '--days', days(weekStart)];
+    const weekArgs = ['--since', iso(weekStart), '--days', days(weekStart), '--daily-from', iso(weekStart)];
     if (cuts.length >= 2) weekArgs.push('--cuts', cuts.map(iso).join(','));
     // The all-time view reads every transcript, so it is kept for ALL_TIME_MS.
-    const keepAll = previous?.views?.all && now - (previous.views.all.read_at ?? 0) < ALL_TIME_MS;
+    const keepAll = previous?.views?.all?.daily && now - (previous.views.all.read_at ?? 0) < ALL_TIME_MS;
     const [week, last, all] = await Promise.all([
       runReporter(script, weekArgs),
-      runReporter(script, ['--since', iso(lastStart), '--until', iso(weekStart), '--days', days(lastStart)]),
-      keepAll ? null : runReporter(script, []),
+      runReporter(script, ['--since', iso(lastStart), '--until', iso(weekStart), '--days', days(lastStart), '--daily-from', iso(lastStart)]),
+      keepAll ? null : runReporter(script, ['--daily-from', iso(weekStart - ALL_DAILY_WEEKS * 7 * 86400000)]),
     ]);
     const sub = (t) => t?.sub?.cost ?? 0;
     // The model that cost the most in a record, by its short name: "opus-5-5", "sonnet-5-5".
@@ -1541,6 +1543,8 @@ async function refreshLeaderboard() {
       // First and last message of any session in the view, ISO times.
       first: out.sessions.map((x) => x.first).filter(Boolean).sort()[0] ?? null,
       last: out.sessions.map((x) => x.last).filter(Boolean).sort().at(-1) ?? null,
+      // 24-hour slices from the quota reset time: { from, to, cost, models: { model: cost } }.
+      daily: out.days ?? [],
       total: out.sessions.reduce((n, x) => n + x.total.cost, 0),
       sub: out.sessions.reduce((n, x) => n + sub(x), 0),
       sessions: out.sessions.map((x) => ({
