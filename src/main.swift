@@ -5704,7 +5704,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var selecting = false
     /// The ticked sessions, by id, so a tick stays with its session as rows re-sort.
     private var picked: Set<String> = []
-    private let selectButton = NSButton(title: "", target: nil, action: nil)
     private let sendBar = NSStackView()
     private let pickedLabel = NSTextField(labelWithString: "")
     private let tagPick = NSPopUpButton(frame: .zero, pullsDown: true)
@@ -5913,8 +5912,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     // last column off the screen. The account-wide quotas are not here — they are
     // the same for every session, so they live in the bar above the table.
     private let columns: [Column] = [
-        // Select mode's checkboxes; hidden outside it.
-        Column(key: "pick", title: "", width: 22),
         Column(key: "age", title: "Last Seen", width: 74),
         // Beside the directory, as the heat stripe sits beside the cache: the
         // session's dots, stacked, without a title.
@@ -5955,10 +5952,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             // Each column sorts by what it means, not by the text it shows:
             // model by capability, effort by level, cache by time left.
-            // The ticks are not an order.
-            if spec.key == "pick" { column.isHidden = true } else {
-                column.sortDescriptorPrototype = NSSortDescriptor(key: spec.key, ascending: true)
-            }
+            column.sortDescriptorPrototype = NSSortDescriptor(key: spec.key, ascending: true)
             table.addTableColumn(column)
         }
         // The caches about to go cold first, until a header is clicked; with
@@ -6015,12 +6009,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         repoTagsButton.target = self
         repoTagsButton.action = #selector(openRepoTags)
         repoTagsButton.toolTip = "Repo Tags: every tag in local-repos-list, its colour and its folders"
-        selectButton.isBordered = false
-        selectButton.target = self
-        selectButton.action = #selector(toggleSelectMode)
-        drawSelectButton()
         let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
-        listControls.setViews([filterPopup, repoTagsButton, selectButton], in: .leading)
+        listControls.setViews([filterPopup, repoTagsButton], in: .leading)
+        // As wide as its controls: nothing else fixes its width, and stretched it
+        // keeps them at its left, away from the right edge.
+        listControls.setHuggingPriority(.defaultHigh, for: .horizontal)
         listControls.spacing = 12
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
@@ -6358,6 +6351,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         problems += selectModeProblems(fixture: fixture)
 
+        // The list's controls end at the right edge, level with the pack name under them.
+        window.contentView?.layoutSubtreeIfNeeded()
+        let controlsEnd = listControls.convert(NSPoint(x: listControls.fittingSize.width, y: 0), to: soundBar).x
+        if abs(controlsEnd - soundBar.bounds.width) > 1 {
+            problems.append("the list's controls end \(Int(soundBar.bounds.width - controlsEnd))pt short of the right edge")
+        }
+
         // Layout: resizes, fits the screen, shrinks to its minimum.
         problems += WindowChecks.verify(window).map { "window: \($0)" }
         return problems
@@ -6367,20 +6367,23 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// finished one, the bar under the table, Send only with a tick and a message, and all of it gone on leaving.
     private func selectModeProblems(fixture: Snapshot) -> [String] {
         var problems: [String] = []
-        guard let pick = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "pick" }) else {
-            return ["no pick column"]
+        guard let pick = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "dots" }) else {
+            return ["no dots column"]
         }
-        if !table.tableColumns[pick].isHidden || !sendBar.isHidden { problems.append("Select mode shows before it is entered") }
-        table.deselectAll(nil)
-        toggleSelectMode()
-        if table.tableColumns[pick].isHidden { problems.append("Select mode does not show the checkboxes") }
-        if sendBar.isHidden || bottomStack.isHidden { problems.append("Select mode does not show the send bar") }
-        if tableToStrip?.isActive != true { problems.append("the table runs under the send bar") }
-        problems += textCellProblems(table, name: "sessions table in Select mode")
         func box(_ id: String) -> NSButton? {
             guard let row = rows.firstIndex(where: { $0.session.summary.session_id == id }) else { return nil }
             return (table.view(atColumn: pick, row: row + 1, makeIfNecessary: true) as? CentredCell)?.content as? NSButton
         }
+        if box("fixture-a") != nil || !sendBar.isHidden { problems.append("Select mode shows before it is entered") }
+        // The toggle is the tool's own row in the dots column; clicking it is the way in.
+        guard let toggle = (table.view(atColumn: pick, row: 0, makeIfNecessary: true) as? CentredCell)?.content as? NSButton
+        else { return problems + ["the tool's row has no Select toggle in the dots column"] }
+        table.deselectAll(nil)
+        toggle.performClick(nil)
+        if !selecting { problems.append("the Select toggle does not enter Select mode") }
+        if sendBar.isHidden || bottomStack.isHidden { problems.append("Select mode does not show the send bar") }
+        if tableToStrip?.isActive != true { problems.append("the table runs under the send bar") }
+        problems += textCellProblems(table, name: "sessions table in Select mode")
         guard let withTerminal = box("fixture-a") else { return problems + ["the live fixture with a terminal has no checkbox"] }
         if !withTerminal.isEnabled { problems.append("a live session with a terminal cannot be ticked") }
         if box("fixture-b")?.isEnabled == true { problems.append("a session with no terminal can be ticked") }
@@ -6405,7 +6408,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         messageField.stringValue = ""
         toggleSelectMode()
-        if !table.tableColumns[pick].isHidden || !sendBar.isHidden { problems.append("leaving Select mode leaves it on screen") }
+        if box("fixture-a") != nil || !sendBar.isHidden { problems.append("leaving Select mode leaves it on screen") }
         if tableToBottom?.isActive != true { problems.append("the table does not reach the bottom after Select mode") }
         return problems
     }
@@ -6503,6 +6506,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         switch key {
         case "age":
             return newSessionCell()
+        case "dots":
+            return selectToggleCell()
         case "cwd":
             text = "this tool"
         case "topic":
@@ -7336,16 +7341,19 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         sendBar.isHidden = true
     }
 
-    private func drawSelectButton() {
-        selectButton.attributedTitle = NSAttributedString(
-            string: selecting ? "done" : "send message",
-            attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: selecting ? Palette.text : Palette.dim])
-        selectButton.toolTip = selecting
-            ? "Leave Select mode (esc)" : "Tick live sessions and type one message into all of them (⇧⌘S)"
+    /// The Select toggle, in the tool's own row of the dots column: Select mode
+    /// puts the checkboxes in that column.
+    private func selectToggleCell() -> NSView {
+        let box = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleSelectMode))
+        box.controlSize = .mini
+        box.state = selecting ? .on : .off
+        box.toolTip = selecting ? "Leave Select mode (esc)" : "Select sessions to type one message into (⇧⌘S)"
+        box.setAccessibilityLabel(selecting ? "Leave Select mode" : "Select sessions to message")
+        return CentredCell(box, leading: 0, trailing: 0)
     }
 
-    /// Session ▸ Send Message to Sessions…, ⇧⌘S and the header's button: shows or
-    /// hides the checkboxes and the send bar. A selected live row starts ticked.
+    /// Session ▸ Send Message to Sessions…, ⇧⌘S and the toggle in the tool's row:
+    /// swaps the dots for checkboxes and shows the send bar. A selected live row starts ticked.
     @objc func toggleSelectMode() {
         selecting.toggle()
         picked = []
@@ -7354,12 +7362,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         {
             picked.insert(id)
         }
-        table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("pick"))?.isHidden = !selecting
         sendBar.isHidden = !selecting
         fitBottomStrip()
-        drawSelectButton()
         drawTagPick()
         refreshTable(full: true)
+        table.reloadData(forRowIndexes: IndexSet(integer: 0), columnIndexes: IndexSet(table.tableColumns.indices))
         drawPickCount()
         if selecting { window?.makeFirstResponder(messageField) } else { focusTable() }
     }
@@ -7382,13 +7389,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private func pickCell(_ session: Session, past: Bool) -> NSView? {
         guard !past, let id = session.summary.session_id else { return nil }
         let box = NSButton(checkboxWithTitle: "", target: self, action: #selector(togglePick(_:)))
+        box.controlSize = .mini
         box.identifier = NSUserInterfaceItemIdentifier(id)
         box.state = picked.contains(id) ? .on : .off
         let blocker = sendBlocker(session, past: past)
         box.isEnabled = blocker == nil
         box.toolTip = blocker ?? "Send the message to this session"
         box.setAccessibilityLabel("Send to \(session.peer_name ?? id)")
-        return CentredCell(box, leading: 4, trailing: 0)
+        return CentredCell(box, leading: 0, trailing: 0)
     }
 
     @objc private func togglePick(_ sender: NSButton) {
@@ -7589,6 +7597,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             top = title
             // Claude Code's own name for the session, under the topic ours derives.
             bottom = s.session_name ?? ""
+        case "dots" where selecting && !past:
+            // The checkbox is drawn by pickCell; this only makes a change of tick
+            // or of what blocks one redraw the cell.
+            let state = (s.session_id.map(picked.contains) ?? false ? "on" : "off") + (sendBlocker(session, past: past) ?? "")
+            return CellContent(
+                text: NSAttributedString(string: state), heat: nil, percent: nil, past: past, drop: drop, alignment: .left)
         case "dots":
             let line = NSMutableAttributedString()
             for dot in tagStore.marks(s.session_id, s.project_dir).dots { line.append(mono("●", dot.color)) }
@@ -7714,12 +7728,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         case "context":
             return CellContent(
                 text: NSAttributedString(), heat: nil, percent: s.context, past: past, drop: drop, alignment: .left)
-        case "pick":
-            // The checkbox is drawn by pickCell; this only makes a change of tick
-            // or of what blocks one redraw the cell.
-            let state = (s.session_id.map(picked.contains) ?? false ? "on" : "off") + (sendBlocker(session, past: past) ?? "")
-            return CellContent(
-                text: NSAttributedString(string: state), heat: nil, percent: nil, past: past, drop: drop, alignment: .left)
         case "heat":
             // A stripe beside the cache, not a wash behind it: the colour is a
             // scale to read along, and a tinted cell fights the text in it.
@@ -7808,7 +7816,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let c = shownContent(key, row: row)
         let drop = c.drop
         if key == "context" { return progressCell(c.percent, past: past, drop: drop, key: s.session_id) }
-        if key == "pick" { return pickCell(session, past: past) }
+        // In Select mode a live row's dots give way to its checkbox.
+        if key == "dots", selecting, !past { return pickCell(session, past: past) }
         if key == "dots" { return dotsCell(tagStore.marks(s.session_id, s.project_dir).dots, past: past, drop: drop) }
         let heat = c.heat
         let alignment = c.alignment
