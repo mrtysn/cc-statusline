@@ -2851,6 +2851,36 @@ func typeInTerminal(tty: String, _ command: String) -> String {
     return runScript(script, label: "restart \(tty)")
 }
 
+/// Pastes text into the iTerm session on this tty and presses Return, so a
+/// message of several lines arrives as one prompt: inside a bracketed paste
+/// Claude Code takes a line break as text, not as Return. "ok", or "not found"
+/// when no session has the tty any more.
+func pasteInTerminal(tty: String, _ text: String) -> String {
+    let quoted = text.replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        .components(separatedBy: "\n").joined(separator: "\" & linefeed & \"")
+    let script = """
+        set esc to character id 27
+        tell application "iTerm2"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "\(tty)" then
+                  tell s to write text (esc & "[200~" & "\(quoted)" & esc & "[201~") newline no
+                  -- Return as its own key, once the paste has landed.
+                  delay 0.3
+                  tell s to write text (character id 13) newline no
+                  return "ok"
+                end if
+              end repeat
+            end repeat
+          end repeat
+        end tell
+        return "not found"
+        """
+    return runScript(script, label: "send \(tty)")
+}
+
 /// True once the process is gone, false if it outlasts the wait.
 func waitForExit(_ pid: pid_t, seconds: Double) -> Bool {
     let deadline = Date().addingTimeInterval(seconds)
@@ -5609,7 +5639,7 @@ func promptNewTag(store: TagStore, on window: NSWindow, note: String, then: @esc
 }
 
 final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation,
-    NSMenuDelegate
+    NSMenuDelegate, NSTextFieldDelegate
 {
     private let statusLabel = StatusLabel()
     private let quotaBar = NSStackView()
@@ -5664,9 +5694,24 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
     private let guardsLabel = NSTextField(labelWithString: "")
-    /// The table reaches the window's bottom, or stops above the guards line while it shows.
+    /// The send bar over the guards line, under the table; each shows only while it has something.
+    private let bottomStack = NSStackView()
+    /// The table reaches the window's bottom, or stops above the bottom strip while it shows.
     private var tableToBottom: NSLayoutConstraint?
-    private var tableToGuards: NSLayoutConstraint?
+    private var tableToStrip: NSLayoutConstraint?
+    /// Select mode: a checkbox on each live row and the send bar, to type one
+    /// message into several sessions.
+    private var selecting = false
+    /// The ticked sessions, by id, so a tick stays with its session as rows re-sort.
+    private var picked: Set<String> = []
+    private let selectButton = NSButton(title: "", target: nil, action: nil)
+    private let sendBar = NSStackView()
+    private let pickedLabel = NSTextField(labelWithString: "")
+    private let tagPick = NSPopUpButton(frame: .zero, pullsDown: true)
+    /// The filter behind each tag pick entry, in order; nil for the title and separators.
+    private var tagPickChoices: [TagFilter?] = []
+    private let messageField = NSTextField()
+    private let sendButton = NSButton(title: "Send", target: nil, action: nil)
     private let filterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// Every session in the last snapshot; `rows` is what the filter lets through.
     private var allRows: [(session: Session, past: Bool)] = []
@@ -5817,15 +5862,24 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         guardsLabel.textColor = Palette.yellow
         guardsLabel.font = NSFont.systemFont(ofSize: 11)
         guardsLabel.toolTip = "Turned off in the Guards menu; each stays off until turned back on there"
-        guardsLabel.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(guardsLabel)
+        buildSendBar()
+        bottomStack.orientation = .vertical
+        bottomStack.alignment = .leading
+        bottomStack.spacing = 8
+        bottomStack.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 10, right: 16)
+        bottomStack.translatesAutoresizingMaskIntoConstraints = false
+        bottomStack.addArrangedSubview(sendBar)
+        bottomStack.addArrangedSubview(guardsLabel)
+        content.addSubview(bottomStack)
         tableToBottom = gridScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor)
-        tableToGuards = gridScroll.bottomAnchor.constraint(equalTo: guardsLabel.topAnchor, constant: -8)
+        tableToStrip = gridScroll.bottomAnchor.constraint(equalTo: bottomStack.topAnchor)
 
         NSLayoutConstraint.activate([
-            guardsLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            guardsLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
-            guardsLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
+            bottomStack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            bottomStack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            bottomStack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sendBar.widthAnchor.constraint(equalTo: bottomStack.widthAnchor, constant: -32),
+            guardsLabel.trailingAnchor.constraint(lessThanOrEqualTo: bottomStack.trailingAnchor, constant: -16),
             quotaBar.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             usageButton.leadingAnchor.constraint(equalTo: quotaBar.trailingAnchor, constant: 8),
@@ -5859,6 +5913,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     // last column off the screen. The account-wide quotas are not here — they are
     // the same for every session, so they live in the bar above the table.
     private let columns: [Column] = [
+        // Select mode's checkboxes; hidden outside it.
+        Column(key: "pick", title: "", width: 22),
         Column(key: "age", title: "Last Seen", width: 74),
         // Beside the directory, as the heat stripe sits beside the cache: the
         // session's dots, stacked, without a title.
@@ -5899,7 +5955,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             // Each column sorts by what it means, not by the text it shows:
             // model by capability, effort by level, cache by time left.
-            column.sortDescriptorPrototype = NSSortDescriptor(key: spec.key, ascending: true)
+            // The ticks are not an order.
+            if spec.key == "pick" { column.isHidden = true } else {
+                column.sortDescriptorPrototype = NSSortDescriptor(key: spec.key, ascending: true)
+            }
             table.addTableColumn(column)
         }
         // The caches about to go cold first, until a header is clicked; with
@@ -5956,8 +6015,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         repoTagsButton.target = self
         repoTagsButton.action = #selector(openRepoTags)
         repoTagsButton.toolTip = "Repo Tags: every tag in local-repos-list, its colour and its folders"
+        selectButton.isBordered = false
+        selectButton.target = self
+        selectButton.action = #selector(toggleSelectMode)
+        drawSelectButton()
         let top = NSStackView(views: [soundControls.volumeRow, gap, packButton])
-        listControls.setViews([filterPopup, repoTagsButton], in: .leading)
+        listControls.setViews([filterPopup, repoTagsButton, selectButton], in: .leading)
         listControls.spacing = 12
         listControls.translatesAutoresizingMaskIntoConstraints = false
         top.spacing = 8
@@ -6189,6 +6252,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// After a tag changes: the popup lists it, and the rows show it.
     private func tagsChanged() {
         drawFilterPopup()
+        drawTagPick()
         applyFilter()
     }
 
@@ -6292,8 +6356,57 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             if bypassed() || !guardsLabel.isHidden { problems.append("\(hook) stays bypassed after the Guards menu turned it back on") }
         }
 
+        problems += selectModeProblems(fixture: fixture)
+
         // Layout: resizes, fits the screen, shrinks to its minimum.
         problems += WindowChecks.verify(window).map { "window: \($0)" }
+        return problems
+    }
+
+    /// Select mode over the fixture: a checkbox on each live row that has a terminal and none on a
+    /// finished one, the bar under the table, Send only with a tick and a message, and all of it gone on leaving.
+    private func selectModeProblems(fixture: Snapshot) -> [String] {
+        var problems: [String] = []
+        guard let pick = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "pick" }) else {
+            return ["no pick column"]
+        }
+        if !table.tableColumns[pick].isHidden || !sendBar.isHidden { problems.append("Select mode shows before it is entered") }
+        table.deselectAll(nil)
+        toggleSelectMode()
+        if table.tableColumns[pick].isHidden { problems.append("Select mode does not show the checkboxes") }
+        if sendBar.isHidden || bottomStack.isHidden { problems.append("Select mode does not show the send bar") }
+        if tableToStrip?.isActive != true { problems.append("the table runs under the send bar") }
+        problems += textCellProblems(table, name: "sessions table in Select mode")
+        func box(_ id: String) -> NSButton? {
+            guard let row = rows.firstIndex(where: { $0.session.summary.session_id == id }) else { return nil }
+            return (table.view(atColumn: pick, row: row + 1, makeIfNecessary: true) as? CentredCell)?.content as? NSButton
+        }
+        guard let withTerminal = box("fixture-a") else { return problems + ["the live fixture with a terminal has no checkbox"] }
+        if !withTerminal.isEnabled { problems.append("a live session with a terminal cannot be ticked") }
+        if box("fixture-b")?.isEnabled == true { problems.append("a session with no terminal can be ticked") }
+        if box("fixture-c") != nil { problems.append("a finished session has a checkbox") }
+        if sendButton.isEnabled { problems.append("Send is enabled with nothing ticked") }
+        withTerminal.state = .on
+        togglePick(withTerminal)
+        messageField.stringValue = "fixture message"
+        drawPickCount()
+        if picked != ["fixture-a"] || pickedLabel.stringValue != "1 ticked" {
+            problems.append("ticking one session reads \(picked) and \"\(pickedLabel.stringValue)\"")
+        }
+        if !sendButton.isEnabled { problems.append("Send is disabled with a tick and a message") }
+        if tagPickChoices.count != tagPick.numberOfItems { problems.append("the tag pull-down and its choices disagree") }
+        pickNone()
+        if !picked.isEmpty || sendButton.isEnabled { problems.append("none leaves sessions ticked") }
+        // The picture of Select mode keeps its tick and message.
+        if ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_SELECTING"] == "1" {
+            picked = ["fixture-a"]
+            pickedChanged()
+            return problems
+        }
+        messageField.stringValue = ""
+        toggleSelectMode()
+        if !table.tableColumns[pick].isHidden || !sendBar.isHidden { problems.append("leaving Select mode leaves it on screen") }
+        if tableToBottom?.isActive != true { problems.append("the table does not reach the bottom after Select mode") }
         return problems
     }
 
@@ -6345,6 +6458,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let past = snapshot.live.filter(ended) + snapshot.history
         allRows = live.map { ($0, false) } + past.map { ($0, true) }
         rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id, $0.session.summary.project_dir) }
+        // A tick goes with its session when it ends.
+        picked.formIntersection(live.compactMap { $0.summary.session_id })
+        if selecting { drawPickCount() }
         counts = "\(live.count) live · \(past.count) finished"
         toolCost = (cost, footprint)
         healthIssues = snapshot.health ?? []
@@ -6715,6 +6831,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             item.title = "Show Sessions Shortcuts\u{2026} (\(shown.isEmpty ? "Unset" : shown.joined(separator: ", ")))"
             return true
         }
+        if item.action == #selector(toggleSelectMode) {
+            item.state = selecting ? .on : .off
+            return true
+        }
         guard item.action == #selector(showSelectedTerminal) else { return true }
         item.title = selected?.past == true ? "Resume Session" : "Show Terminal"
         return selected != nil
@@ -6736,9 +6856,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             .filter { GuardBypassAll.on($0.0) }.map(\.1)
         guardsLabel.stringValue = off.isEmpty ? "" : "\u{26A0}\u{FE0E} \(off.joined(separator: " and ")) bypassed for all sessions"
         guardsLabel.isHidden = off.isEmpty
+        fitBottomStrip()
+    }
+
+    /// The table stops above the strip under it while the send bar or the guards line shows.
+    private func fitBottomStrip() {
+        let empty = sendBar.isHidden && guardsLabel.isHidden
+        bottomStack.isHidden = empty
         // Off before on, so the two are never active together.
-        if off.isEmpty { tableToGuards?.isActive = false; tableToBottom?.isActive = true }
-        else { tableToBottom?.isActive = false; tableToGuards?.isActive = true }
+        if empty { tableToStrip?.isActive = false; tableToBottom?.isActive = true }
+        else { tableToBottom?.isActive = false; tableToStrip?.isActive = true }
     }
 
     @objc func copySelectedSessionId() {
@@ -7159,6 +7286,238 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
+    // MARK: Sending a message
+
+    /// The bar under the table in Select mode: how many are ticked, quick ways
+    /// to tick more, the message and Send.
+    private func buildSendBar() {
+        let small = NSFont.systemFont(ofSize: 11)
+        func link(_ title: String, _ action: Selector, _ tip: String) -> NSButton {
+            let button = NSButton(title: "", target: self, action: action)
+            button.isBordered = false
+            button.attributedTitle = NSAttributedString(string: title, attributes: [.font: small, .foregroundColor: Palette.text])
+            button.toolTip = tip
+            return button
+        }
+        pickedLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        pickedLabel.textColor = Palette.dim
+        let pickWord = NSTextField(labelWithString: "Tick:")
+        pickWord.font = small
+        pickWord.textColor = Palette.dim
+        let yourTurn = link("at your turn", #selector(pickYourTurn), "Tick every listed session that is waiting for your prompt")
+        tagPick.controlSize = .small
+        tagPick.font = small
+        tagPick.isBordered = false
+        tagPick.target = self
+        tagPick.action = #selector(pickTagged)
+        tagPick.toolTip = "Tick every listed session with one dot or tag"
+        let none = link("none", #selector(pickNone), "Untick every session")
+        messageField.placeholderString = "Message, typed into each ticked session as if by you · ⌥↩ new line · esc to leave"
+        messageField.font = NSFont.systemFont(ofSize: 12)
+        messageField.usesSingleLineMode = false
+        messageField.cell?.wraps = false
+        messageField.cell?.isScrollable = true
+        messageField.delegate = self
+        messageField.toolTip = "Pasted into each ticked session's iTerm tab and sent with Return. A session mid-turn "
+            + "queues it; text already typed in a session's prompt is sent along with it."
+        messageField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        messageField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        sendButton.target = self
+        sendButton.action = #selector(sendToPicked)
+        sendButton.bezelStyle = .rounded
+        sendButton.controlSize = .small
+        let done = link("done", #selector(toggleSelectMode), "Leave Select mode (esc)")
+        sendBar.setViews([pickedLabel, pickWord, yourTurn, tagPick, none, messageField, sendButton, done], in: .leading)
+        sendBar.orientation = .horizontal
+        sendBar.alignment = .centerY
+        sendBar.spacing = 10
+        sendBar.setCustomSpacing(16, after: pickedLabel)
+        sendBar.setCustomSpacing(16, after: none)
+        sendBar.isHidden = true
+    }
+
+    private func drawSelectButton() {
+        selectButton.attributedTitle = NSAttributedString(
+            string: selecting ? "done" : "send message",
+            attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: selecting ? Palette.text : Palette.dim])
+        selectButton.toolTip = selecting
+            ? "Leave Select mode (esc)" : "Tick live sessions and type one message into all of them (⇧⌘S)"
+    }
+
+    /// Session ▸ Send Message to Sessions…, ⇧⌘S and the header's button: shows or
+    /// hides the checkboxes and the send bar. A selected live row starts ticked.
+    @objc func toggleSelectMode() {
+        selecting.toggle()
+        picked = []
+        if selecting, let entry = selected, sendBlocker(entry.session, past: entry.past) == nil,
+            let id = entry.session.summary.session_id
+        {
+            picked.insert(id)
+        }
+        table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("pick"))?.isHidden = !selecting
+        sendBar.isHidden = !selecting
+        fitBottomStrip()
+        drawSelectButton()
+        drawTagPick()
+        refreshTable(full: true)
+        drawPickCount()
+        if selecting { window?.makeFirstResponder(messageField) } else { focusTable() }
+    }
+
+    /// Esc anywhere in the window leaves Select mode.
+    override func cancelOperation(_ sender: Any?) {
+        if selecting { toggleSelectMode() }
+    }
+
+    /// Why a session cannot be sent a message, or nil when it can. An open
+    /// question or permission prompt would take the text as its answer.
+    private func sendBlocker(_ session: Session, past: Bool) -> String? {
+        if past { return "Finished" }
+        guard session.tty != nil else { return "Its terminal is unknown" }
+        let (word, colour) = stateWords(session, past: false)
+        if colour == Palette.yellow { return "Waiting on a prompt (\(word)); answer it in its tab" }
+        return nil
+    }
+
+    private func pickCell(_ session: Session, past: Bool) -> NSView? {
+        guard !past, let id = session.summary.session_id else { return nil }
+        let box = NSButton(checkboxWithTitle: "", target: self, action: #selector(togglePick(_:)))
+        box.identifier = NSUserInterfaceItemIdentifier(id)
+        box.state = picked.contains(id) ? .on : .off
+        let blocker = sendBlocker(session, past: past)
+        box.isEnabled = blocker == nil
+        box.toolTip = blocker ?? "Send the message to this session"
+        box.setAccessibilityLabel("Send to \(session.peer_name ?? id)")
+        return CentredCell(box, leading: 4, trailing: 0)
+    }
+
+    @objc private func togglePick(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        if sender.state == .on { picked.insert(id) } else { picked.remove(id) }
+        drawPickCount()
+    }
+
+    /// The listed live sessions that can be sent a message now.
+    private var sendable: [Session] {
+        rows.filter { !$0.past && sendBlocker($0.session, past: false) == nil }.map(\.session)
+    }
+
+    @objc private func pickYourTurn() {
+        let ready = sendable.filter { stateWords($0, past: false).0 == "your turn" }
+        picked.formUnion(ready.compactMap(\.summary.session_id))
+        pickedChanged()
+        if ready.isEmpty { note("No listed session is at your turn") }
+    }
+
+    @objc private func pickTagged() {
+        let index = tagPick.indexOfSelectedItem
+        guard index >= 0, index < tagPickChoices.count, let filter = tagPickChoices[index] else { return }
+        let matching = sendable.filter { tagStore.matches(filter, $0.summary.session_id, $0.summary.project_dir) }
+        picked.formUnion(matching.compactMap(\.summary.session_id))
+        pickedChanged()
+        if matching.isEmpty { note("No listed session that can take a message has it") }
+    }
+
+    @objc private func pickNone() {
+        picked = []
+        pickedChanged()
+    }
+
+    private func pickedChanged() {
+        refreshTable()
+        drawPickCount()
+    }
+
+    /// The count and whether Send can go.
+    private func drawPickCount() {
+        pickedLabel.stringValue = picked.isEmpty ? "none ticked" : "\(picked.count) ticked"
+        sendButton.isEnabled = !picked.isEmpty
+            && !messageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The same dots and tags as the filter popup, as a pull-down that ticks.
+    private func drawTagPick() {
+        tagPick.removeAllItems()
+        tagPickChoices = []
+        let menu = tagPick.menu ?? NSMenu()
+        // A pull-down shows its first item as its title.
+        menu.addItem(NSMenuItem(title: "tag", action: nil, keyEquivalent: ""))
+        tagPickChoices.append(nil)
+        for (index, choice) in filterChoices.enumerated() where index > 0 {
+            guard let choice, let source = filterPopup.item(at: index) else {
+                menu.addItem(.separator())
+                tagPickChoices.append(nil)
+                continue
+            }
+            let item = NSMenuItem(title: source.title, action: nil, keyEquivalent: "")
+            item.image = source.image
+            menu.addItem(item)
+            tagPickChoices.append(choice)
+        }
+    }
+
+    func controlTextDidChange(_ notification: Notification) { drawPickCount() }
+
+    /// In the message: Return sends, ⌥Return breaks the line, esc leaves Select mode.
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        guard control == messageField else { return false }
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)):
+            sendToPicked()
+            return true
+        case #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+            textView.insertText("\n", replacementRange: textView.selectedRange())
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            toggleSelectMode()
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Pastes the message into every ticked session's tab, one after another,
+    /// then says which got it and which did not, and why.
+    @objc private func sendToPicked() {
+        let text = messageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !picked.isEmpty else { return }
+        let live = allRows.filter { !$0.past }.map(\.session)
+        var targets: [(name: String, tty: String)] = []
+        var skipped: [String] = []
+        for id in picked.sorted() {
+            guard let session = live.first(where: { $0.summary.session_id == id }) else {
+                skipped.append("\(id.prefix(8)) (ended)")
+                continue
+            }
+            let name = session.peer_name ?? String(id.prefix(8))
+            if let blocker = sendBlocker(session, past: false) {
+                skipped.append("\(name) (\(blocker.lowercased()))")
+            } else if let tty = session.tty {
+                targets.append((name, tty))
+            }
+        }
+        note("Sending to \(targets.count)…", seconds: 30)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, skipped] in
+            var skipped = skipped
+            var sent: [String] = []
+            for target in targets {
+                if pasteInTerminal(tty: target.tty, text) == "ok" { sent.append(target.name) }
+                else { skipped.append("\(target.name) (no iTerm tab)") }
+            }
+            log("send message: sent to \(sent.count), skipped \(skipped.count): \(skipped)")
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                var words = sent.isEmpty ? "Sent to none" : "Sent to \(sent.joined(separator: ", "))"
+                if !skipped.isEmpty { words += " · skipped \(skipped.joined(separator: ", "))" }
+                self.note(words, seconds: skipped.isEmpty ? 6 : 15)
+                self.statusLabel.toolTip = words
+                guard !sent.isEmpty else { return }
+                self.messageField.stringValue = ""
+                if self.selecting { self.toggleSelectMode() }
+            }
+        }
+    }
+
     /// A line of feedback for an action that changes nothing on screen.
     /// The guards switched off for a session: the tag the sessions table shows
     /// and the words VoiceOver reads. One line per guard.
@@ -7355,6 +7714,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         case "context":
             return CellContent(
                 text: NSAttributedString(), heat: nil, percent: s.context, past: past, drop: drop, alignment: .left)
+        case "pick":
+            // The checkbox is drawn by pickCell; this only makes a change of tick
+            // or of what blocks one redraw the cell.
+            let state = (s.session_id.map(picked.contains) ?? false ? "on" : "off") + (sendBlocker(session, past: past) ?? "")
+            return CellContent(
+                text: NSAttributedString(string: state), heat: nil, percent: nil, past: past, drop: drop, alignment: .left)
         case "heat":
             // A stripe beside the cache, not a wash behind it: the colour is a
             // scale to read along, and a tinted cell fights the text in it.
@@ -7443,6 +7808,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let c = shownContent(key, row: row)
         let drop = c.drop
         if key == "context" { return progressCell(c.percent, past: past, drop: drop, key: s.session_id) }
+        if key == "pick" { return pickCell(session, past: past) }
         if key == "dots" { return dotsCell(tagStore.marks(s.session_id, s.project_dir).dots, past: past, drop: drop) }
         let heat = c.heat
         let alignment = c.alignment
@@ -8213,9 +8579,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// It reads no Claude data, starts no watcher or sender, and writes only under `selfTestRoot`.
     private func runSelfTest() {
         let now = Date().timeIntervalSince1970
-        func session(_ id: String, dir: String, topic: String, ended: Bool) -> String {
+        func session(_ id: String, dir: String, topic: String, ended: Bool, tty: String? = nil) -> String {
             """
             {"updated_at": \(now), "active_at": \(now), "rows": ["fixture", "fixture"],
+             \(tty.map { "\"tty\": \"\($0)\"," } ?? "")
              \(ended ? "\"ended\": {\"reason\": \"exited\", \"at\": \(now)}," : "")
              "summary": {"session_id": "\(id)", "model": "Opus", "effort": "high", "context": 12,
                          "topic": "\(topic)", "cwd": "\(dir)", "project_dir": "\(dir)"},
@@ -8223,7 +8590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """
         }
         let json = """
-            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false)),
+            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, tty: "/dev/ttys999")),
                       \(session("fixture-b", dir: "/fixture/two", topic: "second fixture", ended: false))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
             """
@@ -8240,6 +8607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         problems += LeaderboardWindow.selfTestProblems()
         // CC_SESSIONS_WINDOW_PNG=<path> saves the list window's picture, to read its top row without opening the app.
         // CC_SESSIONS_WINDOW_BYPASS_ALL=1 draws it with both guards bypassed for all sessions, as the Guards menu leaves it.
+        // CC_SESSIONS_WINDOW_SELECTING=1 draws it in Select mode, one session ticked and a message typed.
         if ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_BYPASS_ALL"] == "1", let controller {
             controller.toggleSSHBypassAll()
             controller.toggleSpawnBypassAll()
@@ -8304,6 +8672,9 @@ func buildMenu() {
         keyEquivalent: "\r")
     showItem.keyEquivalentModifierMask = [.command]
     sessionMenu.addItem(.separator())
+    sessionMenu.addItem(
+        withTitle: "Send Message to Sessions…", action: #selector(SessionsWindow.toggleSelectMode),
+        keyEquivalent: "S")
     sessionMenu.addItem(
         withTitle: "Restart Outdated Sessions…", action: #selector(SessionsWindow.restartOutdatedSessions),
         keyEquivalent: "")
