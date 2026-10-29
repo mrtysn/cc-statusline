@@ -2851,34 +2851,91 @@ func typeInTerminal(tty: String, _ command: String) -> String {
     return runScript(script, label: "restart \(tty)")
 }
 
-/// Pastes text into the iTerm session on this tty and presses Return, so a
-/// message of several lines arrives as one prompt: inside a bracketed paste
-/// Claude Code takes a line break as text, not as Return. "ok", or "not found"
-/// when no session has the tty any more.
-func pasteInTerminal(tty: String, _ text: String) -> String {
-    let quoted = text.replacingOccurrences(of: "\r\n", with: "\n")
-        .replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        .components(separatedBy: "\n").joined(separator: "\" & linefeed & \"")
-    let script = """
-        set esc to character id 27
-        tell application "iTerm2"
-          repeat with w in windows
-            repeat with t in tabs of w
-              repeat with s in sessions of t
-                if tty of s is "\(tty)" then
-                  tell s to write text (esc & "[200~" & "\(quoted)" & esc & "[201~") newline no
-                  -- Return as its own key, once the paste has landed.
-                  delay 0.3
-                  tell s to write text (character id 13) newline no
-                  return "ok"
-                end if
-              end repeat
-            end repeat
-          end repeat
-        end tell
-        return "not found"
-        """
-    return runScript(script, label: "send \(tty)")
+/// Sends one message to several sessions by name, through a headless Haiku
+/// session that calls SendMessage: Claude Code's own channel between sessions,
+/// so nothing is typed into a terminal and a session busy or at a prompt gets it
+/// at its next step. The relay runs under the name `cc-sessions-relay`, which the
+/// shared rules read as the user's own words. Its PreToolUse hook
+/// (`cc-statusline.js relay-hook`) puts the exact text into every send and lets
+/// it go only to these names, once each, so the model cannot reword or misroute
+/// it; the user's own settings and hooks are not loaded. Returns, per name, nil
+/// when it was delivered, else why not.
+func relayMessage(_ text: String, to names: [String]) -> [String: String?] {
+    var outcome: [String: String?] = Dictionary(uniqueKeysWithValues: names.map { ($0, "not sent") })
+    let dir = fm.temporaryDirectory.appendingPathComponent("cc-sessions-relay-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: dir) }
+    let relay = dir.appendingPathComponent("relay.json")
+    do {
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["text": text, "to": names]).write(to: relay)
+    } catch {
+        log("relay: \(error.localizedDescription)")
+        return outcome.mapValues { _ in "could not start the relay" }
+    }
+    let quote = { (text: String) in "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let hook = quote(repoDir.appendingPathComponent("cc-statusline.js").path) + " relay-hook"
+    let settings: [String: Any] = ["hooks": ["PreToolUse": [["matcher": "*", "hooks": [["type": "command", "command": hook]]]]]]
+    guard let settingsJSON = (try? JSONSerialization.data(withJSONObject: settings)).flatMap({ String(data: $0, encoding: .utf8) })
+    else { return outcome }
+    // A name the model skipped gets one more run.
+    for _ in 0..<2 {
+        let pending = names.filter { outcome[$0] == "not sent" }
+        guard !pending.isEmpty else { break }
+        let prompt = "Call SendMessage once for each of these names, all at once in one parallel batch: "
+            + pending.joined(separator: ", ")
+            + ". Set `to` to the name and `message` to \"-\": the text is filled in for you. Call no other tool,"
+            + " retry nothing, and reply only \"done\"."
+        let task = scriptProcess(URL(fileURLWithPath: "/usr/bin/env"), [
+            "claude", "-p", "--model", "haiku", "--name", "cc-sessions-relay",
+            "--setting-sources", "project", "--settings", settingsJSON,
+            "--allowedTools", "SendMessage", "--no-session-persistence",
+            "--output-format", "stream-json", "--verbose",
+        ])
+        task.currentDirectoryURL = dir
+        task.environment?["CC_SESSIONS_RELAY"] = relay.path
+        let input = Pipe(), output = Pipe()
+        task.standardInput = input
+        task.standardOutput = output
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch {
+            log("relay: claude did not start: \(error.localizedDescription)")
+            return outcome.mapValues { $0 == "not sent" ? "claude did not start" : $0 }
+        }
+        input.fileHandleForWriting.write(Data(prompt.utf8))
+        try? input.fileHandleForWriting.close()
+        let deadline = DispatchWorkItem { if task.isRunning { task.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 120, execute: deadline)
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        deadline.cancel()
+        // The stream's SendMessage calls, by id, and what each one returned.
+        var callTo: [String: String] = [:]
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            guard let event = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let blocks = (event["message"] as? [String: Any])?["content"] as? [[String: Any]] else { continue }
+            for block in blocks {
+                if block["type"] as? String == "tool_use", block["name"] as? String == "SendMessage",
+                   let id = block["id"] as? String, let to = (block["input"] as? [String: Any])?["to"] as? String {
+                    callTo[id] = to
+                } else if block["type"] as? String == "tool_result", let id = block["tool_use_id"] as? String,
+                          let to = callTo[id], outcome[to] != nil {
+                    let content = block["content"] as? String
+                        ?? (block["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? ""
+                    // A send answers JSON, {success, message}; a refusal by the hook, plain text.
+                    let answer = (try? JSONSerialization.jsonObject(with: Data(content.utf8))) as? [String: Any]
+                    if block["is_error"] as? Bool != true, answer?["success"] as? Bool == true {
+                        outcome[to] = .some(nil)
+                    } else if outcome[to] == "not sent" {
+                        let why = answer?["message"] as? String ?? content.replacingOccurrences(of: "Error: ", with: "")
+                        outcome[to] = String((why.split(separator: "\n").first ?? "refused").prefix(80))
+                    }
+                }
+            }
+        }
+        if task.terminationReason == .uncaughtSignal { log("relay: timed out after 120 s") }
+    }
+    log("relay: \(names.count) names, \(outcome.values.filter { $0 == nil }.count) delivered")
+    return outcome
 }
 
 /// True once the process is gone, false if it outlasts the wait.
@@ -6363,7 +6420,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return problems
     }
 
-    /// Select mode over the fixture: a checkbox on each live row that has a terminal and none on a
+    /// Select mode over the fixture: a checkbox on each live row that has a peer name and none on a
     /// finished one, the bar under the table, Send only with a tick and a message, and all of it gone on leaving.
     private func selectModeProblems(fixture: Snapshot) -> [String] {
         var problems: [String] = []
@@ -6384,13 +6441,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if sendBar.isHidden || bottomStack.isHidden { problems.append("Select mode does not show the send bar") }
         if tableToStrip?.isActive != true { problems.append("the table runs under the send bar") }
         problems += textCellProblems(table, name: "sessions table in Select mode")
-        guard let withTerminal = box("fixture-a") else { return problems + ["the live fixture with a terminal has no checkbox"] }
-        if !withTerminal.isEnabled { problems.append("a live session with a terminal cannot be ticked") }
-        if box("fixture-b")?.isEnabled == true { problems.append("a session with no terminal can be ticked") }
+        guard let withPeer = box("fixture-a") else { return problems + ["the live fixture with a peer name has no checkbox"] }
+        if !withPeer.isEnabled { problems.append("a live session with a peer name cannot be ticked") }
+        if box("fixture-b")?.isEnabled == true { problems.append("a session with no peer name can be ticked") }
         if box("fixture-c") != nil { problems.append("a finished session has a checkbox") }
         if sendButton.isEnabled { problems.append("Send is enabled with nothing ticked") }
-        withTerminal.state = .on
-        togglePick(withTerminal)
+        withPeer.state = .on
+        togglePick(withPeer)
         messageField.stringValue = "fixture message"
         drawPickCount()
         if picked != ["fixture-a"] || pickedLabel.stringValue != "1 ticked" {
@@ -7317,14 +7374,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         tagPick.action = #selector(pickTagged)
         tagPick.toolTip = "Tick every listed session with one dot or tag"
         let none = link("none", #selector(pickNone), "Untick every session")
-        messageField.placeholderString = "Message, typed into each ticked session as if by you · ⌥↩ new line · esc to leave"
+        messageField.placeholderString = "Message to each ticked session, from you · ⌥↩ new line · esc to leave"
         messageField.font = NSFont.systemFont(ofSize: 12)
         messageField.usesSingleLineMode = false
         messageField.cell?.wraps = false
         messageField.cell?.isScrollable = true
         messageField.delegate = self
-        messageField.toolTip = "Pasted into each ticked session's iTerm tab and sent with Return. A session mid-turn "
-            + "queues it; text already typed in a session's prompt is sent along with it."
+        messageField.toolTip = "Sent by a small Haiku relay session as a message between sessions, under the name "
+            + "cc-sessions-relay. A busy session or one at a prompt reads it at its next step; one started with "
+            + "bypassed permissions may hold it for you to approve."
         messageField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         messageField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         sendButton.target = self
@@ -7376,13 +7434,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if selecting { toggleSelectMode() }
     }
 
-    /// Why a session cannot be sent a message, or nil when it can. An open
-    /// question or permission prompt would take the text as its answer.
+    /// Why a session cannot be sent a message, or nil when it can. The message
+    /// goes by the session's peer name, which only a live interactive session has.
     private func sendBlocker(_ session: Session, past: Bool) -> String? {
         if past { return "Finished" }
-        guard session.tty != nil else { return "Its terminal is unknown" }
-        let (word, colour) = stateWords(session, past: false)
-        if colour == Palette.yellow { return "Waiting on a prompt (\(word)); answer it in its tab" }
+        if session.peer_name == nil { return "It has no peer name to message it by" }
         return nil
     }
 
@@ -7484,33 +7540,34 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
-    /// Pastes the message into every ticked session's tab, one after another,
-    /// then says which got it and which did not, and why.
+    /// Sends the message to every ticked session through the relay, then says
+    /// which got it and which did not, and why.
     @objc private func sendToPicked() {
         let text = messageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !picked.isEmpty else { return }
         let live = allRows.filter { !$0.past }.map(\.session)
-        var targets: [(name: String, tty: String)] = []
+        var targets: [String] = []
         var skipped: [String] = []
         for id in picked.sorted() {
             guard let session = live.first(where: { $0.summary.session_id == id }) else {
                 skipped.append("\(id.prefix(8)) (ended)")
                 continue
             }
-            let name = session.peer_name ?? String(id.prefix(8))
             if let blocker = sendBlocker(session, past: false) {
-                skipped.append("\(name) (\(blocker.lowercased()))")
-            } else if let tty = session.tty {
-                targets.append((name, tty))
+                skipped.append("\(id.prefix(8)) (\(blocker.lowercased()))")
+            } else if let name = session.peer_name {
+                targets.append(name)
             }
         }
-        note("Sending to \(targets.count)…", seconds: 30)
+        sendButton.isEnabled = false
+        note("Sending to \(targets.count)…", seconds: 60)
         DispatchQueue.global(qos: .userInitiated).async { [weak self, skipped] in
             var skipped = skipped
             var sent: [String] = []
-            for target in targets {
-                if pasteInTerminal(tty: target.tty, text) == "ok" { sent.append(target.name) }
-                else { skipped.append("\(target.name) (no iTerm tab)") }
+            let outcome = targets.isEmpty ? [:] : relayMessage(text, to: targets)
+            for name in targets {
+                if case .some(.some(let why)) = outcome[name] { skipped.append("\(name) (\(why))") }
+                else { sent.append(name) }
             }
             log("send message: sent to \(sent.count), skipped \(skipped.count): \(skipped)")
             DispatchQueue.main.async {
@@ -7519,6 +7576,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 if !skipped.isEmpty { words += " · skipped \(skipped.joined(separator: ", "))" }
                 self.note(words, seconds: skipped.isEmpty ? 6 : 15)
                 self.statusLabel.toolTip = words
+                self.drawPickCount()
                 guard !sent.isEmpty else { return }
                 self.messageField.stringValue = ""
                 if self.selecting { self.toggleSelectMode() }
@@ -8588,10 +8646,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// It reads no Claude data, starts no watcher or sender, and writes only under `selfTestRoot`.
     private func runSelfTest() {
         let now = Date().timeIntervalSince1970
-        func session(_ id: String, dir: String, topic: String, ended: Bool, tty: String? = nil) -> String {
+        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil) -> String {
             """
             {"updated_at": \(now), "active_at": \(now), "rows": ["fixture", "fixture"],
-             \(tty.map { "\"tty\": \"\($0)\"," } ?? "")
+             \(peer.map { "\"peer_name\": \"\($0)\"," } ?? "")
              \(ended ? "\"ended\": {\"reason\": \"exited\", \"at\": \(now)}," : "")
              "summary": {"session_id": "\(id)", "model": "Opus", "effort": "high", "context": 12,
                          "topic": "\(topic)", "cwd": "\(dir)", "project_dir": "\(dir)"},
@@ -8599,7 +8657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """
         }
         let json = """
-            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, tty: "/dev/ttys999")),
+            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one")),
                       \(session("fixture-b", dir: "/fixture/two", topic: "second fixture", ended: false))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
             """
@@ -8730,6 +8788,16 @@ func buildMenu() {
 
     NSApp.mainMenu = main
     NSApp.windowsMenu = windowMenu
+}
+
+// `CC_SESSIONS_SEND_TO=<peer name> CC_SESSIONS_SEND_TEXT=<text>`: sends through the
+// relay as the send bar does, prints what each name got, and quits with no window, so
+// a change to the relay can be checked against a real session without clicking.
+if let names = ProcessInfo.processInfo.environment["CC_SESSIONS_SEND_TO"] {
+    let text = ProcessInfo.processInfo.environment["CC_SESSIONS_SEND_TEXT"] ?? "CC Sessions relay check; no reply needed."
+    let outcome = relayMessage(text, to: names.split(separator: ",").map(String.init))
+    for (name, why) in outcome.sorted(by: { $0.key < $1.key }) { print("\(name): \(why ?? "delivered")") }
+    exit(outcome.values.allSatisfy { $0 == nil } ? 0 : 1)
 }
 
 let app = NSApplication.shared

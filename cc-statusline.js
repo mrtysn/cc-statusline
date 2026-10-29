@@ -967,6 +967,39 @@ function recordSessionEnd(event) {
   }
 }
 
+// `cc-statusline.js relay-hook`, the PreToolUse hook of the Haiku session CC
+// Sessions starts to send one message to several sessions. CC_SESSIONS_RELAY
+// names a JSON file of { text, to }: each SendMessage goes out with exactly that
+// text, whatever the model wrote, and only to a name in `to`, once. Anything
+// else is refused, so a model that rewords or wanders sends nothing wrong.
+function relayHook() {
+  const answer = (decision, reason, updatedInput) => {
+    const out = { hookEventName: 'PreToolUse', permissionDecision: decision, permissionDecisionReason: reason };
+    if (updatedInput) out.updatedInput = updatedInput;
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: out }));
+  };
+  try {
+    const event = JSON.parse(readFileSync(0, 'utf8'));
+    const file = process.env.CC_SESSIONS_RELAY;
+    const relay = JSON.parse(readFileSync(file, 'utf8'));
+    const to = event.tool_input?.to;
+    if (event.tool_name !== 'SendMessage') return answer('deny', 'This session only relays SendMessage calls');
+    if (!relay.to.includes(to)) return answer('deny', `${to} is not a recipient; send only to ${relay.to.join(', ')}`);
+    // One send per recipient: a retry after a slow answer would deliver it twice.
+    const sent = `${file}.sent`;
+    const done = existsSync(sent) ? readFileSync(sent, 'utf8').split('\n') : [];
+    if (done.includes(to)) return answer('deny', `Already sent to ${to}`);
+    appendFileSync(sent, `${to}\n`);
+    // The input carries the text twice, as `message` and as `content`.
+    const input = { ...event.tool_input, message: relay.text, summary: 'message from the user, via CC Sessions' };
+    if ('content' in input) input.content = relay.text;
+    answer('allow', 'Relayed text', input);
+  } catch (err) {
+    logError(`relay-hook: ${err.message}`);
+    answer('deny', `relay-hook failed: ${err.message}`);
+  }
+}
+
 // What a session's transcript says it is doing, kept up to date by reading only
 // what was appended since the last snapshot: the first read of a session walks
 // the whole file once, every later one a few kilobytes. The running totals live
@@ -1677,6 +1710,8 @@ if (process.argv[2] === 'live') {
   } catch (err) {
     logError(`session-end: ${err.message}`);
   }
+} else if (process.argv[2] === 'relay-hook') {
+  relayHook();
 } else if (process.argv[2] === '--refresh-topic') {
   refreshTopic(process.argv[3], process.argv[4]);
 } else {
