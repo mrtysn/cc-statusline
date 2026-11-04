@@ -250,10 +250,26 @@ function readApiCreditConfig() {
     const grantedAt = Date.parse(config.granted_at);
     const expiresAt = Date.parse(config.expires_at);
     if (!(config.grant_usd > 0) || !Number.isFinite(grantedAt) || !Number.isFinite(expiresAt)) return null;
-    return { grant: config.grant_usd, grantedAt, expiresAt };
+    return rollApiCredit({ grant: config.grant_usd, grantedAt, expiresAt, renewDay: config.renew_day ?? null, assumed: false });
   } catch {
     return null;
   }
+}
+
+// The grant renews monthly: on `renew_day` at 00:00 UTC a new one of the same size
+// starts, and it lapses at 00:00 UTC on the day after `renew_day` the next month (the
+// Console showed 'next credit Nov 12' beside an old grant expiring 11/13). Once the
+// configured grant is over, the next period is assumed, never read: the reading says
+// so, and running set-api-credit.zsh again replaces the assumption with the Console's dates.
+function rollApiCredit(config, now = Date.now()) {
+  const day = config.renewDay;
+  if (!Number.isInteger(day) || day < 1 || day > 27 || now < config.expiresAt) return config;
+  const date = new Date(now);
+  let start = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), day);
+  if (start > now) start = Date.UTC(date.getUTCFullYear(), date.getUTCMonth() - 1, day);
+  const startDate = new Date(start);
+  const expiresAt = Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth() + 1, day + 1);
+  return { ...config, grantedAt: start, expiresAt, assumed: true };
 }
 
 function readApiCreditKey() {
@@ -284,6 +300,7 @@ function apiCreditFromReport(config, body) {
     spent,
     remaining: Math.max(0, config.grant - spent),
     expires_at: config.expiresAt,
+    assumed: config.assumed === true,
     data_refreshed_at: body.data_refreshed_at ? Date.parse(body.data_refreshed_at) : null,
   };
 }
@@ -296,8 +313,10 @@ async function refreshApiCredit() {
   const previous = readApiCreditCache();
   const next = { ...(previous || {}), fetched_at: Date.now(), error: null };
   try {
-    if (config.expiresAt - config.grantedAt > API_CREDIT_MAX_RANGE_MS) {
-      throw new Error('grant spans more than 31 days; the cost report takes at most 31');
+    // The report spans at most 31 days from the grant: the last day of a 32-day period
+    // goes uncounted, which is the credit's final hours.
+    if (Date.now() - config.grantedAt > API_CREDIT_MAX_RANGE_MS + 86400000) {
+      throw new Error('grant older than 32 days; run scripts/set-api-credit.zsh for the current one');
     }
     let key;
     try {

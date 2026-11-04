@@ -233,6 +233,8 @@ struct ApiCredit: Decodable {
     let remaining: Double?
     let expires_at: Double?
     let data_refreshed_at: Double?
+    /// The period was rolled forward from the configured renewal day, not read from the Console.
+    let assumed: Bool?
     let error: String?
 
     static func load() -> ApiCredit? {
@@ -3781,7 +3783,10 @@ final class UsageWindow: NSWindowController {
             if let remaining = credit.remaining, let grant = credit.grant, let spent = credit.spent {
                 row("left (estimate)", bar: grant > 0 ? spent / grant * 100 : nil,
                     "\(money(remaining)) of \(money(grant)) left",
-                    credit.expires_at.map { expired ? "expired \(plainMoment($0))" : "expires \(plainMoment($0))" } ?? "")
+                    credit.expires_at.map {
+                        (expired ? "expired \(plainMoment($0))" : "expires \(plainMoment($0))")
+                            + (credit.assumed == true ? " (renewal assumed)" : "")
+                    } ?? "")
                 row("spent since the grant", bar: nil, money(spent),
                     credit.data_refreshed_at.map { "counted up to \(ago($0)) ago" } ?? "")
             }
