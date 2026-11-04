@@ -233,6 +233,7 @@ struct ApiCredit: Decodable {
     let remaining: Double?
     let expires_at: Double?
     let data_refreshed_at: Double?
+    let fetched_at: Double?
     /// The period was rolled forward from the configured renewal day, not read from the Console.
     let assumed: Bool?
     let error: String?
@@ -249,6 +250,8 @@ struct ApiCredit: Decodable {
 struct UsageSummary: Decodable {
     let read_at: Double?
     let error: String?
+    /// A refusal's pause: the script asks nothing of the endpoint before this moment.
+    let retry_after_at: Double?
     let credits: [CreditGrant]?
     let spend: SpendCap?
     let surfaces: [SurfaceShare]?
@@ -377,6 +380,22 @@ func refreshUsageOnce() {
         task.waitUntilExit()
     } catch {
         log("usage refresh failed: \(error.localizedDescription)")
+    }
+}
+
+/// A Query now click: one request to that source's endpoint, past the automatic age gate but
+/// not past the script's 15-second floor or a refusal's pause. Blocks; call it off the main thread.
+func queryUsageSourceNow(_ source: UsageSource) {
+    let script = repoDir.appendingPathComponent("cc-statusline.js")
+    guard fm.isExecutableFile(atPath: script.path) else { return }
+    let task = scriptProcess(script, source == .claude ? ["refresh-usage", "--force"] : ["refresh-api-credit"])
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        log("usage query (\(source)) failed: \(error.localizedDescription)")
     }
 }
 
@@ -3663,8 +3682,23 @@ final class ShortcutRecorder: NSButton {
 /// usage endpoint says beyond the three quotas drawn there — Fable's share of the
 /// week, credit grants, the monthly spend cap and where the week went. A titled
 /// window, not a popover, so the capture script can read it.
+/// What the Usage window reads from, one section each.
+enum UsageSource: Int, Hashable {
+    case claude, console
+}
+
 final class UsageWindow: NSWindowController {
-    fileprivate let grid = NSGridView()
+    /// Replaced on every update: NSGridView refuses to remove a row that holds merged cells.
+    fileprivate var grid = NSGridView()
+    /// Runs the queries for these sources and calls back when done; set by the app.
+    var onQuery: ((Set<UsageSource>, @escaping () -> Void) -> Void)?
+    private var querying: Set<UsageSource> = []
+    private var shownUsage: UsageSummary?
+    private var shownWeekly: FableQuota?
+    /// Seconds an automatic query waits after the last one: the script's REFRESH_MS and
+    /// API_CREDIT_REFRESH_MS, said in the window's "next automatic query".
+    private static let claudeEvery: Double = 5 * 60
+    private static let consoleEvery: Double = 30 * 60
 
     init() {
         let window = NSWindow(
@@ -3677,6 +3711,13 @@ final class UsageWindow: NSWindowController {
         guard let content = window.contentView else { return }
         content.wantsLayer = true
         content.layer?.backgroundColor = Palette.background.cgColor
+        update(nil)
+    }
+
+    private func installFreshGrid() {
+        guard let content = window?.contentView else { return }
+        grid.removeFromSuperview()
+        grid = NSGridView()
         grid.rowSpacing = 6
         grid.columnSpacing = 12
         grid.translatesAutoresizingMaskIntoConstraints = false
@@ -3686,7 +3727,6 @@ final class UsageWindow: NSWindowController {
             grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
             grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -18),
         ])
-        update(nil)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -3747,10 +3787,83 @@ final class UsageWindow: NSWindowController {
         }
     }
 
+    private func button(_ title: String, _ action: Selector, enabled: Bool = true) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        b.controlSize = .small
+        b.font = NSFont.systemFont(ofSize: 11)
+        b.isEnabled = enabled
+        return b
+    }
+
+    @objc private func queryClaude() { query([.claude]) }
+    @objc private func queryConsole() { query([.console]) }
+    @objc private func queryAll() { query([.claude, .console]) }
+
+    private func query(_ sources: Set<UsageSource>) {
+        let fresh = sources.subtracting(querying)
+        guard !fresh.isEmpty, let run = onQuery else { return }
+        querying.formUnion(fresh)
+        redraw()
+        run(fresh) { [weak self] in
+            guard let self = self else { return }
+            self.querying.subtract(fresh)
+            self.redraw()
+        }
+    }
+
+    private func redraw() { update(shownUsage, weekly: shownWeekly) }
+
+    /// A row spanning the window's columns, with an optional button in the last one.
+    private func spanRow(_ view: NSView, button: NSButton? = nil) {
+        if let button = button {
+            let row = grid.addRow(with: [view, NSGridCell.emptyContentView, NSGridCell.emptyContentView, button])
+            row.mergeCells(in: NSRange(location: 0, length: 3))
+        } else {
+            let row = grid.addRow(with: [view, NSGridCell.emptyContentView, NSGridCell.emptyContentView, NSGridCell.emptyContentView])
+            row.mergeCells(in: NSRange(location: 0, length: 4))
+        }
+    }
+
+    /// One data source's heading: its endpoint and a Query now button, then when it was last
+    /// queried, how that went, and when the next automatic query runs.
+    private func sourceHeader(_ title: String, endpoint: String, source: UsageSource, queriedAt: Double?,
+                              error: String?, pausedUntil: Double?, every: Double, extra: String = "",
+                              enabled: Bool = true) {
+        if grid.numberOfRows > 0 { grid.addRow(with: [label(" ", size: 8)]) }
+        let now = Date().timeIntervalSince1970 * 1000
+        let busy = querying.contains(source)
+        let action = source == .claude ? #selector(queryClaude) : #selector(queryConsole)
+        spanRow(label("\(title)  ·  \(endpoint)", Palette.text, size: 11, weight: .semibold),
+                button: button(busy ? "Querying…" : "Query now", action, enabled: enabled && !busy))
+        var parts: [String] = []
+        var colour = Palette.dim
+        if let at = queriedAt {
+            parts.append("queried \(ago(at)) ago")
+            if let error = error { parts.append("failed: \(error)"); colour = Palette.yellow } else { parts.append("ok") }
+            if let until = pausedUntil, until > now {
+                parts.append("paused after a refusal until \(plainMoment(until))"); colour = Palette.yellow
+            } else {
+                let due = at + every * 1000
+                parts.append(due <= now ? "next automatic query within 30s" : "next automatic query in \(until(due))")
+            }
+        } else {
+            parts.append("never queried")
+        }
+        if !extra.isEmpty { parts.append(extra) }
+        spanRow(label(parts.joined(separator: " · "), colour, size: 11))
+    }
+
     func update(_ usage: UsageSummary?, weekly: FableQuota? = nil) {
-        // removeRow leaves a row's views in the grid as subviews; they would draw over the next reading.
-        for _ in 0..<grid.numberOfRows { grid.removeRow(at: 0) }
-        for view in grid.subviews { view.removeFromSuperview() }
+        shownUsage = usage
+        shownWeekly = weekly
+        installFreshGrid()
+        spanRow(label("Usage by data source", Palette.dim, size: 11),
+                button: button(querying.isEmpty ? "Query all" : "Querying…", #selector(queryAll), enabled: querying.isEmpty))
+
+        sourceHeader("CLAUDE ACCOUNT", endpoint: "GET /api/oauth/usage", source: .claude,
+                     queriedAt: usage?.read_at, error: usage?.error, pausedUntil: usage?.retry_after_at,
+                     every: Self.claudeEvery)
         if let week = weekly, let percent = week.percent {
             let now = Date().timeIntervalSince1970 * 1000
             // A reading past its reset describes the week before: the new one starts empty.
@@ -3759,26 +3872,43 @@ final class UsageWindow: NSWindowController {
             row("this week", bar: current, "\(Int(current.rounded()))% used",
                 week.resets_at.map { "resets \(plainMoment($0))" } ?? "")
         }
-        guard let usage = usage else {
-            grid.addRow(with: [label("No usage reading yet.", Palette.dim)])
-            return
-        }
-        if let share = usage.fable_share {
-            heading("FABLE (inside the weekly limit)")
-            row("Fable's part", bar: share.allowance > 0 ? share.used / share.allowance * 100 : nil,
-                "\(Int(share.used.rounded()))% of the \(Int(share.allowance.rounded()))% it may use", "")
-        }
-        if let credits = usage.credits, !credits.isEmpty {
-            heading("CLOUD CREDIT (Claude Code on the web)")
-            for grant in credits {
-                let used = grant.limit > 0 ? (grant.used ?? 0) / grant.limit * 100 : 0
-                row("left", bar: used,
-                    "\(money(grant.remaining)) of \(money(grant.limit)) left",
-                    grant.expires_at.map { "expires \(plainMoment($0))" } ?? "no expiry")
+        if let usage = usage {
+            if let share = usage.fable_share {
+                heading("FABLE (inside the weekly limit)")
+                row("Fable's part", bar: share.allowance > 0 ? share.used / share.allowance * 100 : nil,
+                    "\(Int(share.used.rounded()))% of the \(Int(share.allowance.rounded()))% it may use", "")
             }
+            if let credits = usage.credits, !credits.isEmpty {
+                heading("CLOUD CREDIT (Claude Code on the web)")
+                for grant in credits {
+                    let used = grant.limit > 0 ? (grant.used ?? 0) / grant.limit * 100 : 0
+                    row("left", bar: used,
+                        "\(money(grant.remaining)) of \(money(grant.limit)) left",
+                        grant.expires_at.map { "expires \(plainMoment($0))" } ?? "no expiry")
+                }
+            }
+            if let spend = usage.spend, let limit = spend.limit {
+                heading("EXTRA SPENDING (only after the weekly limit is hit)")
+                let used = spend.used ?? 0
+                row("this month", bar: limit > 0 ? used / limit * 100 : nil, "\(money(used)) of the \(money(limit)) cap",
+                    spendNote(spend))
+            }
+            if let surfaces = usage.surfaces, !surfaces.isEmpty {
+                heading("WHERE THIS WEEK WENT (share of what was used)")
+                for surface in surfaces { row(surface.name, bar: surface.percent, limit: false, "\(Int(surface.percent.rounded()))%") }
+            }
+        } else {
+            grid.addRow(with: [label("No usage reading yet.", Palette.dim)])
         }
-        if let credit = ApiCredit.load() {
-            heading("API CREDIT (Console: API, Agent SDK, Managed Agents)")
+
+        let credit = ApiCredit.load()
+        sourceHeader("CONSOLE", endpoint: "GET /v1/organizations/analytics/cost", source: .console,
+                     queriedAt: credit?.fetched_at, error: credit?.error, pausedUntil: nil, every: Self.consoleEvery,
+                     extra: credit == nil ? "not set up: run scripts/set-api-credit.zsh"
+                         : (credit?.data_refreshed_at.map { "report data up to \(ago($0)) ago" } ?? ""),
+                     enabled: credit != nil)
+        if let credit = credit {
+            heading("API CREDIT (API, Agent SDK, Managed Agents)")
             let expired = (credit.expires_at ?? .infinity) < Date().timeIntervalSince1970 * 1000
             if let remaining = credit.remaining, let grant = credit.grant, let spent = credit.spent {
                 row("left (estimate)", bar: grant > 0 ? spent / grant * 100 : nil,
@@ -3787,27 +3917,10 @@ final class UsageWindow: NSWindowController {
                         (expired ? "expired \(plainMoment($0))" : "expires \(plainMoment($0))")
                             + (credit.assumed == true ? " (renewal assumed)" : "")
                     } ?? "")
-                row("spent since the grant", bar: nil, money(spent),
-                    credit.data_refreshed_at.map { "counted up to \(ago($0)) ago" } ?? "")
+                row("spent since the grant", bar: nil, money(spent), "")
             }
-            if let error = credit.error {
-                grid.addRow(with: [label("refresh failed: \(error)", Palette.yellow, size: 11)])
-            }
-        }
-        if let spend = usage.spend, let limit = spend.limit {
-            heading("EXTRA SPENDING (only after the weekly limit is hit)")
-            let used = spend.used ?? 0
-            row("this month", bar: limit > 0 ? used / limit * 100 : nil, "\(money(used)) of the \(money(limit)) cap",
-                spendNote(spend))
-        }
-        if let surfaces = usage.surfaces, !surfaces.isEmpty {
-            heading("WHERE THIS WEEK WENT (share of what was used)")
-            for surface in surfaces { row(surface.name, bar: surface.percent, limit: false, "\(Int(surface.percent.rounded()))%") }
         }
         heading("")
-        var footer = usage.read_at.map { "updated \(ago($0)) ago" } ?? "never updated"
-        if let error = usage.error { footer += " · refresh failed: \(error)" }
-        grid.addRow(with: [label(footer, usage.error == nil ? Palette.dim : Palette.yellow, size: 11)])
         window?.layoutIfNeeded()
         if let content = window?.contentView, let window = window {
             window.setContentSize(NSSize(width: max(420, grid.fittingSize.width + 36), height: grid.fittingSize.height + 36))
@@ -6245,6 +6358,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if usageWindow == nil {
             usageWindow = UsageWindow()
             usageWindow?.window?.center()
+            usageWindow?.onQuery = { [weak self] sources, done in
+                DispatchQueue.global(qos: .utility).async {
+                    for source in sources.sorted(by: { $0.rawValue < $1.rawValue }) { queryUsageSourceNow(source) }
+                    DispatchQueue.main.async {
+                        done()
+                        self?.reload()
+                    }
+                }
+            }
         }
         usageWindow?.update(lastUsage, weekly: lastWeekly)
         usageWindow?.show()

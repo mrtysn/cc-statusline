@@ -235,6 +235,9 @@ const API_CREDIT_URL = process.env.CC_STATUSLINE_API_CREDIT_URL || 'https://api.
 // The report is exported about every four hours, so asking more often reads the same figures.
 const API_CREDIT_REFRESH_MS = 30 * 60000;
 const API_CREDIT_MAX_RANGE_MS = 31 * 86400000;
+// The least time between two requests to one endpoint, whoever asks: a double click on a
+// Query now button sends one.
+const MANUAL_MIN_MS = 15000;
 
 function readApiCreditCache() {
   try {
@@ -1541,6 +1544,7 @@ function usageSummary(cached, now) {
   return {
     read_at: cached.fetched_at ?? null,
     error: cached.error ?? null,
+    retry_after_at: cached.retry_after_at ?? null,
     credits,
     spend: cached.spend ?? null,
     surfaces: cached.surfaces ?? null,
@@ -1831,13 +1835,20 @@ if (process.argv[2] === 'live') {
   // is younger than REFRESH_MS — a failed attempt stamps it too — so launching
   // the app again and again makes no more requests than one session would, and
   // while another refresh holds the lock.
+  // `--force`, from the Usage window's Query now button, skips the age gate and
+  // keeps MANUAL_MIN_MS between requests and any pause a refusal asked for.
+  const force = process.argv.includes('--force');
   const cache = readUsageCache();
   const age = Date.now() - (cache?.fetched_at ?? 0);
-  if (age >= REFRESH_MS && Date.now() >= (cache?.retry_after_at ?? 0) && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
-  maybeRefreshApiCredit();
+  if (age >= (force ? MANUAL_MIN_MS : REFRESH_MS) && Date.now() >= (cache?.retry_after_at ?? 0) && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
+  if (!force) maybeRefreshApiCredit();
 } else if (process.argv[2] === 'refresh-api-credit') {
-  // By hand, regardless of age: scripts/set-api-credit.zsh runs it to check the key.
-  refreshApiCredit().catch((err) => logError(`api-credit: ${err.message}`));
+  // By hand, regardless of the 30-minute gate: the Usage window's Query now button and
+  // scripts/set-api-credit.zsh (to check the key) run it. Two requests are never
+  // closer than MANUAL_MIN_MS.
+  if (Date.now() - (readApiCreditCache()?.fetched_at ?? 0) >= MANUAL_MIN_MS) {
+    refreshApiCredit().catch((err) => logError(`api-credit: ${err.message}`));
+  }
 } else if (process.argv[2] === 'refresh-leaderboard') {
   refreshLeaderboard().catch((err) => logError(`leaderboard: ${err.message}`));
 } else if (process.argv[2] === '--refresh-usage') {
