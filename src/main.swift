@@ -2697,6 +2697,20 @@ func clock(_ epochMs: Double) -> String {
     return f.string(from: Date(timeIntervalSince1970: epochMs / 1000))
 }
 
+/// A moment said the way a person would: "today 3:00 PM", "tomorrow 10:59 AM", "Tue 2:00 AM",
+/// and past two days "Nov 12, 10:59 AM".
+func plainMoment(_ epochMs: Double, now: Date = Date()) -> String {
+    let date = Date(timeIntervalSince1970: epochMs / 1000)
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    let calendar = Calendar.current
+    if calendar.isDate(date, inSameDayAs: now) { f.dateFormat = "'today' h:mm a" }
+    else if calendar.isDateInTomorrow(date) { f.dateFormat = "'tomorrow' h:mm a" }
+    else if date.timeIntervalSince(now) < 6 * 86400 { f.dateFormat = "EEE h:mm a" }
+    else { f.dateFormat = "MMM d, h:mm a" }
+    return f.string(from: date)
+}
+
 func share(_ percent: Double?) -> String {
     guard let p = percent else { return "—" }
     let r = Int(p.rounded())
@@ -3703,52 +3717,60 @@ final class UsageWindow: NSWindowController {
         ])
     }
 
-    /// Two facts, said apart: whether the usage-credits toggle is on, and whether
-    /// spending can happen. On with an empty balance is not the same as turned off.
+    /// Why extra spending can or cannot happen, in a sentence: the toggle and the
+    /// balance are two facts, and an empty balance is not the same as switched off.
     private func spendNote(_ spend: SpendCap) -> String {
-        if spend.enabled == true { return "" }
-        if spend.user_disabled == true { return "turned off" }
+        if spend.enabled == true { return "on" }
+        if spend.user_disabled == true { return "switched off" }
         switch spend.disabled_reason {
-        case "out_of_credits": return spend.user_disabled == false ? "on · no credits to spend" : "no credits to spend"
-        case let reason?: return "off · \(reason.replacingOccurrences(of: "_", with: " "))"
+        case "out_of_credits": return "no credits bought, so nothing can be spent"
+        case let reason?: return "off: \(reason.replacingOccurrences(of: "_", with: " "))"
         case nil: return "off"
         }
     }
 
-    func update(_ usage: UsageSummary?) {
+    func update(_ usage: UsageSummary?, weekly: FableQuota? = nil) {
         // removeRow leaves a row's views in the grid as subviews; they would draw over the next reading.
         for _ in 0..<grid.numberOfRows { grid.removeRow(at: 0) }
         for view in grid.subviews { view.removeFromSuperview() }
+        if let week = weekly, let percent = week.percent {
+            let now = Date().timeIntervalSince1970 * 1000
+            // A reading past its reset describes the week before: the new one starts empty.
+            let current = (week.resets_at ?? now + 1) < now ? 0 : percent
+            heading("WEEKLY LIMIT (all products)")
+            row("this week", bar: current, "\(Int(current.rounded()))% used",
+                week.resets_at.map { "resets \(plainMoment($0))" } ?? "")
+        }
         guard let usage = usage else {
             grid.addRow(with: [label("No usage reading yet.", Palette.dim)])
             return
         }
         if let share = usage.fable_share {
-            heading("FABLE")
-            row("weekly share", bar: share.allowance > 0 ? share.used / share.allowance * 100 : nil,
-                "\(Int(share.used.rounded()))% of \(Int(share.allowance.rounded()))%", "of the weekly limit")
+            heading("FABLE (inside the weekly limit)")
+            row("Fable's part", bar: share.allowance > 0 ? share.used / share.allowance * 100 : nil,
+                "\(Int(share.used.rounded()))% of the \(Int(share.allowance.rounded()))% it may use", "")
         }
         if let credits = usage.credits, !credits.isEmpty {
-            heading("CREDITS")
+            heading("CLOUD CREDIT (Claude Code on the web)")
             for grant in credits {
                 let used = grant.limit > 0 ? (grant.used ?? 0) / grant.limit * 100 : 0
-                row("cloud sessions", bar: used,
-                    "\(money(grant.remaining)) of \(money(grant.limit))",
-                    grant.expires_at.map { "left · expires \(clock($0))" } ?? "left")
+                row("left", bar: used,
+                    "\(money(grant.remaining)) of \(money(grant.limit)) left",
+                    grant.expires_at.map { "expires \(plainMoment($0))" } ?? "no expiry")
             }
         }
         if let spend = usage.spend, let limit = spend.limit {
-            heading("MONTHLY SPEND")
+            heading("EXTRA SPENDING (only after the weekly limit is hit)")
             let used = spend.used ?? 0
-            row("this month", bar: limit > 0 ? used / limit * 100 : nil, "\(money(used)) of \(money(limit))",
+            row("this month", bar: limit > 0 ? used / limit * 100 : nil, "\(money(used)) of the \(money(limit)) cap",
                 spendNote(spend))
         }
         if let surfaces = usage.surfaces, !surfaces.isEmpty {
-            heading("THIS WEEK BY SURFACE")
+            heading("WHERE THIS WEEK WENT (share of what was used)")
             for surface in surfaces { row(surface.name, bar: surface.percent, limit: false, "\(Int(surface.percent.rounded()))%") }
         }
         heading("")
-        var footer = usage.read_at.map { "read \(ago($0)) ago" } ?? "never read"
+        var footer = usage.read_at.map { "updated \(ago($0)) ago" } ?? "never updated"
         if let error = usage.error { footer += " · refresh failed: \(error)" }
         grid.addRow(with: [label(footer, usage.error == nil ? Palette.dim : Palette.yellow, size: 11)])
         window?.layoutIfNeeded()
@@ -3773,9 +3795,9 @@ final class UsageWindow: NSWindowController {
             return ["usage fixture did not decode"]
         }
         let window = UsageWindow()
-        window.update(usage)
+        window.update(usage, weekly: FableQuota(percent: 1, resets_at: Date().timeIntervalSince1970 * 1000 + 5 * 86400000, read_at: nil))
         var problems: [String] = []
-        if window.grid.numberOfRows < 8 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 8 or more") }
+        if window.grid.numberOfRows < 12 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 12 or more") }
         if let content = window.window?.contentView {
             content.layoutSubtreeIfNeeded()
             if window.grid.frame.maxX > content.bounds.maxX || window.grid.frame.minY < 0 {
@@ -5747,6 +5769,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let usageButton = NSButton(title: "", target: nil, action: nil)
     /// The newest usage reading, kept so the window opens with it at once.
     private var lastUsage: UsageSummary?
+    private var lastWeekly: FableQuota?
     /// The tag filter and repo tags: what the list
     /// status line show, not how anything sounds.
     private let listControls = NSStackView()
@@ -5861,7 +5884,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         usageButton.contentTintColor = Palette.dim
         usageButton.target = self
         usageButton.action = #selector(openUsage)
-        usageButton.toolTip = "Usage: credits, monthly spend, Fable's share and the week by surface"
+        usageButton.toolTip = "Usage: weekly limit, cloud credit, extra spending, Fable's share and where the week went"
         usageButton.translatesAutoresizingMaskIntoConstraints = false
 
         buildColumns()
@@ -6179,7 +6202,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             usageWindow = UsageWindow()
             usageWindow?.window?.center()
         }
-        usageWindow?.update(lastUsage)
+        usageWindow?.update(lastUsage, weekly: lastWeekly)
         usageWindow?.show()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             refreshUsageOnce()
@@ -6532,7 +6555,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         drawQuotaBar(snapshot)
         fitMinimumWidth()
         lastUsage = snapshot.usage
-        usageWindow?.update(snapshot.usage)
+        lastWeekly = snapshot.weekly
+        usageWindow?.update(snapshot.usage, weekly: snapshot.weekly)
         sortRows()
         refreshTable()
         table.reloadData(forRowIndexes: IndexSet(integer: 0), columnIndexes: IndexSet(table.tableColumns.indices))
