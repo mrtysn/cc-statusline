@@ -8208,7 +8208,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         /// a high reading is about to become wrong and the newest one is safer.
         func source(_ pick: (Session) -> Limit?) -> Session? {
             let now = Date().timeIntervalSince1970
-            let reported = all.filter { pick($0)?.percent != nil }
+            // A reading whose window has ended describes a window that is over: it is never
+            // the current one, however high it read.
+            let reported = all.filter { session in
+                guard pick(session)?.percent != nil else { return false }
+                guard let resets = pick(session)?.resets_at else { return true }
+                return resets / 1000 > now
+            }
             let settled = reported.filter { session in
                 guard let resets = pick(session)?.resets_at else { return true }
                 return resets / 1000 - now > 300
