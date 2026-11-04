@@ -225,6 +225,22 @@ struct FableShare: Decodable {
     let allowance: Double
 }
 
+/// The Console API credit, estimated by `cc-statusline.js` as the grant minus the API spend
+/// since it was granted (`api-credit.json` in the cache). Absent until set-api-credit.zsh ran.
+struct ApiCredit: Decodable {
+    let grant: Double?
+    let spent: Double?
+    let remaining: Double?
+    let expires_at: Double?
+    let data_refreshed_at: Double?
+    let error: String?
+
+    static func load() -> ApiCredit? {
+        guard let data = try? Data(contentsOf: cacheDir.appendingPathComponent("api-credit.json")) else { return nil }
+        return try? JSONDecoder().decode(ApiCredit.self, from: data)
+    }
+}
+
 
 /// What the Usage window shows beyond the quota bar, from the shared usage cache.
 /// Every field is optional: a cache written before they existed has none.
@@ -3759,6 +3775,20 @@ final class UsageWindow: NSWindowController {
                     grant.expires_at.map { "expires \(plainMoment($0))" } ?? "no expiry")
             }
         }
+        if let credit = ApiCredit.load() {
+            heading("API CREDIT (Console: API, Agent SDK, Managed Agents)")
+            let expired = (credit.expires_at ?? .infinity) < Date().timeIntervalSince1970 * 1000
+            if let remaining = credit.remaining, let grant = credit.grant, let spent = credit.spent {
+                row("left (estimate)", bar: grant > 0 ? spent / grant * 100 : nil,
+                    "\(money(remaining)) of \(money(grant)) left",
+                    credit.expires_at.map { expired ? "expired \(plainMoment($0))" : "expires \(plainMoment($0))" } ?? "")
+                row("spent since the grant", bar: nil, money(spent),
+                    credit.data_refreshed_at.map { "counted up to \(ago($0)) ago" } ?? "")
+            }
+            if let error = credit.error {
+                grid.addRow(with: [label("refresh failed: \(error)", Palette.yellow, size: 11)])
+            }
+        }
         if let spend = usage.spend, let limit = spend.limit {
             heading("EXTRA SPENDING (only after the weekly limit is hit)")
             let used = spend.used ?? 0
@@ -3794,10 +3824,19 @@ final class UsageWindow: NSWindowController {
         guard let usage = try? JSONDecoder().decode(UsageSummary.self, from: Data(json.utf8)) else {
             return ["usage fixture did not decode"]
         }
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let credit = """
+            {"grant": 200, "spent": 42.47, "remaining": 157.53, "expires_at": \(nowMs + 9 * 86400000),
+             "data_refreshed_at": \(nowMs - 3 * 3600000), "fetched_at": \(nowMs), "error": null}
+            """
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let creditFile = cacheDir.appendingPathComponent("api-credit.json")
+        try? credit.write(to: creditFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: creditFile) }
         let window = UsageWindow()
-        window.update(usage, weekly: FableQuota(percent: 1, resets_at: Date().timeIntervalSince1970 * 1000 + 5 * 86400000, read_at: nil))
+        window.update(usage, weekly: FableQuota(percent: 1, resets_at: nowMs + 5 * 86400000, read_at: nil))
         var problems: [String] = []
-        if window.grid.numberOfRows < 12 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 12 or more") }
+        if window.grid.numberOfRows < 16 { problems.append("usage window drew \(window.grid.numberOfRows) rows, want 16 or more") }
         if let content = window.window?.contentView {
             content.layoutSubtreeIfNeeded()
             if window.grid.frame.maxX > content.bounds.maxX || window.grid.frame.minY < 0 {

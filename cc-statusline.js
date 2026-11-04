@@ -224,6 +224,121 @@ function readUsageCache() {
   }
 }
 
+// The Console's API credit (the monthly grant shown under Billing) has no balance
+// endpoint. The estimate is the grant minus the organization's API spend since it
+// was granted, from the cost report. Set up with scripts/set-api-credit.zsh, which
+// writes the config (grant, dates) and stores the key in the Keychain.
+const API_CREDIT_FILE = join(CACHE_DIR, 'api-credit.json');
+const API_CREDIT_CONFIG = join(APP_SUPPORT_DIR, 'api-credit.json');
+const API_CREDIT_KEY_SERVICE = 'cc-statusline-analytics-key';
+const API_CREDIT_URL = process.env.CC_STATUSLINE_API_CREDIT_URL || 'https://api.anthropic.com/v1/organizations/analytics/cost';
+// The report is exported about every four hours, so asking more often reads the same figures.
+const API_CREDIT_REFRESH_MS = 30 * 60000;
+const API_CREDIT_MAX_RANGE_MS = 31 * 86400000;
+
+function readApiCreditCache() {
+  try {
+    return JSON.parse(readFileSync(API_CREDIT_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function readApiCreditConfig() {
+  try {
+    const config = JSON.parse(readFileSync(API_CREDIT_CONFIG, 'utf8'));
+    const grantedAt = Date.parse(config.granted_at);
+    const expiresAt = Date.parse(config.expires_at);
+    if (!(config.grant_usd > 0) || !Number.isFinite(grantedAt) || !Number.isFinite(expiresAt)) return null;
+    return { grant: config.grant_usd, grantedAt, expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+function readApiCreditKey() {
+  if (process.env.CC_STATUSLINE_API_CREDIT_KEY) return process.env.CC_STATUSLINE_API_CREDIT_KEY;
+  const out = execFileSync('security', ['find-generic-password', '-s', API_CREDIT_KEY_SERVICE, '-w'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 3000,
+  }).trim();
+  if (!out) throw new Error('empty key');
+  return out;
+}
+
+// What the cost report says about the span since the grant: dollars spent, and the
+// moment the report's export was cut. Amounts come in fractional cents.
+function apiCreditFromReport(config, body) {
+  const rows = Array.isArray(body?.data) ? body.data : null;
+  if (!rows) throw new Error('cost report has no data[]');
+  let cents = 0;
+  for (const row of rows) {
+    const amount = Number(row?.cost?.amount);
+    if (!Number.isFinite(amount)) throw new Error('cost report row has no numeric cost.amount');
+    cents += amount;
+  }
+  const spent = cents / 100;
+  return {
+    grant: config.grant,
+    spent,
+    remaining: Math.max(0, config.grant - spent),
+    expires_at: config.expiresAt,
+    data_refreshed_at: body.data_refreshed_at ? Date.parse(body.data_refreshed_at) : null,
+  };
+}
+
+// Keeps the last good reading on failure and records the failure beside it. Nothing
+// happens until set-api-credit.zsh has written a config.
+async function refreshApiCredit() {
+  const config = readApiCreditConfig();
+  if (!config) return;
+  const previous = readApiCreditCache();
+  const next = { ...(previous || {}), fetched_at: Date.now(), error: null };
+  try {
+    if (config.expiresAt - config.grantedAt > API_CREDIT_MAX_RANGE_MS) {
+      throw new Error('grant spans more than 31 days; the cost report takes at most 31');
+    }
+    let key;
+    try {
+      key = readApiCreditKey();
+    } catch (err) {
+      throw new Error(`keychain: no key stored as "${API_CREDIT_KEY_SERVICE}"; run scripts/set-api-credit.zsh`);
+    }
+    const url = `${API_CREDIT_URL}?starting_at=${encodeURIComponent(new Date(config.grantedAt).toISOString())}`;
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'anthropic-version': '2026-10-21',
+          'anthropic-beta': 'analytics-usage-cost-2026-08-24',
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (err) {
+      throw new Error(`network: ${err.cause?.code || err.message}`);
+    }
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    Object.assign(next, apiCreditFromReport(config, await res.json()));
+  } catch (err) {
+    next.error = err.message;
+    logError(`api-credit: ${err.message}`);
+  }
+  mkdirSync(CACHE_DIR, { recursive: true });
+  const tmp = `${API_CREDIT_FILE}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(next));
+  renameSync(tmp, API_CREDIT_FILE);
+}
+
+// Called with each launch/tick refresh of the usage: only when a config exists, and
+// at most once per API_CREDIT_REFRESH_MS, a failed attempt included.
+function maybeRefreshApiCredit() {
+  if (!readApiCreditConfig()) return;
+  if (Date.now() - (readApiCreditCache()?.fetched_at ?? 0) < API_CREDIT_REFRESH_MS) return;
+  refreshApiCredit().catch((err) => logError(`api-credit: ${err.message}`));
+}
+
 // This session's dots and tags from the app's tags.json, read on every redraw
 // like sounds.json. Missing file, unknown session or malformed entries: none.
 // A single value per session is the format from before a session had several.
@@ -1700,6 +1815,10 @@ if (process.argv[2] === 'live') {
   const cache = readUsageCache();
   const age = Date.now() - (cache?.fetched_at ?? 0);
   if (age >= REFRESH_MS && Date.now() >= (cache?.retry_after_at ?? 0) && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
+  maybeRefreshApiCredit();
+} else if (process.argv[2] === 'refresh-api-credit') {
+  // By hand, regardless of age: scripts/set-api-credit.zsh runs it to check the key.
+  refreshApiCredit().catch((err) => logError(`api-credit: ${err.message}`));
 } else if (process.argv[2] === 'refresh-leaderboard') {
   refreshLeaderboard().catch((err) => logError(`leaderboard: ${err.message}`));
 } else if (process.argv[2] === '--refresh-usage') {
