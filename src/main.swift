@@ -1120,6 +1120,16 @@ final class TagStore {
 
     // MARK: What a session shows
 
+    /// The hue a tag without a colour is drawn in: spread over the wheel from a hash of the name,
+    /// so the same tag is the same colour in every session and on every run.
+    static func autoHex(_ name: String) -> String {
+        var h: UInt32 = 2166136261
+        for byte in name.utf8 { h = (h ^ UInt32(byte)) &* 16777619 }
+        let c = NSColor(hue: CGFloat(h % 360) / 360, saturation: 0.45, brightness: 0.85, alpha: 1).usingColorSpace(.sRGB) ?? .gray
+        func part(_ v: CGFloat) -> Int { Int((v * 255).rounded()) }
+        return String(format: "%02X%02X%02X", part(c.redComponent), part(c.greenComponent), part(c.blueComponent))
+    }
+
     /// Its dots and tags: the preset dots and named tags set by hand, then its
     /// repo's tags, each of those with a colour also a dot. A colour shows as
     /// one dot however many marks share it.
@@ -1132,7 +1142,8 @@ final class TagStore {
             for name in repo.tags {
                 let hex = repo.colors[name]
                 tags.append(Mark(name: name, hex: hex))
-                if let hex = hex { dots.append(Mark(name: name, hex: hex)) }
+                // A tag nobody coloured still gets a dot, a hue fixed by its name; `container` only marks structure.
+                if let hex = hex ?? (name == "container" ? nil : Self.autoHex(name)) { dots.append(Mark(name: name, hex: hex)) }
             }
         }
         var seen = Set<String>()
@@ -6529,6 +6540,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     func selfTestProblems(fixture: Snapshot) -> [String] {
         var problems: [String] = []
         guard let window else { return ["no window"] }
+        let auto = ["my", "fork", "generated", "interview-prep", "third-party"].map(TagStore.autoHex)
+        if Set(auto).count != auto.count || TagStore.autoHex("my") != auto[0] || auto.contains(where: { $0.count != 6 }) {
+            problems.append("auto tag colours are not distinct and stable: \(auto)")
+        }
         window.layoutIfNeeded()
 
         // Columns: every declared column is in the table, in order, with its title.
