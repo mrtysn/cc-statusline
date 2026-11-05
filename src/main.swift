@@ -8189,7 +8189,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if key == "context" { return progressCell(c.percent, past: past, drop: drop, key: s.session_id) }
         // In Select mode a live row's dots give way to its checkbox.
         if key == "dots", selecting, !past { return pickCell(session, past: past) }
-        if key == "dots" { return dotsCell(tagStore.marks(s.session_id, s.project_dir).dots, past: past, drop: drop) }
+        if key == "dots" {
+            let marks = tagStore.marks(s.session_id, s.project_dir)
+            let cell = dotsCell(marks.dots, past: past, drop: drop)
+            // The dots carry no words; the tooltip names every tag, and the colours set by hand.
+            let words = marks.tags.map(\.name) + marks.dots.filter { dot in !marks.tags.contains { $0.name == dot.name } }.map(\.name)
+            cell.toolTip = words.isEmpty ? nil : words.joined(separator: "\n")
+            return cell
+        }
         let heat = c.heat
         let alignment = c.alignment
         let cell = (table.makeView(withIdentifier: SessionTextCell.identifier(key), owner: nil) as? SessionTextCell)
