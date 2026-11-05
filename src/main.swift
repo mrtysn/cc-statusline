@@ -6154,6 +6154,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // session's dots, stacked, without a title.
         Column(key: "dots", title: "", width: 12),
         Column(key: "cwd", title: "Directory", width: 164),
+        // Every tag of the session, in its colour, beside the directory it comes from.
+        Column(key: "tags", title: "Tags", width: 150),
         Column(key: "topic", title: "Doing", width: 300),
         Column(key: "state", title: "State", width: 112),
         // Beside the state: what a session is doing and how long its cache has
@@ -6529,6 +6531,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     func selfTestProblems(fixture: Snapshot) -> [String] {
         var problems: [String] = []
         guard let window else { return ["no window"] }
+        // The first live fixture carries three tags, the second one, so the Tags column has both lines to draw.
+        for (name, hex) in [("games", "61AFEF"), ("interview-prep", "C678DD"), ("study", "98C379")] { tagStore.create(name, hex: hex) }
+        for name in ["games", "interview-prep", "study"] { tagStore.toggleTag(name, for: "fixture-a") }
+        tagStore.toggleTag("games", for: "fixture-b")
+        refreshTable(full: true)
         window.layoutIfNeeded()
 
         // Columns: every declared column is in the table, in order, with its title.
@@ -7934,18 +7941,31 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // caption falls back to the terminal. The tags come first, each in
             // its colour when it has one.
             let name = session.peer_name ?? session.tty.map { $0.replacingOccurrences(of: "/dev/", with: "") } ?? ""
-            var parts: [String] = []
-            var at = 0
-            for tag in marks.tags {
-                if tag.hex != nil {
-                    highlights.append((NSRange(location: at, length: (tag.name as NSString).length),
-                        past ? tag.color.withAlphaComponent(0.6) : tag.color))
+            bottom = name
+        case "tags":
+            // Every tag in its colour, filled across the top line and then the
+            // caption; the full list is in the tooltip.
+            let names = tagStore.marks(s.session_id, s.project_dir).tags
+            let top1 = NSMutableAttributedString()
+            var lowerParts: [String] = []
+            var topLength = 0
+            for tag in names {
+                let colour = tag.hex != nil ? (past ? tag.color.withAlphaComponent(0.6) : tag.color) : Palette.text
+                if lowerParts.isEmpty && (topLength == 0 || topLength + tag.name.count + 3 <= 22) {
+                    if topLength > 0 { top1.append(prose(" · ", Palette.dim)) }
+                    top1.append(prose(tag.name, colour))
+                    topLength += tag.name.count + (topLength > 0 ? 3 : 0)
+                } else {
+                    let at = lowerParts.joined(separator: " · ").count + (lowerParts.isEmpty ? 0 : 3)
+                    if tag.hex != nil {
+                        highlights.append((NSRange(location: at, length: (tag.name as NSString).length),
+                            past ? tag.color.withAlphaComponent(0.6) : tag.color))
+                    }
+                    lowerParts.append(tag.name)
                 }
-                parts.append(tag.name)
-                at += (tag.name as NSString).length + 3
             }
-            if !name.isEmpty { parts.append(name) }
-            bottom = parts.joined(separator: " · ")
+            top = top1
+            bottom = lowerParts.joined(separator: " · ")
         case "git":
             top = mono(gitText(s.git), Palette.text)
             bottom = gitWords(s.git)
@@ -8418,6 +8438,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 // Preset colours in their order, other colours after them.
                 guard let first = tagStore.marks(s.session_id, s.project_dir).dots.first else { return (99, "") }
                 return (TagColour.all.firstIndex { $0.hex == first.hex }.map(Double.init) ?? 50, first.hex ?? "")
+            case "tags":
+                let names = tagStore.marks(s.session_id, s.project_dir).tags.map(\.name)
+                return (names.isEmpty ? 1 : 0, names.joined(separator: " ").lowercased())
             case "git": return (0, (s.git?.branch ?? "~").lowercased())
             case "model": return (modelRank(s.model), (s.model ?? "").lowercased())
             case "effort": return (effortRank(s.effort), s.effort ?? "")
@@ -8598,6 +8621,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return "Directory \(s.cwd ?? "unknown")\(session.tty.map { ", terminal \($0)" } ?? "")"
                 + (marks.isEmpty ? "" : ", " + marks.joined(separator: ", ")) + ". "
                 + "Double-click to show that terminal."
+        case "tags":
+            let names = tagStore.marks(s.session_id, s.project_dir).tags.map(\.name)
+            return names.isEmpty ? "No tags" : "Tags " + names.joined(separator: ", ")
         case "git": return "Branch \(gitText(s.git)), \(gitWords(s.git))"
         case "model": return "Model \(s.model_full ?? s.model ?? "unknown")"
         case "effort": return "Effort \(s.effort ?? "unknown")"
