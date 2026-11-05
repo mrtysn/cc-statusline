@@ -2810,7 +2810,64 @@ func cacheElapsed(_ c: CacheState?) -> Double? {
 
 /// Brings the iTerm2 tab whose session owns this tty to the front. iTerm exposes
 /// `tty` on every session, so the lookup is exact rather than a guess from titles.
+/// A session inside tmux (every `clo` launch, and the ones clo-web starts from the
+/// phone) has a pane's tty, which no iTerm session owns: then the tab of a tmux
+/// client attached to that session comes forward, or, with none, the session is
+/// attached in a new tab through iTerm's tmux integration.
 func focusTerminal(tty: String) {
+    if focusITermSession(tty: tty) { return }
+    guard let name = tmuxSession(forTty: tty, in: tmuxOutput(["list-panes", "-a", "-F", "#{pane_tty}\t#{session_name}"]) ?? "") else { return }
+    for clientTty in tmuxClientTtys(in: tmuxOutput(["list-clients", "-t", "=\(name)", "-F", "#{client_tty}"]) ?? "") {
+        if focusITermSession(tty: clientTty) { return }
+    }
+    log("focus \(tty): tmux session \(name) has no terminal; attaching it in a new tab")
+    runInNewTab("tmux -CC attach-session -t '=\(name)'")
+}
+
+/// The tmux session whose pane has this tty, from `list-panes -a -F '#{pane_tty}\t#{session_name}'`.
+func tmuxSession(forTty tty: String, in panes: String) -> String? {
+    for line in panes.split(separator: "\n") {
+        let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
+        if parts.count == 2, parts[0] == tty { return parts[1] }
+    }
+    return nil
+}
+
+/// The ttys of the clients attached to a session, from `list-clients -F '#{client_tty}'`.
+func tmuxClientTtys(in clients: String) -> [String] {
+    clients.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.hasPrefix("/dev/") }
+}
+
+/// tmux's output for these arguments, or nil without a tmux or a tmux server.
+func tmuxOutput(_ arguments: [String]) -> String? {
+    guard let tmux = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"].first(where: { fm.isExecutableFile(atPath: $0) }) else { return nil }
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: tmux)
+    task.arguments = arguments
+    let out = Pipe()
+    task.standardOutput = out
+    task.standardError = FileHandle.nullDevice
+    do { try task.run() } catch { return nil }
+    let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
+    task.waitUntilExit()
+    guard task.terminationStatus == 0 else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+/// The tmux lookups, exercised by the self-test on fixed output.
+func tmuxLookupProblems() -> [String] {
+    var problems: [String] = []
+    let panes = "/dev/ttys004\tai-job-search-72\n/dev/ttys009\tnotebook-3f\n"
+    if tmuxSession(forTty: "/dev/ttys009", in: panes) != "notebook-3f" { problems.append("tmux pane tty did not map to its session") }
+    if tmuxSession(forTty: "/dev/ttys001", in: panes) != nil { problems.append("a tty no pane has mapped to a session") }
+    if tmuxSession(forTty: "/dev/ttys004", in: "") != nil { problems.append("empty tmux output mapped to a session") }
+    if tmuxClientTtys(in: "/dev/ttys002\n\n/dev/ttys007\n") != ["/dev/ttys002", "/dev/ttys007"] { problems.append("client ttys were not read") }
+    return problems
+}
+
+/// The iTerm tab owning this tty, brought forward; false when no session has it.
+@discardableResult
+func focusITermSession(tty: String) -> Bool {
     let script = """
         tell application "iTerm2"
           repeat with w in windows
@@ -2836,11 +2893,12 @@ func focusTerminal(tty: String) {
         end tell
         return "not found"
         """
-    runScript(script, label: "focus \(tty)")
+    guard runScript(script, label: "focus \(tty)") == "ok" else { return false }
     // The script selects the tab, but a hotkey window hides again unless iTerm is
     // the active app — and AppleScript's own `activate` makes iTerm open a fresh
     // tab when that window is hidden.
     bringITermForward(label: "focus \(tty)")
+    return true
 }
 
 /// The shell command that opens a finished session again: from the directory it
@@ -9001,6 +9059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         problems += UsageWindow.selfTestProblems()
         problems += LeaderboardWindow.selfTestProblems()
+        problems += tmuxLookupProblems()
         // CC_SESSIONS_WINDOW_PNG=<path> saves the list window's picture, to read its top row without opening the app.
         // CC_SESSIONS_WINDOW_BYPASS_ALL=1 draws it with both guards bypassed for all sessions, as the Guards menu leaves it.
         // CC_SESSIONS_WINDOW_SELECTING=1 draws it in Select mode, one session ticked and a message typed.
