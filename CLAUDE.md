@@ -19,5 +19,8 @@ app that lists every live session (`src/main.swift`). `README.md` describes both
 - A table cell is built through `CentredCell`, never returned as a bare `NSTextField`: a label that
   fills a taller row draws at its top. The self-test fails a bare label (`textCellProblems`) and
   reads the leaderboard's picture for text off the row's middle (`inkProblems`).
+- A long list stays quick because session cells are reused (`SessionTextCell`) and a refresh builds only the rows near the
+  screen (`contentWindow`). `CC_SESSIONS_SELFTEST=1 CC_SESSIONS_BENCH=<n> .build/release/CCSessions` prints refresh, sort and
+  flick-scroll times for n finished sessions; run it with 500 and 2000 after touching cell or refresh code.
 - Caption colours in the sessions table are one colour per caption; colour a part of it by adding
   to `highlights` (caption-relative ranges), as the ssh warning and the Cache tags do.

@@ -3215,7 +3215,7 @@ final class ActionItem: NSMenuItem {
 }
 
 /// A cell that acts on a click and says so with the cursor.
-final class ClickableCell: NSView {
+class ClickableCell: NSView {
     var onClick: (() -> Void)? {
         didSet { setAccessibilityRole(onClick == nil ? .group : .button) }
     }
@@ -3251,11 +3251,65 @@ final class ClickableCell: NSView {
     }
 }
 
+/// One session cell of text: the label and its constraints are made once and refilled, so scrolling
+/// a long list reuses a handful of these instead of building and solving a few thousand.
+final class SessionTextCell: ClickableCell {
+    let field = NSTextField(labelWithString: "")
+    private var leading: NSLayoutConstraint!
+    private var trailing: NSLayoutConstraint!
+    private var centre: NSLayoutConstraint!
+    private var extras: [NSView] = []
+
+    static func identifier(_ key: String) -> NSUserInterfaceItemIdentifier {
+        NSUserInterfaceItemIdentifier("session-text-" + key)
+    }
+
+    init(key: String) {
+        super.init(frame: .zero)
+        identifier = Self.identifier(key)
+        // Selectable text steals the click and re-styles itself when focused, so
+        // the cells act on a click instead of letting text be dragged over.
+        field.isSelectable = false
+        field.maximumNumberOfLines = 2
+        field.lineBreakMode = .byTruncatingTail
+        field.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(field)
+        leading = field.leadingAnchor.constraint(equalTo: leadingAnchor)
+        trailing = field.trailingAnchor.constraint(equalTo: trailingAnchor)
+        centre = field.centerYAnchor.constraint(equalTo: centerYAnchor)
+        NSLayoutConstraint.activate([leading, trailing, centre])
+    }
+
+    required init?(coder: NSCoder) { fatalError("SessionTextCell is built in code") }
+
+    /// Back to a blank cell: nothing of the session it showed before survives.
+    func reset(leading: CGFloat, trailing: CGFloat, drop: CGFloat) {
+        onClick = nil
+        onDoubleClick = nil
+        menu = nil
+        toolTip = nil
+        field.toolTip = nil
+        layer?.backgroundColor = NSColor.clear.cgColor
+        for view in extras { view.removeFromSuperview() }
+        extras = []
+        self.leading.constant = leading
+        self.trailing.constant = -trailing
+        centre.constant = drop
+    }
+
+    /// A stripe or a dot beside the text, gone again at the next reset.
+    func addExtra(_ view: NSView) {
+        addSubview(view)
+        extras.append(view)
+    }
+}
+
 /// Draws its own selection band. AppKit's emphasised highlight rewrites the
 /// attributes of every label in the row, which undoes the fonts and colours the
 /// cells set for themselves.
 final class SessionRowView: NSTableRowView {
     /// Set on the first finished row, to mark where the live sessions end.
+    static let identifier = NSUserInterfaceItemIdentifier("session-row")
     var drawsBoundary = false
     /// Extra height on that row, so the line sits in clear space.
     static let boundaryPadding: CGFloat = 26
@@ -6537,6 +6591,39 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// The problems a self-test run finds in this window, built over fixture sessions.
     /// Checks the columns, the filter, the empty label, the buttons and the window's layout.
+    /// Milliseconds a refresh with nothing changed, a full one, and drawing every row's cells take.
+    func benchReport() -> String {
+        func ms(_ body: () -> Void) -> Int {
+            let start = DispatchTime.now().uptimeNanoseconds
+            body()
+            return Int((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
+        }
+        window?.contentView?.layoutSubtreeIfNeeded()
+        let same = ms { refreshTable() }
+        let full = ms { refreshTable(full: true) }
+        let cells = ms {
+            for row in 0..<table.numberOfRows { for col in table.tableColumns.indices { _ = table.view(atColumn: col, row: row, makeIfNecessary: true) } }
+        }
+        let sorted = ms { sortRows() }
+        // A flick through the whole list, fifteen rows a frame.
+        refreshTable(full: true)
+        table.scroll(NSPoint.zero)
+        table.layoutSubtreeIfNeeded()
+        var frames = 0
+        let scroll = ms {
+            var y: CGFloat = 0
+            while y < table.bounds.height {
+                table.enclosingScrollView?.contentView.scroll(to: NSPoint(x: 0, y: y))
+                table.enclosingScrollView.map { $0.reflectScrolledClipView($0.contentView) }
+                table.layoutSubtreeIfNeeded()
+                y += table.rowHeight * 15
+                frames += 1
+            }
+        }
+        return "bench: \(rows.count) rows: refresh unchanged \(same)ms, full \(full)ms, every cell \(cells)ms, sort \(sorted)ms, "
+            + "scroll \(scroll)ms over \(frames) frames (\(frames > 0 ? scroll * 1000 / frames : 0)us a frame)"
+    }
+
     func selfTestProblems(fixture: Snapshot) -> [String] {
         var problems: [String] = []
         guard let window else { return ["no window"] }
@@ -6836,11 +6923,23 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var lastState: [String: String] = [:]
     /// What each bar last showed, so its replacement glides on from there.
     private var barMemory: [String: Double] = [:]
-    private var drawn: [[String: CellContent]] = []
+    private var drawn: [Int: [String: CellContent]] = [:]
 
     private func shownContent(_ key: String, row: Int) -> CellContent {
-        if row < drawn.count, let c = drawn[row][key] { return c }
-        return content(key, row: row)
+        if let c = drawn[row]?[key] { return c }
+        let c = content(key, row: row)
+        drawn[row, default: [:]][key] = c
+        return c
+    }
+
+    /// The session rows whose cells are worth keeping built: those on screen and a margin around them.
+    /// The rest are built when they scroll in, so a refresh costs the screen, not the list.
+    private func contentWindow() -> Range<Int> {
+        let visible = table.rows(in: table.visibleRect)
+        guard visible.length > 0 else { return 0..<min(rows.count, 60) }
+        let margin = 25
+        let low = max(0, visible.location - 1 - margin)
+        return low..<max(low, min(rows.count, visible.location + visible.length + margin))
     }
 
     /// Rebuilds only the cells whose contents changed while the rows stay the
@@ -6850,9 +6949,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         drawGuardsLabel()
         let keys = table.tableColumns.map { $0.identifier.rawValue }
         let ids = rows.map { "\($0.session.summary.session_id ?? "")\($0.past ? "~" : "")" }
-        let next = rows.indices.map { row in
-            Dictionary(uniqueKeysWithValues: keys.map { ($0, content($0, row: row)) })
-        }
+        let span = contentWindow()
+        var next: [Int: [String: CellContent]] = [:]
+        for row in span { next[row] = Dictionary(uniqueKeysWithValues: keys.map { ($0, content($0, row: row)) }) }
         let same = !full && ids == drawnIds
         let previous = drawn
         drawn = next
@@ -6862,8 +6961,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             table.reloadData()
             return
         }
-        for row in rows.indices {
-            let changed = IndexSet(keys.indices.filter { next[row][keys[$0]] != previous[row][keys[$0]] })
+        let onScreen = table.rows(in: table.visibleRect)
+        for row in span {
+            guard let now = next[row] else { continue }
+            // A row never cached was not on screen at the last refresh; if it is now, redraw all of it.
+            let changed = IndexSet(keys.indices.filter { index in
+                guard let before = previous[row] else { return NSLocationInRange(row + 1, onScreen) }
+                return now[keys[index]] != before[keys[index]]
+            })
             if !changed.isEmpty { table.reloadData(forRowIndexes: IndexSet(integer: row + 1), columnIndexes: changed) }
         }
     }
@@ -6952,7 +7057,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        let view = SessionRowView()
+        let view = (tableView.makeView(withIdentifier: SessionRowView.identifier, owner: nil) as? SessionRowView)
+            ?? SessionRowView()
+        view.identifier = SessionRowView.identifier
+        view.pulse = 0
         // Live sessions always sort above finished ones; the line says where
         // that boundary is without spending a row on a heading.
         view.drawsBoundary = row > 0 && isBoundary(row - 1)
@@ -8084,16 +8192,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if key == "dots" { return dotsCell(tagStore.marks(s.session_id, s.project_dir).dots, past: past, drop: drop) }
         let heat = c.heat
         let alignment = c.alignment
-        let field = NSTextField(labelWithString: "")
+        let cell = (table.makeView(withIdentifier: SessionTextCell.identifier(key), owner: nil) as? SessionTextCell)
+            ?? SessionTextCell(key: key)
+        cell.reset(leading: key == "effort" ? 3 : 4, trailing: key == "model" ? 3 : 4, drop: drop)
+        let field = cell.field
         field.attributedStringValue = c.text
-        // Selectable text steals the click and re-styles itself when focused, so
-        // the cells act on a click instead of letting text be dragged over.
-        field.isSelectable = false
-        field.maximumNumberOfLines = 2
-        field.lineBreakMode = .byTruncatingTail
         field.alignment = alignment
-        field.translatesAutoresizingMaskIntoConstraints = false
-        let cell = ClickableCell()
         if let heat = heat {
             // Inset and rounded, so the stripe never touches the row divider
             // above or below it.
@@ -8107,7 +8211,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             stripe.layer?.backgroundColor = (warm ? heat : Palette.dim.withAlphaComponent(0.6)).cgColor
             stripe.layer?.cornerRadius = past ? 1.5 : 2
             stripe.translatesAutoresizingMaskIntoConstraints = false
-            cell.addSubview(stripe)
+            cell.addExtra(stripe)
             NSLayoutConstraint.activate([
                 stripe.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
                 stripe.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
@@ -8194,16 +8298,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // On the cell as well as the text: the text is only as tall as its
         // lines, and a hover below them would find no tooltip.
         cell.toolTip = field.toolTip
-        cell.addSubview(field)
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: key == "effort" ? 3 : 4),
-            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: key == "model" ? -3 : -4),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor, constant: drop),
-        ])
         if key == "topic", !past, isWorking(session) {
             // Over the clear glyph the text keeps, on the same baseline.
             let dot = breathingDot(dotColour(session, past: false))
-            cell.addSubview(dot)
+            cell.addExtra(dot)
             NSLayoutConstraint.activate([
                 dot.leadingAnchor.constraint(equalTo: field.leadingAnchor),
                 dot.firstBaselineAnchor.constraint(equalTo: field.firstBaselineAnchor),
@@ -8873,6 +8971,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
             """
         var problems: [String] = []
+        // CC_SESSIONS_BENCH=<n> times the list with n finished sessions and a tenth as many live ones.
+        if let n = ProcessInfo.processInfo.environment["CC_SESSIONS_BENCH"].flatMap(Int.init) {
+            let many = """
+                {"live": [\((0..<max(n / 10, 1)).map { session("live-\($0)", dir: "/fixture/live\($0)", topic: "live fixture \($0)", ended: false, peer: "peer-\($0)") }.joined(separator: ","))],
+                 "history": [\((0..<n).map { session("past-\($0)", dir: "/fixture/past\($0)", topic: "finished fixture \($0)", ended: true) }.joined(separator: ","))]}
+                """
+            if let snapshot = try? JSONDecoder().decode(Snapshot.self, from: Data(many.utf8)) {
+                let controller = SessionsWindow(fixture: snapshot)
+                self.controller = controller
+                print(controller.benchReport())
+            }
+            exit(0)
+        }
         do {
             let fixture = try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
             let controller = SessionsWindow(fixture: fixture)
