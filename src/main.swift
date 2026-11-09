@@ -2813,22 +2813,32 @@ func cacheElapsed(_ c: CacheState?) -> Double? {
 /// A session inside tmux (every `clo` launch, and the ones clo-web starts from the
 /// phone) has a pane's tty, which no iTerm session owns: then the tab of a tmux
 /// client attached to that session comes forward, or, with none, the session is
-/// attached in a new tab through iTerm's tmux integration.
+/// attached in a new tab through iTerm's tmux integration. A `tmux -CC` tab (how
+/// `clo` opens a session) reports no tty, and its client's tty is iTerm's hidden
+/// gateway, which no window holds: that tab is found by its `tmuxWindowPane`.
 func focusTerminal(tty: String) {
     if focusITermSession(tty: tty) { return }
-    guard let name = tmuxSession(forTty: tty, in: tmuxOutput(["list-panes", "-a", "-F", "#{pane_tty}\t#{session_name}"]) ?? "") else { return }
-    for clientTty in tmuxClientTtys(in: tmuxOutput(["list-clients", "-t", "=\(name)", "-F", "#{client_tty}"]) ?? "") {
+    let panes = tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat])
+    guard let pane = tmuxPane(forTty: tty, in: panes ?? "") else {
+        log("focus \(tty): no iTerm tab has this tty and no tmux pane does either (tmux \(panes == nil ? "gave no output" : "listed \(panes!.split(separator: "\n").count) panes"))")
+        return
+    }
+    if focusITermTmuxPane(pane.paneNumber, label: "focus \(tty) as tmux pane %\(pane.paneNumber)") { return }
+    for clientTty in tmuxClientTtys(in: tmuxOutput(["list-clients", "-t", "=\(pane.session)", "-F", "#{client_tty}"]) ?? "") {
         if focusITermSession(tty: clientTty) { return }
     }
-    log("focus \(tty): tmux session \(name) has no terminal; attaching it in a new tab")
-    runInNewTab("tmux -CC attach-session -t '=\(name)'")
+    log("focus \(tty): tmux session \(pane.session) has no terminal; attaching it in a new tab")
+    runInNewTab("tmux -CC attach-session -t '=\(pane.session)'")
 }
 
-/// The tmux session whose pane has this tty, from `list-panes -a -F '#{pane_tty}\t#{session_name}'`.
-func tmuxSession(forTty tty: String, in panes: String) -> String? {
+/// What `list-panes -a -F` prints for `tmuxPane(forTty:in:)`.
+let tmuxPaneFormat = "#{pane_tty}\t#{session_name}\t#{pane_id}"
+
+/// The tmux session and pane number (`%22` → "22") of the pane with this tty.
+func tmuxPane(forTty tty: String, in panes: String) -> (session: String, paneNumber: String)? {
     for line in panes.split(separator: "\n") {
-        let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
-        if parts.count == 2, parts[0] == tty { return parts[1] }
+        let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+        if parts.count == 3, parts[0] == tty, parts[2].hasPrefix("%") { return (parts[1], String(parts[2].dropFirst())) }
     }
     return nil
 }
@@ -2839,11 +2849,14 @@ func tmuxClientTtys(in clients: String) -> [String] {
 }
 
 /// tmux's output for these arguments, or nil without a tmux or a tmux server.
-func tmuxOutput(_ arguments: [String]) -> String? {
+/// `-u` because launchd starts the app with no locale, and tmux in a non-UTF-8
+/// locale prints a format's tab as `_`, which no lookup here can split.
+func tmuxOutput(_ arguments: [String], environment: [String: String]? = nil) -> String? {
     guard let tmux = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"].first(where: { fm.isExecutableFile(atPath: $0) }) else { return nil }
     let task = Process()
     task.executableURL = URL(fileURLWithPath: tmux)
-    task.arguments = arguments
+    task.arguments = ["-u"] + arguments
+    if let environment = environment { task.environment = environment }
     let out = Pipe()
     task.standardOutput = out
     task.standardError = FileHandle.nullDevice
@@ -2857,23 +2870,41 @@ func tmuxOutput(_ arguments: [String]) -> String? {
 /// The tmux lookups, exercised by the self-test on fixed output.
 func tmuxLookupProblems() -> [String] {
     var problems: [String] = []
-    let panes = "/dev/ttys004\tai-job-search-72\n/dev/ttys009\tnotebook-3f\n"
-    if tmuxSession(forTty: "/dev/ttys009", in: panes) != "notebook-3f" { problems.append("tmux pane tty did not map to its session") }
-    if tmuxSession(forTty: "/dev/ttys001", in: panes) != nil { problems.append("a tty no pane has mapped to a session") }
-    if tmuxSession(forTty: "/dev/ttys004", in: "") != nil { problems.append("empty tmux output mapped to a session") }
+    let panes = "/dev/ttys004\tai-job-search-72\t%0\n/dev/ttys009\tnotebook-3f\t%22\n"
+    let found = tmuxPane(forTty: "/dev/ttys009", in: panes)
+    if found?.session != "notebook-3f" || found?.paneNumber != "22" { problems.append("tmux pane tty did not map to its session and pane") }
+    if tmuxPane(forTty: "/dev/ttys001", in: panes) != nil { problems.append("a tty no pane has mapped to a session") }
+    if tmuxPane(forTty: "/dev/ttys004", in: "") != nil { problems.append("empty tmux output mapped to a session") }
+    if tmuxPane(forTty: "/dev/ttys004", in: "/dev/ttys004_ai-job-search-72_%0\n") != nil { problems.append("tmux output without tabs mapped to a session") }
     if tmuxClientTtys(in: "/dev/ttys002\n\n/dev/ttys007\n") != ["/dev/ttys002", "/dev/ttys007"] { problems.append("client ttys were not read") }
+    // The app runs with launchd's bare environment: with a tmux server up, its
+    // real output must still split into fields there.
+    if let live = tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat], environment: ["HOME": home.path, "PATH": "/usr/bin:/bin"]),
+       let line = live.split(separator: "\n").first, line.split(separator: "\t").count != 3 {
+        problems.append("tmux output under launchd's environment did not split on tabs: \(line)")
+    }
     return problems
 }
 
 /// The iTerm tab owning this tty, brought forward; false when no session has it.
 @discardableResult
 func focusITermSession(tty: String) -> Bool {
+    focusITermSession(where: "tty of s is \"\(tty)\"", label: "focus \(tty)")
+}
+
+/// The iTerm tab showing this tmux pane through `tmux -CC`, brought forward.
+func focusITermTmuxPane(_ paneNumber: String, label: String) -> Bool {
+    focusITermSession(where: "((variable named \"tmuxWindowPane\") of s as text) is \"\(paneNumber)\"", label: label)
+}
+
+/// The first iTerm session `s` meeting this AppleScript condition, brought forward.
+func focusITermSession(where condition: String, label: String) -> Bool {
     let script = """
         tell application "iTerm2"
           repeat with w in windows
             repeat with t in tabs of w
               repeat with s in sessions of t
-                if tty of s is "\(tty)" then
+                if \(condition) then
                   select t
                   select s
                   -- A hidden hotkey window ignores `select` and reveals itself,
@@ -2893,11 +2924,11 @@ func focusITermSession(tty: String) -> Bool {
         end tell
         return "not found"
         """
-    guard runScript(script, label: "focus \(tty)") == "ok" else { return false }
+    guard runScript(script, label: label) == "ok" else { return false }
     // The script selects the tab, but a hotkey window hides again unless iTerm is
     // the active app — and AppleScript's own `activate` makes iTerm open a fresh
     // tab when that window is hidden.
-    bringITermForward(label: "focus \(tty)")
+    bringITermForward(label: label)
     return true
 }
 
