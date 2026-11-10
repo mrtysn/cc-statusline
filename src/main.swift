@@ -8128,10 +8128,22 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // New for a minute after it changes, as of the last redraw: a session
             // that ended inside that minute never redraws to say it is not.
             let fresh = !past && (s.topic_is_new ?? false)
-            title.append(prose(s.topic ?? "—", fresh ? Palette.yellow : Palette.text))
+            // Claude Code's own name for the session leads, because it is the title
+            // iTerm shows on the tab: the eye that comes from a tab matches on it.
+            // The topic ours derives sits under it, yellow while it is new. A
+            // session with no name yet keeps the topic on top.
+            let name = s.session_name ?? ""
+            if name.isEmpty {
+                title.append(prose(s.topic ?? "—", fresh ? Palette.yellow : Palette.text))
+                bottom = ""
+            } else {
+                title.append(prose(name, Palette.text))
+                bottom = s.topic ?? ""
+                if fresh, !bottom.isEmpty {
+                    highlights = [(NSRange(location: 0, length: (bottom as NSString).length), Palette.yellow)]
+                }
+            }
             top = title
-            // Claude Code's own name for the session, under the topic ours derives.
-            bottom = s.session_name ?? ""
         case "dots" where selecting && !past:
             // The checkbox is drawn by pickCell; this only makes a change of tick
             // or of what blocks one redraw the cell.
@@ -8702,7 +8714,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         func rank(_ entry: (session: Session, past: Bool)) -> (Double, String) {
             let s = entry.session.summary
             switch key {
-            case "topic": return (0, (s.topic ?? "~").lowercased())
+            // The line drawn on top: the session name when it has one, else the topic.
+            case "topic": return (0, ((s.session_name?.isEmpty == false ? s.session_name : s.topic) ?? "~").lowercased())
             // Tagged sessions together, by tag, above the untagged.
             case "cwd": return (0, (s.cwd ?? "~").lowercased())
             case "dots":
@@ -9136,18 +9149,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// It reads no Claude data, starts no watcher or sender, and writes only under `selfTestRoot`.
     private func runSelfTest() {
         let now = Date().timeIntervalSince1970
-        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil) -> String {
+        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil, name: String? = nil) -> String {
             """
             {"updated_at": \(now), "active_at": \(now), "rows": ["fixture", "fixture"],
              \(peer.map { "\"peer_name\": \"\($0)\"," } ?? "")
              \(ended ? "\"ended\": {\"reason\": \"exited\", \"at\": \(now)}," : "")
              "summary": {"session_id": "\(id)", "model": "Opus", "effort": "high", "context": 12,
+                         \(name.map { "\"session_name\": \"\($0)\"," } ?? "")
                          "topic": "\(topic)", "cwd": "\(dir)", "project_dir": "\(dir)"},
              "segments": {}}
             """
         }
         let json = """
-            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one")),
+            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one", name: "Named fixture")),
                       \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
             """
