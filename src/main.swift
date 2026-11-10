@@ -2897,6 +2897,10 @@ func focusITermSession(tty: String) -> Bool {
 }
 
 /// The iTerm tab showing this tmux pane through `tmux -CC`, brought forward.
+/// `tmuxWindowPane` is the pane number without its tmux server, so this is exact
+/// only while one server has a `-CC` client: the default one, which is the only
+/// server `tmuxOutput` lists. clo leaves `-CC` off whenever it uses another socket
+/// (`CLO_TMUX_SOCKET`); a `tmux -CC -L other` started by hand would make the match ambiguous.
 func focusITermTmuxPane(_ paneNumber: String, label: String) -> Bool {
     focusITermSession(where: "((variable named \"tmuxWindowPane\") of s as text) is \"\(paneNumber)\"", label: label)
 }
