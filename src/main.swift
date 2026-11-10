@@ -8245,6 +8245,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
 
         let stack = NSMutableAttributedString(attributedString: past ? faded(top) : top)
+        // A long path stays on one line, cut in the middle: wrapped, it pushed
+        // the caption out of the cell. The tooltip carries the whole path.
+        if key == "cwd", stack.length > 0 {
+            let style = NSMutableParagraphStyle()
+            style.lineBreakMode = .byTruncatingMiddle
+            stack.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: stack.length))
+        }
         // Before the first prompt the status line shouts the model and effort in
         // yellow so the choice can still be checked; the captions join in.
         let pending = s.context == nil && !past && (key == "model" || key == "effort")
@@ -8412,9 +8419,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         } else if key == "cwd", let tty = session.tty, !past {
             // The table's double-click goes to the terminal; a single click only
             // selects, as in every other cell.
-            field.toolTip = "\(tty.replacingOccurrences(of: "/dev/", with: "")) · double-click to show this terminal in iTerm"
+            field.toolTip = "\(session.summary.cwd ?? "")\n\(tty.replacingOccurrences(of: "/dev/", with: "")) · double-click to show this terminal in iTerm"
         } else if key == "cwd", past {
-            field.toolTip = "Double-click to resume in a new iTerm tab"
+            field.toolTip = "\(session.summary.cwd ?? "")\nDouble-click to resume in a new iTerm tab"
         }
         if key == "cwd" {
             // The row's menu, with the copies flashing the cell they came from.
@@ -9094,7 +9101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let json = """
             {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one")),
-                      \(session("fixture-b", dir: "/fixture/two", topic: "second fixture", ended: false))],
+                      \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
             """
         var problems: [String] = []
