@@ -2864,6 +2864,8 @@ func detachedTtys(in panes: String) -> Set<String> {
 
 /// The ttys of detached tmux panes as of the last poll; read on the main thread.
 var detachedPaneTtys: Set<String> = []
+/// Whether a tmux poll for it is still out; read and written on the main thread.
+var pollingDetachedPanes = false
 
 /// The glyph of a live session's dot: a half-filled one when its tmux session has no terminal attached.
 func liveDotGlyph(tty: String?) -> String {
@@ -7153,10 +7155,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// Which tmux sessions run with nothing attached; redraws the table when that changes.
     private func pollDetachedPanes() {
-        guard !selfTest else { return }
+        // One poll at a time: a hung tmux server would otherwise park a thread and a
+        // child process every 30 seconds.
+        guard !selfTest, !pollingDetachedPanes else { return }
+        pollingDetachedPanes = true
         DispatchQueue.global(qos: .utility).async {
             let found = detachedTtys(in: tmuxOutput(["list-panes", "-a", "-F", tmuxAttachedFormat]) ?? "")
             DispatchQueue.main.async { [weak self] in
+                pollingDetachedPanes = false
                 guard found != detachedPaneTtys else { return }
                 detachedPaneTtys = found
                 self?.refreshTable()
