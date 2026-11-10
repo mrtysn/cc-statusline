@@ -2877,6 +2877,10 @@ func tmuxLookupProblems() -> [String] {
     if tmuxPane(forTty: "/dev/ttys004", in: "") != nil { problems.append("empty tmux output mapped to a session") }
     if tmuxPane(forTty: "/dev/ttys004", in: "/dev/ttys004_ai-job-search-72_%0\n") != nil { problems.append("tmux output without tabs mapped to a session") }
     if tmuxClientTtys(in: "/dev/ttys002\n\n/dev/ttys007\n") != ["/dev/ttys002", "/dev/ttys007"] { problems.append("client ttys were not read") }
+    let resume = resumeShellCommand(directory: "'/tmp/a b'", arguments: "--resume x --effort low")
+    if resume != "cd '/tmp/a b' && if command -v clo >/dev/null; then command clo --run-claude --resume x --effort low; else claude --resume x --effort low; fi" {
+        problems.append("resume did not go through clo --run-claude: \(resume)")
+    }
     // The app runs with launchd's bare environment: with a tmux server up, its
     // real output must still split into fields there.
     if let live = tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat], environment: ["HOME": home.path, "PATH": "/usr/bin:/bin"]),
@@ -2938,12 +2942,19 @@ func focusITermSession(where condition: String, label: String) -> Bool {
 func resumeCommand(_ s: Summary, mode: String?) -> String? {
     guard let id = s.session_id, let dir = s.project_dir else { return nil }
     let quote = { (text: String) in "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-    var parts = ["cd", quote((dir as NSString).expandingTildeInPath), "&&", "claude", "--resume", id]
-    if let model = s.model_id { parts += ["--model", quote(model)] }
-    if let effort = s.effort { parts += ["--effort", effort] }
+    var args = ["--resume", id]
+    if let model = s.model_id { args += ["--model", quote(model)] }
+    if let effort = s.effort { args += ["--effort", effort] }
     // The transcript still says `default` for what the command line calls `manual`.
-    if let mode = mode { parts += ["--permission-mode", mode == "default" ? "manual" : mode] }
-    return parts.joined(separator: " ")
+    if let mode = mode { args += ["--permission-mode", mode == "default" ? "manual" : mode] }
+    return resumeShellCommand(directory: quote((dir as NSString).expandingTildeInPath), arguments: args.joined(separator: " "))
+}
+
+/// Resumes through `clo --run-claude` where clo is installed, so the session runs
+/// inside tmux as every clo launch does and clo-remote can reach it; plain
+/// `claude` otherwise. `command` skips the shell function `clo --init zsh` defines.
+func resumeShellCommand(directory: String, arguments: String) -> String {
+    "cd \(directory) && if command -v clo >/dev/null; then command clo --run-claude \(arguments); else claude \(arguments); fi"
 }
 
 /// Runs a command in a new tab of iTerm's hotkey window, and shows that window;
@@ -3000,6 +3011,16 @@ func typeInTerminal(tty: String, _ command: String) -> String {
         return "not found"
         """
     return runScript(script, label: "restart \(tty)")
+}
+
+/// Types a command into this tmux pane (`%22` → "22") and presses Return; false
+/// when the pane is gone. A pane reached by the phone or a `-CC` tab has no iTerm
+/// session with its tty, so `typeInTerminal` cannot reach it.
+func typeInTmuxPane(_ paneNumber: String, _ command: String) -> Bool {
+    guard tmuxOutput(["send-keys", "-t", "%\(paneNumber)", "-l", "--", command]) != nil else { return false }
+    let entered = tmuxOutput(["send-keys", "-t", "%\(paneNumber)", "Enter"]) != nil
+    log("restart: typed into tmux pane %\(paneNumber): \(entered ? "ok" : "Return failed")")
+    return entered
 }
 
 /// Sends one message to several sessions by name, through a headless Haiku
@@ -7461,7 +7482,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let item = ActionItem("Restart Session", enabled: restartBlocker(session) == nil) { [weak self] in
                 self?.restartInPlace(session)
             }
-            item.toolTip = restartBlocker(session) ?? "Exits Claude Code here and resumes it in the same iTerm tab"
+            item.toolTip = restartBlocker(session) ?? "Exits Claude Code here and resumes it where it ran: the same iTerm tab or tmux pane, else a new tab"
             menu.addItem(item)
         }
     }
@@ -7715,7 +7736,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         guard let window = window else { return }
         let alert = NSAlert()
         alert.messageText = "Restart \(ready.count) session\(ready.count == 1 ? "" : "s") on an older Claude Code?"
-        alert.informativeText = "Each one exits and resumes in its own iTerm tab, with its model, effort and permission mode."
+        alert.informativeText = "Each one exits and resumes where it ran, its own iTerm tab or tmux pane, with its model, effort and permission mode."
             + (busy > 0 ? " \(busy) busy session\(busy == 1 ? " is" : "s are") left alone." : "")
         alert.addButton(withTitle: "Restart")
         alert.addButton(withTitle: "Cancel")
@@ -7740,10 +7761,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let report = { (message: String) in DispatchQueue.main.async { self?.note(message) } }
             // The pid is only ours to signal while it is still that process on that terminal.
             guard sampler.owns(pid: pid, tty: tty) else { return report("Not restarted: \(id) already ended") }
+            // Found before the exit: a pane whose shell outlives Claude Code (a
+            // clo-remote launch) is typed into; one that ran Claude Code itself
+            // (a clo launch from iTerm) is gone, and the session resumes in a new tab.
+            let pane = tmuxPane(forTty: tty, in: tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat]) ?? "")
             kill(pid, SIGTERM)
             guard waitForExit(pid, seconds: 15) else { return report("Not restarted: \(id) did not exit") }
             waitForQuietTerminal(tty, seconds: 10)
-            if typeInTerminal(tty: tty, command) != "ok" {
+            if let pane = pane {
+                if !typeInTmuxPane(pane.paneNumber, command) { DispatchQueue.main.async { runInNewTab(command) } }
+            } else if typeInTerminal(tty: tty, command) != "ok" {
                 DispatchQueue.main.async { runInNewTab(command) }
             }
             report("Restarted \(id)")
