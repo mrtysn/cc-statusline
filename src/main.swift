@@ -2848,6 +2848,28 @@ func tmuxClientTtys(in clients: String) -> [String] {
     clients.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.hasPrefix("/dev/") }
 }
 
+/// What `list-panes -a -F` prints for `detachedTtys(in:)`.
+let tmuxAttachedFormat = "#{pane_tty}\t#{session_attached}"
+
+/// The ttys of panes whose tmux session has no client attached: a session that runs
+/// on without any terminal showing it. A `tmux -CC` tab counts as attached.
+func detachedTtys(in panes: String) -> Set<String> {
+    var ttys: Set<String> = []
+    for line in panes.split(separator: "\n") {
+        let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+        if parts.count == 2, parts[0].hasPrefix("/dev/"), parts[1] == "0" { ttys.insert(parts[0]) }
+    }
+    return ttys
+}
+
+/// The ttys of detached tmux panes as of the last poll; read on the main thread.
+var detachedPaneTtys: Set<String> = []
+
+/// The glyph of a live session's dot: a half-filled one when its tmux session has no terminal attached.
+func liveDotGlyph(tty: String?) -> String {
+    tty.map(detachedPaneTtys.contains) == true ? "◐" : "●"
+}
+
 /// tmux's output for these arguments, or nil without a tmux or a tmux server.
 /// `-u` because launchd starts the app with no locale, and tmux in a non-UTF-8
 /// locale prints a format's tab as `_`, which no lookup here can split.
@@ -2876,6 +2898,7 @@ func tmuxLookupProblems() -> [String] {
     if tmuxPane(forTty: "/dev/ttys001", in: panes) != nil { problems.append("a tty no pane has mapped to a session") }
     if tmuxPane(forTty: "/dev/ttys004", in: "") != nil { problems.append("empty tmux output mapped to a session") }
     if tmuxPane(forTty: "/dev/ttys004", in: "/dev/ttys004_ai-job-search-72_%0\n") != nil { problems.append("tmux output without tabs mapped to a session") }
+    if detachedTtys(in: "/dev/ttys004\t0\n/dev/ttys009\t2\n/dev/ttys011\t0\nbroken\n") != ["/dev/ttys004", "/dev/ttys011"] { problems.append("detached panes were not read") }
     if tmuxClientTtys(in: "/dev/ttys002\n\n/dev/ttys007\n") != ["/dev/ttys002", "/dev/ttys007"] { problems.append("client ttys were not read") }
     let resume = resumeShellCommand(directory: "'/tmp/a b'", arguments: "--resume x --effort low")
     if resume != "cd '/tmp/a b' && if command -v clo >/dev/null; then command clo --run-claude --resume x --effort low; else claude --resume x --effort low; fi" {
@@ -7118,11 +7141,26 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         // Countdowns keep running while nothing redraws, and a session only
         // becomes "finished" with the passage of time.
+        pollDetachedPanes()
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.reload()
+            self?.pollDetachedPanes()
             // The account's quotas, so a reset made on claude.ai reaches the bar with no
             // session redrawing: the script gates it to one request per five minutes.
             DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
+        }
+    }
+
+    /// Which tmux sessions run with nothing attached; redraws the table when that changes.
+    private func pollDetachedPanes() {
+        guard !selfTest else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let found = detachedTtys(in: tmuxOutput(["list-panes", "-a", "-F", tmuxAttachedFormat]) ?? "")
+            DispatchQueue.main.async { [weak self] in
+                guard found != detachedPaneTtys else { return }
+                detachedPaneTtys = found
+                self?.refreshTable()
+            }
         }
     }
 
@@ -7277,8 +7315,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// The dot of a working session, breathing between full and 60% on a
     /// 2-second cycle. Every such dot shares one clock, so they breathe
     /// together and a rebuilt cell picks up mid-breath rather than restarting.
-    private func breathingDot(_ colour: NSColor) -> NSTextField {
-        let dot = NSTextField(labelWithString: "●")
+    private func breathingDot(_ colour: NSColor, glyph: String = "●") -> NSTextField {
+        let dot = NSTextField(labelWithString: glyph)
         dot.font = barFont
         dot.textColor = colour
         dot.wantsLayer = true
@@ -8077,7 +8115,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // A working session's dot is drawn by an overlay that breathes;
             // the glyph stays, clear, to hold its place in the line.
             let breathes = !past && isWorking(session)
-            let dot = mono(past ? "○  " : "●  ", breathes ? .clear : dotColour(session, past: past))
+            let dot = mono(past ? "○  " : liveDotGlyph(tty: session.tty) + "  ", breathes ? .clear : dotColour(session, past: past))
             // The caption lines up with the topic, not with the dot before it.
             captionIndent = ceil(dot.size().width)
             let title = NSMutableAttributedString(attributedString: dot)
@@ -8434,7 +8472,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         cell.toolTip = field.toolTip
         if key == "topic", !past, isWorking(session) {
             // Over the clear glyph the text keeps, on the same baseline.
-            let dot = breathingDot(dotColour(session, past: false))
+            let dot = breathingDot(dotColour(session, past: false), glyph: liveDotGlyph(tty: session.tty))
             cell.addExtra(dot)
             NSLayoutConstraint.activate([
                 dot.leadingAnchor.constraint(equalTo: field.leadingAnchor),
