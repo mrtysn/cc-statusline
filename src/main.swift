@@ -8673,6 +8673,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // The stripe and the cache column show the same thing, so they sort
             // the same way: by how much cache life is left, cold last.
             case "cache", "heat":
+                // Finished sessions have no cache to save: in the default order
+                // the one closed last comes first, not the one closed longest ago.
+                if cacheOrder == .soonest && entry.past { return (-(entry.session.active_at ?? entry.session.updated_at), "") }
                 let left = cacheLeft(s.cache)
                 return (cacheOrder == .soonest && left < 0 ? .greatestFiniteMagnitude : left, "")
             case "age": return (entry.session.active_at ?? entry.session.updated_at, "")
