@@ -6933,7 +6933,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let grouped = rows.filter { !$0.past }.map { $0.session.summary.session_id }
             if grouped != ["fixture-b", "fixture-a"] { problems.append("live order with an agent-launched session is \(grouped), want fixture-a last") }
             if !startsAgentGroup(1) || startsAgentGroup(0) { problems.append("the Agent-launched heading is not on the first agent-launched row") }
-            if !content("topic", row: 1).text.string.contains("launched by orchestrator-1f") { problems.append("an agent-launched row does not name its launcher") }
+            if !content("topic", row: 1).text.string.contains("orchestrator-1f launched") { problems.append("an agent-launched row does not name its launcher") }
             paneLaunchers = savedLaunchers
             sortRows()
             // Finished sessions stay newest first even under Doing, whose names would put "fourth" before "third".
@@ -8386,7 +8386,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
             // An agent-launched session names its launcher first in the caption.
             if !past, let by = launcher(tty: session.tty) {
-                let prefix = "launched by " + by
+                let prefix = by + " launched"
                 let shift = ((prefix + (bottom.isEmpty ? "" : " · ")) as NSString).length
                 highlights = highlights.map { (NSRange(location: $0.range.location + shift, length: $0.range.length), $0.colour) }
                 bottom = prefix + (bottom.isEmpty ? "" : " · " + bottom)
