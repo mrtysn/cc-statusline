@@ -132,6 +132,8 @@ struct Summary: Decodable {
     let effort: String?
     let started_at: Double?
     let context: Double?
+    /// Before the first reply of a resumed session: the last reply's share of the window, read from its transcript.
+    let context_estimate: Double?
     let five_hour: Limit?
     let seven_day: Limit?
     let fable: Limit?
@@ -6893,6 +6895,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             problems.append("replacedBundle misjudges a swapped-aside, a missing or an existing bundle")
         }
 
+        // A session with no reported context shows the transcript's estimate, marked as one.
+        if let row = rows.firstIndex(where: { $0.session.summary.session_id == "fixture-b" }) {
+            let cell = content("context", row: row)
+            if cell.percent != 41 || !cell.estimated { problems.append("the context cell shows \(String(describing: cell.percent)) (estimated: \(cell.estimated)), want an estimate of 41") }
+        } else {
+            problems.append("fixture-b is not in the list")
+        }
+
         // The refresh button sits at the right end of the table's header row.
         if let header = table.headerView, let content = window.contentView {
             let button = content.convert(refreshButton.bounds, from: refreshButton)
@@ -8333,6 +8343,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         var past: Bool
         var drop: CGFloat
         var alignment: NSTextAlignment
+        /// The percentage is a guess from the transcript, not Claude Code's reading.
+        var estimated = false
     }
 
     private func content(_ key: String, row: Int) -> CellContent {
@@ -8522,7 +8534,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             }
         case "context":
             return CellContent(
-                text: NSAttributedString(), heat: nil, percent: s.context, past: past, drop: drop, alignment: .left)
+                text: NSAttributedString(), heat: nil, percent: s.context ?? s.context_estimate, past: past, drop: drop,
+                alignment: .left, estimated: s.context == nil && s.context_estimate != nil)
         case "heat":
             // A stripe beside the cache, not a wash behind it: the colour is a
             // scale to read along, and a tinted cell fights the text in it.
@@ -8617,7 +8630,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let s = session.summary
         let c = shownContent(key, row: row)
         let drop = c.drop
-        if key == "context" { return progressCell(c.percent, past: past, drop: drop, key: s.session_id) }
+        if key == "context" { return progressCell(c.percent, past: past, drop: drop, key: s.session_id, estimated: c.estimated) }
         // In Select mode a live row's dots give way to its checkbox.
         if key == "dots", selecting, !past { return pickCell(session, past: past) }
         if key == "dots" {
@@ -8982,7 +8995,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             case "model": return (modelRank(s.model), (s.model ?? "").lowercased())
             case "effort": return (effortRank(s.effort), s.effort ?? "")
             case "started": return (s.started_at ?? 0, "")
-            case "context": return (s.context ?? -1, "")
+            case "context": return (s.context ?? s.context_estimate ?? -1, "")
             // The stripe and the cache column show the same thing, so they sort
             // the same way: by how much cache life is left, cold last.
             case "cache", "heat":
@@ -9088,21 +9101,22 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     /// "▓▓▓░░ 52%": the bar, then the number it stands for.
-    private func progressCell(_ percent: Double?, past: Bool, drop: CGFloat, key: String?) -> NSView {
+    private func progressCell(_ percent: Double?, past: Bool, drop: CGFloat, key: String?, estimated: Bool = false) -> NSView {
         let cell = ClickableCell()
         cell.setAccessibilityLabel(
-            "Context window \(percent.map { "\(Int($0.rounded())) percent used" } ?? "unknown")")
+            "Context window \(percent.map { "\(Int($0.rounded())) percent used" } ?? "unknown")\(estimated ? ", estimated" : "")")
+        if estimated { cell.toolTip = "Estimated from the last reply: the status line reports the real figure after the next message" }
         let bar = BarView()
         let value = percent ?? 0
         bar.fraction = value / 100
         if let key = key { remember(bar, "context " + key) }
         let colour = Palette.threshold(percent)
-        bar.colour = past ? colour.withAlphaComponent(0.72) : colour
+        bar.colour = past ? colour.withAlphaComponent(0.72) : estimated ? colour.withAlphaComponent(0.5) : colour
         bar.translatesAutoresizingMaskIntoConstraints = false
 
-        let label = NSTextField(labelWithString: percent == nil ? "—" : "\(Int(value.rounded()))%")
+        let label = NSTextField(labelWithString: percent == nil ? "—" : "\(estimated ? "~" : "")\(Int(value.rounded()))%")
         label.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        label.textColor = past ? colour.withAlphaComponent(0.72) : colour
+        label.textColor = past ? colour.withAlphaComponent(0.72) : estimated ? colour.withAlphaComponent(0.6) : colour
         label.alignment = .right
         label.translatesAutoresizingMaskIntoConstraints = false
 
@@ -9413,13 +9427,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// It reads no Claude data, starts no watcher or sender, and writes only under `selfTestRoot`.
     private func runSelfTest() {
         let now = Date().timeIntervalSince1970
-        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil, name: String? = nil, tty: String? = nil, ago: Double = 0) -> String {
+        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil, name: String? = nil, tty: String? = nil, ago: Double = 0, estimate: Int? = nil) -> String {
             """
             {"updated_at": \(now - ago), "active_at": \(now - ago), "rows": ["fixture", "fixture"],
              \(tty.map { "\"tty\": \"\($0)\"," } ?? "")
              \(peer.map { "\"peer_name\": \"\($0)\"," } ?? "")
              \(ended ? "\"ended\": {\"reason\": \"exited\", \"at\": \(now)}," : "")
-             "summary": {"session_id": "\(id)", "model": "Opus", "effort": "high", "context": 12,
+             "summary": {"session_id": "\(id)", "model": "Opus", "effort": "high", "context": \(estimate == nil ? "12" : "null"),
+                         \(estimate.map { "\"context_estimate\": \($0)," } ?? "")
                          \(name.map { "\"session_name\": \"\($0)\"," } ?? "")
                          "topic": "\(topic)", "cwd": "\(dir)", "project_dir": "\(dir)"},
              "segments": {}}
@@ -9427,7 +9442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let json = """
             {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one", name: "Named fixture", tty: "/dev/fixture-attached")),
-                      \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false, tty: "/dev/fixture-detached"))],
+                      \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false, tty: "/dev/fixture-detached", estimate: 41))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true, ago: 10)),
                         \(session("fixture-d", dir: "/fixture/four", topic: "fourth fixture", ended: true, ago: 100))]}
             """

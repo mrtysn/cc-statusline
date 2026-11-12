@@ -1282,6 +1282,44 @@ function judgeTranscript(t, seen) {
 
 // `fresh` false reads only the saved totals: a finished session's transcript is
 // not opened again.
+// A resumed session has had no reply yet, so the status line has no context percentage; the last
+// reply in its transcript says how full the window was. Reads only the tail of the file.
+const CONTEXT_TAIL_BYTES = 512 * 1024;
+function estimateContext(path, windowSize) {
+  if (!path || !(windowSize > 0)) return null;
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+    const size = statSync(path).size;
+    const length = Math.min(size, CONTEXT_TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    readSync(fd, buffer, 0, length, size - length);
+    const lines = buffer.toString('utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"usage"')) continue;
+      let entry;
+      try {
+        entry = JSON.parse(lines[i]);
+      } catch {
+        continue; // the first line of the tail may be cut
+      }
+      const u = entry?.type === 'assistant' ? entry.message?.usage : null;
+      if (!u || entry.message?.model === '<synthetic>') continue;
+      const tokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+      return tokens > 0 ? Math.min(100, Math.round((tokens / windowSize) * 100)) : null;
+    }
+  } catch {
+    // no transcript yet, or unreadable: no estimate
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+  }
+  return null;
+}
+
 function transcriptScan(sessionId, transcriptPath, fresh) {
   if (!sessionId || !transcriptPath) return null;
   const file = scanPath(sessionId);
@@ -1495,6 +1533,11 @@ function liveSnapshot(columns) {
   // totals they ended with.
   for (const [list, fresh] of [[live, true], [ended.slice(0, LIVE_HISTORY_MAX), false]]) {
     for (const e of list) e.transcript = transcriptScan(e.summary.session_id, e.transcript_path, fresh);
+  }
+  for (const e of live) {
+    if (e.summary.context != null) continue;
+    const estimate = estimateContext(e.transcript_path, e.summary.context_window_size);
+    if (estimate != null) e.summary.context_estimate = estimate;
   }
 
   // A session that ended without ever having a prompt has nothing to show and
