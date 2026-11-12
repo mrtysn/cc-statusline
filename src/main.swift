@@ -2884,14 +2884,34 @@ var detachedPaneTtys: Set<String> = []
 /// The launcher of each agent-launched pane, by tty, as of the last poll; read on the main thread.
 var paneLaunchers: [String: String] = [:]
 
+/// Ttys of sessions that appeared since the last tmux poll, each with the number of the first poll
+/// that started after it did. macOS hands a closed pane's tty to the next session, so until such a
+/// poll has run, what the last one said about that tty describes the previous holder.
+var unverifiedTtys: [String: Int] = [:]
+var tmuxPollsStarted = 0
+/// A poll was asked for while one was out; it runs when that one ends.
+var tmuxPollWanted = false
+
+/// The entries still unverified once poll `poll` has finished.
+func unverifiedAfter(poll: Int, _ unverified: [String: Int]) -> [String: Int] { unverified.filter { $0.value > poll } }
+
 /// The peer name of the session that launched this one, when an agent did.
-func launcher(tty: String?) -> String? { tty.flatMap { paneLaunchers[$0] } }
+func launcher(tty: String?) -> String? {
+    guard let tty = tty, unverifiedTtys[tty] == nil else { return nil }
+    return paneLaunchers[tty]
+}
+
+/// Whether the tty is a tmux pane with no terminal attached, as of a poll that saw its session.
+func isDetachedTty(_ tty: String?) -> Bool {
+    guard let tty = tty, unverifiedTtys[tty] == nil else { return false }
+    return detachedPaneTtys.contains(tty)
+}
 /// Whether a tmux poll for it is still out; read and written on the main thread.
 var pollingDetachedPanes = false
 
 /// The glyph of a live session's dot: a hollow diamond (◇) when its tmux session has no terminal attached.
 func liveDotGlyph(tty: String?) -> String {
-    tty.map(detachedPaneTtys.contains) == true ? "◇" : "●"
+    isDetachedTty(tty) ? "◇" : "●"
 }
 
 /// tmux's output for these arguments, or nil without a tmux or a tmux server.
@@ -6928,6 +6948,27 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             problems.append("kept order differs from the shown order")
         }
 
+        // A tty that appeared since the last poll carries no launcher or detached state until a poll has run after it.
+        do {
+            let savedTtys = detachedPaneTtys, savedLaunchers = paneLaunchers, savedUnverified = unverifiedTtys
+            detachedPaneTtys = ["/dev/fixture-attached"]
+            paneLaunchers = ["/dev/fixture-attached": "orchestrator-1f"]
+            unverifiedTtys = ["/dev/fixture-attached": 5]
+            if launcher(tty: "/dev/fixture-attached") != nil || liveDotGlyph(tty: "/dev/fixture-attached") != "●" {
+                problems.append("an unverified tty still shows a launcher or the detached dot")
+            }
+            if unverifiedAfter(poll: 4, unverifiedTtys).count != 1 || !unverifiedAfter(poll: 5, unverifiedTtys).isEmpty {
+                problems.append("a poll verifies the wrong ttys")
+            }
+            unverifiedTtys = [:]
+            if launcher(tty: "/dev/fixture-attached") != "orchestrator-1f" || liveDotGlyph(tty: "/dev/fixture-attached") != "◇" {
+                problems.append("a verified tty loses its launcher or detached dot")
+            }
+            detachedPaneTtys = savedTtys
+            paneLaunchers = savedLaunchers
+            unverifiedTtys = savedUnverified
+        }
+
         // Live sessions: attached first, detached after, under any sort.
         do {
             let savedTtys = detachedPaneTtys, savedLaunchers = paneLaunchers
@@ -7134,6 +7175,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let ended = { (s: Session) in reused.contains(s.summary.session_id ?? "") }
         let live = snapshot.live.filter { !ended($0) }
         let past = snapshot.live.filter(ended) + snapshot.history
+        // A session that just appeared (a finished one resumed, a new one) may hold a tty the last
+        // tmux poll saw under another session: it gets no launcher group or detached dot until
+        // a poll that started after it has run, and that poll starts now.
+        if !selfTest, !allRows.isEmpty {
+            let known = Set(allRows.filter { !$0.past }.compactMap { $0.session.summary.session_id })
+            let fresh = live.filter { !known.contains($0.summary.session_id ?? "") }.compactMap(\.tty)
+            for tty in fresh { unverifiedTtys[tty] = tmuxPollsStarted + 1 }
+            if !fresh.isEmpty { pollDetachedPanes() }
+        }
         allRows = live.map { ($0, false) } + past.map { ($0, true) }
         rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id, $0.session.summary.project_dir) }
         // A tick goes with its session when it ends.
@@ -7391,14 +7441,27 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private func pollDetachedPanes() {
         // One poll at a time: a hung tmux server would otherwise park a thread and a
         // child process every 30 seconds.
-        guard !selfTest, !pollingDetachedPanes else { return }
+        guard !selfTest else { return }
+        guard !pollingDetachedPanes else {
+            tmuxPollWanted = true
+            return
+        }
         pollingDetachedPanes = true
+        tmuxPollsStarted += 1
+        let number = tmuxPollsStarted
         DispatchQueue.global(qos: .utility).async {
             let panes = tmuxOutput(["list-panes", "-a", "-F", tmuxAttachedFormat]) ?? ""
             let found = detachedTtys(in: panes), launchers = launchersByTty(in: panes)
             DispatchQueue.main.async { [weak self] in
                 pollingDetachedPanes = false
-                guard found != detachedPaneTtys || launchers != paneLaunchers else { return }
+                let stillUnverified = unverifiedAfter(poll: number, unverifiedTtys)
+                let verified = stillUnverified.count != unverifiedTtys.count
+                unverifiedTtys = stillUnverified
+                if tmuxPollWanted {
+                    tmuxPollWanted = false
+                    self?.pollDetachedPanes()
+                }
+                guard verified || found != detachedPaneTtys || launchers != paneLaunchers else { return }
                 detachedPaneTtys = found
                 paneLaunchers = launchers
                 self?.sortRows()
@@ -8973,7 +9036,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let ascending = descriptor.ascending
 
         func isDetached(_ entry: (session: Session, past: Bool)) -> Bool {
-            entry.session.tty.map(detachedPaneTtys.contains) == true
+            isDetachedTty(entry.session.tty)
         }
         /// The owner's own sessions, attached then detached, then those another agent launched.
         func group(_ entry: (session: Session, past: Bool)) -> Int {
