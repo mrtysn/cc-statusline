@@ -6197,6 +6197,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var leaderboardWindow: LeaderboardWindow?
     /// The info icon beside the quotas that opens the Usage window.
     private let usageButton = NSButton(title: "", target: nil, action: nil)
+    /// At the right end of the table's header row: reads everything again now instead of at the next change or tick.
+    private let refreshButton = NSButton(title: "", target: nil, action: nil)
     /// The newest usage reading, kept so the window opens with it at once.
     private var lastUsage: UsageSummary?
     private var lastWeekly: FableQuota?
@@ -6316,6 +6318,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         usageButton.action = #selector(openUsage)
         usageButton.toolTip = "Usage: weekly limit, cloud credit, extra spending, Fable's share and where the week went"
         usageButton.translatesAutoresizingMaskIntoConstraints = false
+        refreshButton.isBordered = false
+        refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh now")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
+        refreshButton.imagePosition = .imageOnly
+        refreshButton.imageScaling = .scaleProportionallyDown
+        refreshButton.contentTintColor = Palette.dim
+        refreshButton.target = self
+        refreshButton.action = #selector(forceRefresh)
+        refreshButton.toolTip = "Refresh now: read every session, the detached tmux sessions and the quotas again"
+        refreshButton.setAccessibilityLabel("Refresh now")
+        refreshButton.translatesAutoresizingMaskIntoConstraints = false
 
         buildColumns()
         table.dataSource = self
@@ -6367,6 +6380,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         content.addSubview(soundBar)
         content.addSubview(gridScroll)
         content.addSubview(emptyLabel)
+        content.addSubview(refreshButton)
         // Its own strip under the table, so the controls at the top never move for it.
         guardsLabel.textColor = Palette.yellow
         guardsLabel.font = NSFont.systemFont(ofSize: 11)
@@ -6405,6 +6419,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             gridScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             emptyLabel.centerXAnchor.constraint(equalTo: gridScroll.centerXAnchor),
             emptyLabel.topAnchor.constraint(equalTo: gridScroll.topAnchor, constant: 60),
+            // On the header row, at its right end.
+            refreshButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -8),
+            refreshButton.centerYAnchor.constraint(equalTo: gridScroll.topAnchor, constant: (table.headerView?.frame.height ?? 28) / 2),
+            refreshButton.widthAnchor.constraint(equalToConstant: 18),
+            refreshButton.heightAnchor.constraint(equalToConstant: 18),
         ])
         drawGuardsLabel()
 
@@ -6840,6 +6859,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             problems.append("auto tag colours are not distinct and stable: \(auto)")
         }
         window.layoutIfNeeded()
+
+        // The refresh button sits at the right end of the table's header row.
+        if let header = table.headerView, let content = window.contentView {
+            let button = content.convert(refreshButton.bounds, from: refreshButton)
+            let strip = content.convert(header.bounds, from: header)
+            if abs(button.midY - strip.midY) > 2 { problems.append("refresh button is not on the header row: \(button) vs \(strip)") }
+            if content.bounds.maxX - button.maxX > 16 || button.minX < content.bounds.midX { problems.append("refresh button is not at the right end: \(button)") }
+        } else {
+            problems.append("no table header to hold the refresh button")
+        }
 
         // Order hold: kept order while interacting, released after the grace period and at the cap.
         var hold = OrderHold()
@@ -7302,6 +7331,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // session redrawing: the script gates it to one request per five minutes.
             DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
         }
+    }
+
+    /// The refresh button: what the watchers and the 30-second tick do, now, and with the new order
+    /// applied at once even when the pointer had held the old one.
+    @objc private func forceRefresh() {
+        orderHold = OrderHold()
+        reload()
+        pollDetachedPanes()
+        DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
+        refreshButton.contentTintColor = Palette.text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.refreshButton.contentTintColor = Palette.dim }
     }
 
     /// Which tmux sessions run with nothing attached; redraws the table when that changes.
