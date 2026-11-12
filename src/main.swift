@@ -2867,9 +2867,9 @@ var detachedPaneTtys: Set<String> = []
 /// Whether a tmux poll for it is still out; read and written on the main thread.
 var pollingDetachedPanes = false
 
-/// The glyph of a live session's dot: a diamond (◆) when its tmux session has no terminal attached.
+/// The glyph of a live session's dot: a hollow diamond (◇) when its tmux session has no terminal attached.
 func liveDotGlyph(tty: String?) -> String {
-    tty.map(detachedPaneTtys.contains) == true ? "◆" : "●"
+    tty.map(detachedPaneTtys.contains) == true ? "◇" : "●"
 }
 
 /// tmux's output for these arguments, or nil without a tmux or a tmux server.
