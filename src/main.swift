@@ -6078,6 +6078,38 @@ func promptNewTag(store: TagStore, on window: NSWindow, note: String, then: @esc
     }
 }
 
+/// Decides when the sessions list may keep its old row order: while the user is on a row, for a
+/// grace period after, and never longer than `cap` seconds from the first moment of the hold.
+struct OrderHold {
+    static let cap: TimeInterval = 15
+    static let grace: TimeInterval = 1.5
+    private var lastActive = Date.distantPast
+    private var since: Date?
+
+    mutating func held(interacting: Bool, now: Date) -> Bool {
+        if interacting { lastActive = now }
+        guard now.timeIntervalSince(lastActive) < Self.grace else {
+            since = nil
+            return false
+        }
+        if since == nil { since = now }
+        // Past the cap it stays released until the user has been off the rows for the grace period.
+        return now.timeIntervalSince(since!) < Self.cap
+    }
+
+    /// `rows` with the sessions already on screen in their shown order; new ones follow, as sorted.
+    static func keep(
+        _ rows: [(session: Session, past: Bool)], like before: [String]
+    ) -> [(session: Session, past: Bool)] {
+        let place = Dictionary(before.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        return rows.enumerated().sorted { a, b in
+            let pa = place[a.element.session.summary.session_id ?? ""] ?? Int.max
+            let pb = place[b.element.session.summary.session_id ?? ""] ?? Int.max
+            return pa != pb ? pa < pb : a.offset < b.offset
+        }.map(\.element)
+    }
+}
+
 final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation,
     NSMenuDelegate, NSTextFieldDelegate
 {
@@ -6772,6 +6804,21 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         window.layoutIfNeeded()
 
+        // Order hold: kept order while interacting, released after the grace period and at the cap.
+        var hold = OrderHold()
+        let t0 = Date()
+        if hold.held(interacting: false, now: t0) { problems.append("order held with no interaction") }
+        if !hold.held(interacting: true, now: t0) { problems.append("order not held while on a row") }
+        if !hold.held(interacting: false, now: t0 + 1) { problems.append("order released inside the grace period") }
+        if hold.held(interacting: false, now: t0 + 3) { problems.append("order still held after the grace period") }
+        _ = hold.held(interacting: true, now: t0 + 10)
+        if !hold.held(interacting: true, now: t0 + 10 + OrderHold.cap - 1) { problems.append("hold ended before the cap") }
+        if hold.held(interacting: true, now: t0 + 10 + OrderHold.cap + 1) { problems.append("hold outlasts the cap") }
+        let kept = OrderHold.keep(Array(rows.reversed()), like: rows.compactMap { $0.session.summary.session_id })
+        if kept.map({ $0.session.summary.session_id }) != rows.map({ $0.session.summary.session_id }) {
+            problems.append("kept order differs from the shown order")
+        }
+
         // Columns: every declared column is in the table, in order, with its title.
         // A sorted column's title carries its order after the name ("Cache · soonest").
         let shown = table.tableColumns.map(\.title)
@@ -6965,10 +7012,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         lastWeekly = snapshot.weekly
         usageWindow?.update(snapshot.usage, weekly: snapshot.weekly)
         sortRows()
+        holdOrderIfInteracting(like: shownOrder)
         refreshTable()
         table.reloadData(forRowIndexes: IndexSet(integer: 0), columnIndexes: IndexSet(table.tableColumns.indices))
         select(keep)
     }
+
+    /// The sessions in the order they were last drawn.
+    private var shownOrder: [String] { drawnIds.map { $0.hasSuffix("~") ? String($0.dropLast()) : $0 } }
 
     /// The window never narrows past the top row: the quotas, the usage icon, a gap and the sound controls side by side.
     private func fitMinimumWidth() {
@@ -7058,6 +7109,37 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var drawnIds: [String] = []
     /// The table row under the mouse, or -1.
     private var hoveredRow = -1
+    private var menuOpen = false
+    private var orderHold = OrderHold()
+    private var orderPending = false
+    private var settleTimer: Timer?
+
+    /// Whether the pointer is on a session row or the row menu is open: the moments a reorder
+    /// would put another session under the click.
+    private func interacting() -> Bool { menuOpen || hoveredRow > 0 }
+
+    /// A refresh that would reorder rows keeps the order on screen while the user is on a row,
+    /// for at most `OrderHold.cap` seconds; cells keep updating in place. The new order lands
+    /// once the pointer has been off the rows for the grace period, or the cap runs out.
+    private func holdOrderIfInteracting(like before: [String]) {
+        guard orderHold.held(interacting: interacting(), now: Date()) else { return }
+        rows = OrderHold.keep(rows, like: before)
+        daySplits = findDaySplits()
+        orderPending = true
+        guard settleTimer == nil else { return }
+        settleTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self, self.orderPending else { return }
+            if self.orderHold.held(interacting: self.interacting(), now: Date()) { return }
+            self.settleTimer?.invalidate()
+            self.settleTimer = nil
+            self.orderPending = false
+            let keep = self.selected?.session.summary.session_id
+            self.sortRows()
+            self.refreshTable()
+            self.select(keep)
+        }
+    }
+
     /// Each live session's state as last drawn, to pulse a row when it changes.
     private var lastState: [String: String] = [:]
     /// What each bar last showed, so its replacement glides on from there.
@@ -7460,6 +7542,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     // MARK: Session menu
+
+    func menuWillOpen(_ menu: NSMenu) { if menu === table.menu { menuOpen = true } }
+    func menuDidClose(_ menu: NSMenu) { if menu === table.menu { menuOpen = false } }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
