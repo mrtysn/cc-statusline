@@ -2867,9 +2867,9 @@ var detachedPaneTtys: Set<String> = []
 /// Whether a tmux poll for it is still out; read and written on the main thread.
 var pollingDetachedPanes = false
 
-/// The glyph of a live session's dot: a half-filled one when its tmux session has no terminal attached.
+/// The glyph of a live session's dot: a ringed one (◉) when its tmux session has no terminal attached.
 func liveDotGlyph(tty: String?) -> String {
-    tty.map(detachedPaneTtys.contains) == true ? "◐" : "●"
+    tty.map(detachedPaneTtys.contains) == true ? "◉" : "●"
 }
 
 /// tmux's output for these arguments, or nil without a tmux or a tmux server.
@@ -9234,9 +9234,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// It reads no Claude data, starts no watcher or sender, and writes only under `selfTestRoot`.
     private func runSelfTest() {
         let now = Date().timeIntervalSince1970
-        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil, name: String? = nil) -> String {
+        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil, name: String? = nil, tty: String? = nil) -> String {
             """
             {"updated_at": \(now), "active_at": \(now), "rows": ["fixture", "fixture"],
+             \(tty.map { "\"tty\": \"\($0)\"," } ?? "")
              \(peer.map { "\"peer_name\": \"\($0)\"," } ?? "")
              \(ended ? "\"ended\": {\"reason\": \"exited\", \"at\": \(now)}," : "")
              "summary": {"session_id": "\(id)", "model": "Opus", "effort": "high", "context": 12,
@@ -9247,10 +9248,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let json = """
             {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one", name: "Named fixture")),
-                      \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false))],
+                      \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false, tty: "/dev/fixture-detached"))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
             """
         var problems: [String] = []
+        // CC_SESSIONS_WINDOW_DETACHED=1 draws the second fixture as a tmux session with no terminal attached.
+        if ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_DETACHED"] == "1" { detachedPaneTtys = ["/dev/fixture-detached"] }
         // CC_SESSIONS_BENCH=<n> times the list with n finished sessions and a tenth as many live ones.
         if let n = ProcessInfo.processInfo.environment["CC_SESSIONS_BENCH"].flatMap(Int.init) {
             let many = """
