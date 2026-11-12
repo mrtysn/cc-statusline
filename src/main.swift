@@ -2848,8 +2848,10 @@ func tmuxClientTtys(in clients: String) -> [String] {
     clients.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.hasPrefix("/dev/") }
 }
 
-/// What `list-panes -a -F` prints for `detachedTtys(in:)`.
-let tmuxAttachedFormat = "#{pane_tty}\t#{session_attached}"
+/// What `list-panes -a -F` prints for `detachedTtys(in:)` and `launchersByTty(in:)`.
+/// `@launched_by` is the tmux user option a launcher (`clo launch --launched-by`, a
+/// script's `set-option`) puts on a session another agent started: that agent's peer name.
+let tmuxAttachedFormat = "#{pane_tty}\t#{session_attached}\t#{@launched_by}"
 
 /// The ttys of panes whose tmux session has no client attached: a session that runs
 /// on without any terminal showing it. A `tmux -CC` tab counts as attached.
@@ -2857,13 +2859,31 @@ func detachedTtys(in panes: String) -> Set<String> {
     var ttys: Set<String> = []
     for line in panes.split(separator: "\n") {
         let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-        if parts.count == 2, parts[0].hasPrefix("/dev/"), parts[1] == "0" { ttys.insert(parts[0]) }
+        if parts.count >= 2, parts[0].hasPrefix("/dev/"), parts[1] == "0" { ttys.insert(parts[0]) }
     }
     return ttys
 }
 
+/// The peer name of the agent that launched each pane's tmux session, by pane tty; panes
+/// with no `@launched_by` are left out.
+func launchersByTty(in panes: String) -> [String: String] {
+    var launchers: [String: String] = [:]
+    for line in panes.split(separator: "\n") {
+        let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 3, parts[0].hasPrefix("/dev/") else { continue }
+        let by = parts[2].trimmingCharacters(in: .whitespaces)
+        if !by.isEmpty { launchers[parts[0]] = by }
+    }
+    return launchers
+}
+
 /// The ttys of detached tmux panes as of the last poll; read on the main thread.
 var detachedPaneTtys: Set<String> = []
+/// The launcher of each agent-launched pane, by tty, as of the last poll; read on the main thread.
+var paneLaunchers: [String: String] = [:]
+
+/// The peer name of the session that launched this one, when an agent did.
+func launcher(tty: String?) -> String? { tty.flatMap { paneLaunchers[$0] } }
 /// Whether a tmux poll for it is still out; read and written on the main thread.
 var pollingDetachedPanes = false
 
@@ -2901,6 +2921,7 @@ func tmuxLookupProblems() -> [String] {
     if tmuxPane(forTty: "/dev/ttys004", in: "") != nil { problems.append("empty tmux output mapped to a session") }
     if tmuxPane(forTty: "/dev/ttys004", in: "/dev/ttys004_ai-job-search-72_%0\n") != nil { problems.append("tmux output without tabs mapped to a session") }
     if detachedTtys(in: "/dev/ttys004\t0\n/dev/ttys009\t2\n/dev/ttys011\t0\nbroken\n") != ["/dev/ttys004", "/dev/ttys011"] { problems.append("detached panes were not read") }
+    if launchersByTty(in: "/dev/ttys004\t0\torchestrator-1f\n/dev/ttys009\t1\t\nbroken\n") != ["/dev/ttys004": "orchestrator-1f"] { problems.append("agent launchers were not read") }
     if tmuxClientTtys(in: "/dev/ttys002\n\n/dev/ttys007\n") != ["/dev/ttys002", "/dev/ttys007"] { problems.append("client ttys were not read") }
     let resume = resumeShellCommand(directory: "'/tmp/a b'", arguments: "--resume x --effort low")
     if resume != "cd '/tmp/a b' && if command -v clo >/dev/null; then command clo --run-claude --resume x --effort low; else claude --resume x --effort low; fi" {
@@ -3454,6 +3475,11 @@ final class SessionRowView: NSTableRowView {
     static let boundaryPadding: CGFloat = 26
     /// Set on a finished row from a different day than the one above it.
     var startsDay = false
+    /// Set on the first live session another agent launched: draws the group's heading above it.
+    var agentHeading = false
+    /// Extra height on that row, which holds the heading.
+    static let headingPadding: CGFloat = 24
+    static let headingText = "Agent-launched"
 
     override func drawBackground(in dirtyRect: NSRect) {
         super.drawBackground(in: dirtyRect)
@@ -3466,6 +3492,17 @@ final class SessionRowView: NSTableRowView {
             line.setLineDash([3, 4], count: 2, phase: 0)
             NSColor(srgbRed: 0.42, green: 0.44, blue: 0.51, alpha: 0.35).setStroke()
             line.stroke()
+        }
+        if agentHeading {
+            // A small caps label in the padding above the row's own content, left-aligned
+            // with the topic: a heading, not a session.
+            let label = NSAttributedString(string: Self.headingText.uppercased(), attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                .foregroundColor: NSColor(srgbRed: 0.62, green: 0.64, blue: 0.71, alpha: 1),
+                .kern: 0.8,
+            ])
+            let size = label.size()
+            label.draw(at: NSPoint(x: 16, y: ((Self.headingPadding - size.height) / 2).rounded() + 2))
         }
         guard drawsBoundary else { return }
         NSColor(srgbRed: 0.42, green: 0.44, blue: 0.51, alpha: 0.9).setFill()
@@ -3491,7 +3528,7 @@ final class SessionRowView: NSTableRowView {
     /// Where hover, pulse and selection draw: inset from the table's edges and
     /// rounded, and on the boundary row only the part below the line.
     private var band: NSBezierPath {
-        let top = drawsBoundary ? Self.boundaryPadding : 0
+        let top = (drawsBoundary ? Self.boundaryPadding : 0) + (agentHeading ? Self.headingPadding : 0)
         let rect = NSRect(x: 4, y: top + 1, width: bounds.width - 8, height: bounds.height - top - 2)
         return NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
     }
@@ -6821,12 +6858,22 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         // Live sessions: attached first, detached after, under any sort.
         do {
-            let savedTtys = detachedPaneTtys
+            let savedTtys = detachedPaneTtys, savedLaunchers = paneLaunchers
             detachedPaneTtys = ["/dev/fixture-attached"]
+            paneLaunchers = [:]
             sortRows()
             let live = rows.filter { !$0.past }.map { $0.session.summary.session_id }
             if live != ["fixture-b", "fixture-a"] { problems.append("live order is \(live), want attached fixture-b first") }
             detachedPaneTtys = savedTtys
+            // An agent-launched session goes below the owner's own, under a heading, naming its launcher.
+            paneLaunchers = ["/dev/fixture-attached": "orchestrator-1f"]
+            sortRows()
+            let grouped = rows.filter { !$0.past }.map { $0.session.summary.session_id }
+            if grouped != ["fixture-b", "fixture-a"] { problems.append("live order with an agent-launched session is \(grouped), want fixture-a last") }
+            if !startsAgentGroup(1) || startsAgentGroup(0) { problems.append("the Agent-launched heading is not on the first agent-launched row") }
+            if !content("topic", row: 1).text.string.contains("launched by orchestrator-1f") { problems.append("an agent-launched row does not name its launcher") }
+            paneLaunchers = savedLaunchers
+            sortRows()
             // Finished sessions stay newest first even under Doing, whose names would put "fourth" before "third".
             let savedSort = table.sortDescriptors
             settingSort = true
@@ -7264,12 +7311,15 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         guard !selfTest, !pollingDetachedPanes else { return }
         pollingDetachedPanes = true
         DispatchQueue.global(qos: .utility).async {
-            let found = detachedTtys(in: tmuxOutput(["list-panes", "-a", "-F", tmuxAttachedFormat]) ?? "")
+            let panes = tmuxOutput(["list-panes", "-a", "-F", tmuxAttachedFormat]) ?? ""
+            let found = detachedTtys(in: panes), launchers = launchersByTty(in: panes)
             DispatchQueue.main.async { [weak self] in
                 pollingDetachedPanes = false
-                guard found != detachedPaneTtys else { return }
+                guard found != detachedPaneTtys || launchers != paneLaunchers else { return }
                 detachedPaneTtys = found
-                self?.refreshTable()
+                paneLaunchers = launchers
+                self?.sortRows()
+                self?.refreshTable(full: true)
             }
         }
     }
@@ -7293,6 +7343,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         if row == 0 { return Self.toolRowHeight }
         return tableView.rowHeight + (isBoundary(row - 1) ? SessionRowView.boundaryPadding : 0)
+            + (startsAgentGroup(row - 1) ? SessionRowView.headingPadding : 0)
+    }
+
+    /// The first live session another agent launched: the "Agent-launched" heading sits above it.
+    private func startsAgentGroup(_ row: Int) -> Bool {
+        guard row < rows.count, !rows[row].past, launcher(tty: rows[row].session.tty) != nil else { return false }
+        return row == 0 || launcher(tty: rows[row - 1].session.tty) == nil
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { row > 0 }
@@ -7327,6 +7384,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // that boundary is without spending a row on a heading.
         view.drawsBoundary = row > 0 && isBoundary(row - 1)
         view.startsDay = row > 0 && daySplits.contains(row - 1)
+        view.agentHeading = row > 0 && startsAgentGroup(row - 1)
         // A rebuilt row under a still mouse is already hovered: no fade in.
         view.hover = row == hoveredRow ? 1 : 0
         return view
@@ -8206,7 +8264,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let (session, past) = rows[row]
         // The boundary row is taller; its content sits below the line, not
         // centred across it.
-        let drop = isBoundary(row) ? SessionRowView.boundaryPadding / 2 : 0
+        let drop = (isBoundary(row) ? SessionRowView.boundaryPadding / 2 : 0)
+            + (startsAgentGroup(row) ? SessionRowView.headingPadding / 2 : 0)
         let s = session.summary
         let seg = session.segments
 
@@ -8249,6 +8308,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 if fresh, !bottom.isEmpty {
                     highlights = [(NSRange(location: 0, length: (bottom as NSString).length), Palette.yellow)]
                 }
+            }
+            // An agent-launched session names its launcher first in the caption.
+            if !past, let by = launcher(tty: session.tty) {
+                let prefix = "launched by " + by
+                let shift = ((prefix + (bottom.isEmpty ? "" : " · ")) as NSString).length
+                highlights = highlights.map { (NSRange(location: $0.range.location + shift, length: $0.range.length), $0.colour) }
+                bottom = prefix + (bottom.isEmpty ? "" : " · " + bottom)
             }
             top = title
         case "dots" where selecting && !past:
@@ -8821,6 +8887,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         func isDetached(_ entry: (session: Session, past: Bool)) -> Bool {
             entry.session.tty.map(detachedPaneTtys.contains) == true
         }
+        /// The owner's own sessions, attached then detached, then those another agent launched.
+        func group(_ entry: (session: Session, past: Bool)) -> Int {
+            launcher(tty: entry.session.tty) != nil ? 2 : isDetached(entry) ? 1 : 0
+        }
 
         func rank(_ entry: (session: Session, past: Bool)) -> (Double, String) {
             let s = entry.session.summary
@@ -8862,10 +8932,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             // Finished sessions stay newest first, whichever column is sorted.
             if a.past { return (a.session.active_at ?? a.session.updated_at) > (b.session.active_at ?? b.session.updated_at) }
             // Within the live sessions, those with a terminal attached come before the detached
-            // ones, and the sort applies inside each group.
+            // ones, and sessions another agent launched come last; the sort applies inside each group.
             if !a.past {
-                let da = isDetached(a), db = isDetached(b)
-                if da != db { return !da }
+                let ga = group(a), gb = group(b)
+                if ga != gb { return ga < gb }
             }
             let (an, at) = rank(a)
             let (bn, bt) = rank(b)
@@ -9289,6 +9359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var problems: [String] = []
         // CC_SESSIONS_WINDOW_DETACHED=1 draws the second fixture as a tmux session with no terminal attached.
         if ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_DETACHED"] == "1" { detachedPaneTtys = ["/dev/fixture-detached"] }
+        // CC_SESSIONS_WINDOW_AGENT=1 draws the second fixture as launched by another agent.
+        if ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_AGENT"] == "1" { paneLaunchers = ["/dev/fixture-detached": "orchestrator-1f"] }
         // CC_SESSIONS_BENCH=<n> times the list with n finished sessions and a tenth as many live ones.
         if let n = ProcessInfo.processInfo.environment["CC_SESSIONS_BENCH"].flatMap(Int.init) {
             let many = """
