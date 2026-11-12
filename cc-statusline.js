@@ -660,6 +660,12 @@ async function refreshUsage(sevenArg) {
     } catch {
       throw new Error('parse: response is not JSON');
     }
+    // For finding fields the app does not read yet: CC_STATUSLINE_DUMP_USAGE=<file> saves the raw response.
+    if (process.env.CC_STATUSLINE_DUMP_USAGE) {
+      try {
+        writeFileSync(process.env.CC_STATUSLINE_DUMP_USAGE, JSON.stringify(body, null, 2));
+      } catch {}
+    }
     if (!Array.isArray(body.limits)) throw new Error('parse: no limits[] in response');
     const entry = body.limits.find(
       (l) => l?.kind === 'weekly_scoped' && l.scope?.model?.display_name === 'Fable'

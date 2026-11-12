@@ -8885,8 +8885,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             sevenReadAt = at
         }
         let hour: Double = 3600
-        quotaBar.addArrangedSubview(
-            quotaItem("5-hour quota", readAt: five?.updated_at, five?.summary.five_hour, window: 5 * hour))
+        // An account without a 5-hour limit (Anthropic dropped it for verified Ultra accounts on
+        // 2026-10-30) reports none, so the item has nothing to show: it is left out, and the
+        // others move left, until a session sends a current reading.
+        if five != nil {
+            quotaBar.addArrangedSubview(
+                quotaItem("5-hour quota", readAt: five?.updated_at, five?.summary.five_hour, window: 5 * hour))
+        }
         quotaBar.addArrangedSubview(
             quotaItem("7-day quota", readAt: sevenReadAt, sevenLimit, window: 168 * hour))
         // Fable comes from the account's own reading, not from a session: only a

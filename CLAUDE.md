@@ -26,5 +26,9 @@ app that lists every live session (`src/main.swift`). `README.md` describes both
 - A long list stays quick because session cells are reused (`SessionTextCell`) and a refresh builds only the rows near the
   screen (`contentWindow`). `CC_SESSIONS_SELFTEST=1 CC_SESSIONS_BENCH=<n> .build/release/CCSessions` prints refresh, sort and
   flick-scroll times for n finished sessions; run it with 500 and 2000 after touching cell or refresh code.
+- To see which fields the account's usage endpoint returns beyond those the app reads, run
+  `CC_STATUSLINE_DUMP_USAGE=<file> node cc-statusline.js refresh-usage --force` once: it saves the raw
+  response (one request to the user's account, like the Usage window's Query now). Its `five_hour`
+  is `null` since Anthropic dropped that limit for Ultra accounts; the claude.ai "Limit resets" are not in it.
 - Caption colours in the sessions table are one colour per caption; colour a part of it by adding
   to `highlights` (caption-relative ranges), as the ssh warning and the Cache tags do.
