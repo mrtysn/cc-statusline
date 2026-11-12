@@ -6819,22 +6819,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             problems.append("kept order differs from the shown order")
         }
 
-        // Doing sorted "detached last": a detached session sinks below the attached ones whatever its name.
+        // Live sessions: attached first, detached after, under any sort.
         do {
-            let savedTtys = detachedPaneTtys, savedOrder = doingOrder, savedSort = table.sortDescriptors
-            settingSort = true
-            table.sortDescriptors = [NSSortDescriptor(key: "topic", ascending: true)]
-            settingSort = false
-            doingOrder = .detachedLast
+            let savedTtys = detachedPaneTtys
             detachedPaneTtys = ["/dev/fixture-attached"]
             sortRows()
             let live = rows.filter { !$0.past }.map { $0.session.summary.session_id }
-            if live != ["fixture-b", "fixture-a"] { problems.append("Doing detached-last order is \(live), want fixture-b first") }
+            if live != ["fixture-b", "fixture-a"] { problems.append("live order is \(live), want attached fixture-b first") }
             detachedPaneTtys = savedTtys
-            doingOrder = savedOrder
-            settingSort = true
-            table.sortDescriptors = savedSort
-            settingSort = false
             sortRows()
         }
 
@@ -8784,29 +8776,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var cacheOrder = CacheOrder.soonest
     private var settingSort = false
 
-    /// The Doing column sorts three ways, in turn on each click of its header: A to Z, Z to A, then
-    /// A to Z with the live sessions whose tmux session has no terminal attached after the attached ones.
-    private enum DoingOrder { case ascending, descending, detachedLast }
-    private var doingOrder = DoingOrder.ascending
-
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange old: [NSSortDescriptor]) {
         guard !settingSort else { return }
         let isCache = { (key: String?) in key == "cache" || key == "heat" }
-        if let key = tableView.sortDescriptors.first?.key, key == "topic" {
-            // AppKit only flips ascending; the third order is ours to add.
-            if old.first?.key == "topic" {
-                doingOrder = doingOrder == .ascending ? .descending : doingOrder == .descending ? .detachedLast : .ascending
-            } else {
-                doingOrder = .ascending
-            }
-            settingSort = true
-            tableView.sortDescriptors = [NSSortDescriptor(key: key, ascending: doingOrder != .descending)]
-            settingSort = false
-        } else {
-            doingOrder = .ascending
-        }
-        tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("topic"))?.title =
-            doingOrder == .detachedLast && tableView.sortDescriptors.first?.key == "topic" ? "Doing · detached last" : "Doing"
         if let key = tableView.sortDescriptors.first?.key, isCache(key) {
             // AppKit only flips ascending; the third order is ours to add.
             if isCache(old.first?.key) {
@@ -8876,7 +8848,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         rows.sort { a, b in
             if a.past != b.past { return !a.past }
-            if key == "topic", doingOrder == .detachedLast, !a.past {
+            // Within the live sessions, those with a terminal attached come before the detached
+            // ones, and the sort applies inside each group.
+            if !a.past {
                 let da = isDetached(a), db = isDetached(b)
                 if da != db { return !da }
             }
