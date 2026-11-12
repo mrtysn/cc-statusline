@@ -6984,6 +6984,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let grouped = rows.filter { !$0.past }.map { $0.session.summary.session_id }
             if grouped != ["fixture-b", "fixture-a"] { problems.append("live order with an agent-launched session is \(grouped), want fixture-a last") }
             if !startsAgentGroup(1) || startsAgentGroup(0) { problems.append("the Agent-launched heading is not on the first agent-launched row") }
+            // The heading row is taller once the reorder lands, though the row count did not change.
+            refreshTable(full: true)
+            table.layoutSubtreeIfNeeded()
+            if table.rect(ofRow: 2).height != table.rowHeight + SessionRowView.headingPadding {
+                problems.append("the Agent-launched row is \(table.rect(ofRow: 2).height) high after a reorder, want \(table.rowHeight + SessionRowView.headingPadding)")
+            }
             if !content("topic", row: 1).text.string.contains("orchestrator-1f launched") { problems.append("an agent-launched row does not name its launcher") }
             paneLaunchers = savedLaunchers
             sortRows()
@@ -7298,6 +7304,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// The contents each cell was last drawn with, and the rows they belong to.
     private var drawnIds: [String] = []
+    /// The rows drawn with extra height (the boundary, the Agent-launched heading) at the last reload.
+    private var paddedRows: Set<Int> = []
     /// The table row under the mouse, or -1.
     private var hoveredRow = -1
     private var menuOpen = false
@@ -7369,6 +7377,16 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         drawn = next
         drawnIds = ids
         defer { pulseChangedStates() }
+        // A row's height depends on its neighbours (the boundary line, the Agent-launched heading), so it
+        // can change in a refresh that redraws only cells; re-measure the rows that gained or lost padding.
+        defer {
+            let padded = Set(rows.indices.filter { isBoundary($0) || startsAgentGroup($0) })
+            if padded != paddedRows {
+                let moved = padded.symmetricDifference(paddedRows).map { $0 + 1 }.filter { $0 < table.numberOfRows }
+                paddedRows = padded
+                if !moved.isEmpty { table.noteHeightOfRows(withIndexesChanged: IndexSet(moved)) }
+            }
+        }
         guard same else {
             table.reloadData()
             return
