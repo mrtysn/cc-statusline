@@ -9,6 +9,10 @@ app that lists every live session (`src/main.swift`). `README.md` describes both
   `swift build` fetches the shared package from GitHub instead of the local checkout and fails on
   newer APIs (`clearFocusAtLaunch`); ignore that error, or set `PROJECT_LIFECYCLE_PACKAGE`.
 - Rebuild and install after every app change, but never relaunch the running app: the user does.
+  An install replaces the bundle under a running copy, and macOS then refuses that copy's Apple
+  events (-1743: double-click, Resume and tab focus stop working) until it is reopened. The app
+  says so in its status line and leaves the Automation grant alone (`replacedBundle`); tell the
+  user a reopen is needed after an install, not that the permission is gone.
 - Never click, press keys or bring windows forward to test the app while the user is at the machine.
   The built binary is `.build/release/CCSessions`, fresh after `project-lifecycle test`; the app bundle
   under `.build/project-lifecycle/` is only rewritten by `install` and shows the previous build.

@@ -3208,6 +3208,21 @@ func waitForQuietTerminal(_ tty: String, seconds: Double) {
     }
 }
 
+extension Notification.Name {
+    /// A message for the sessions window's status line from code that has no window: `userInfo["message"]`.
+    static let tellWindow = Notification.Name("CCSessionsTellWindow")
+}
+
+func tellWindow(_ message: String) {
+    DispatchQueue.main.async { NotificationCenter.default.post(name: .tellWindow, object: nil, userInfo: ["message": message]) }
+}
+
+/// Whether the app at this path is a copy a reinstall has replaced: the install swaps the old bundle
+/// aside as `.previous` and deletes it, and a process still running from it is refused by macOS.
+func replacedBundle(at path: String) -> Bool {
+    path.hasSuffix(".previous") || !fm.fileExists(atPath: path)
+}
+
 /// Runs an AppleScript and returns what it printed. Apple Events can be refused
 /// silently, so whatever osascript says is logged.
 @discardableResult
@@ -3230,17 +3245,26 @@ func runScript(_ script: String, label: String, retrying: Bool = false) -> Strin
     task.waitUntilExit()
     let result = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     log("\(label): exit \(task.terminationStatus) out=\(result) err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
-    // -1743: macOS has this app's Automation grant down as refused and answers
-    // without asking again. Clearing the entry puts it back to "not asked", so
-    // the same call raises the permission prompt.
-    if stderr.contains("-1743"), !retrying, let bundle = Bundle.main.bundleIdentifier {
-        let reset = Process()
-        reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-        reset.arguments = ["reset", "AppleEvents", bundle]
-        if (try? reset.run()) != nil {
-            reset.waitUntilExit()
-            log("\(label): reset the Automation grant to ask again")
-            return runScript(script, label: label, retrying: true)
+    // -1743: macOS refuses this process's Apple events. A copy that a reinstall replaced while it
+    // ran is refused whatever the grant says, and wiping the grant would only lose the user's real
+    // one: that copy has to be reopened. Otherwise the grant is down as refused and macOS answers
+    // without asking again; clearing the entry puts it back to "not asked", so the same call
+    // raises the permission prompt.
+    if stderr.contains("-1743") {
+        if replacedBundle(at: Bundle.main.bundlePath) {
+            log("\(label): this copy was replaced by a reinstall; its grant is left as it is")
+            tellWindow("CC Sessions was reinstalled while open: quit and reopen it to control iTerm again")
+        } else if !retrying, let bundle = Bundle.main.bundleIdentifier {
+            let reset = Process()
+            reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            reset.arguments = ["reset", "AppleEvents", bundle]
+            if (try? reset.run()) != nil {
+                reset.waitUntilExit()
+                log("\(label): reset the Automation grant to ask again")
+                return runScript(script, label: label, retrying: true)
+            }
+        } else {
+            tellWindow("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation")
         }
     }
     return result
@@ -6272,6 +6296,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return
         }
         startWatching()
+        NotificationCenter.default.addObserver(forName: .tellWindow, object: nil, queue: .main) { [weak self] n in
+            if let message = n.userInfo?["message"] as? String { self?.note(message, seconds: 12) }
+        }
         events.onChange = { [weak self] in self?.refreshTable() }
         sshGuard.onChange = { [weak self] in self?.refreshTable() }
         sshGuard.start()
@@ -6859,6 +6886,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             problems.append("auto tag colours are not distinct and stable: \(auto)")
         }
         window.layoutIfNeeded()
+
+        // A bundle a reinstall replaced is told apart from the installed one.
+        if !replacedBundle(at: "/x/CC Sessions.app.previous") || !replacedBundle(at: "/nonexistent/CC Sessions.app")
+            || replacedBundle(at: NSHomeDirectory()) {
+            problems.append("replacedBundle misjudges a swapped-aside, a missing or an existing bundle")
+        }
 
         // The refresh button sits at the right end of the table's header row.
         if let header = table.headerView, let content = window.contentView {
@@ -7656,8 +7689,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if runInNewTab(command) {
             note("Resuming \(id ?? "session")")
         } else {
-            // macOS drops the Automation grant whenever the app is reinstalled.
-            note("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation", seconds: 12)
+            // runScript has told the window why when macOS refused it; this covers the rest.
+            if !replacedBundle(at: Bundle.main.bundlePath) {
+                note("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation", seconds: 12)
+            }
         }
     }
 
