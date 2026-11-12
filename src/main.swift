@@ -6819,6 +6819,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             problems.append("kept order differs from the shown order")
         }
 
+        // Doing sorted "detached last": a detached session sinks below the attached ones whatever its name.
+        do {
+            let savedTtys = detachedPaneTtys, savedOrder = doingOrder, savedSort = table.sortDescriptors
+            settingSort = true
+            table.sortDescriptors = [NSSortDescriptor(key: "topic", ascending: true)]
+            settingSort = false
+            doingOrder = .detachedLast
+            detachedPaneTtys = ["/dev/fixture-attached"]
+            sortRows()
+            let live = rows.filter { !$0.past }.map { $0.session.summary.session_id }
+            if live != ["fixture-b", "fixture-a"] { problems.append("Doing detached-last order is \(live), want fixture-b first") }
+            detachedPaneTtys = savedTtys
+            doingOrder = savedOrder
+            settingSort = true
+            table.sortDescriptors = savedSort
+            settingSort = false
+            sortRows()
+        }
+
         // Columns: every declared column is in the table, in order, with its title.
         // A sorted column's title carries its order after the name ("Cache · soonest").
         let shown = table.tableColumns.map(\.title)
@@ -8765,9 +8784,29 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private var cacheOrder = CacheOrder.soonest
     private var settingSort = false
 
+    /// The Doing column sorts three ways, in turn on each click of its header: A to Z, Z to A, then
+    /// A to Z with the live sessions whose tmux session has no terminal attached after the attached ones.
+    private enum DoingOrder { case ascending, descending, detachedLast }
+    private var doingOrder = DoingOrder.ascending
+
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange old: [NSSortDescriptor]) {
         guard !settingSort else { return }
         let isCache = { (key: String?) in key == "cache" || key == "heat" }
+        if let key = tableView.sortDescriptors.first?.key, key == "topic" {
+            // AppKit only flips ascending; the third order is ours to add.
+            if old.first?.key == "topic" {
+                doingOrder = doingOrder == .ascending ? .descending : doingOrder == .descending ? .detachedLast : .ascending
+            } else {
+                doingOrder = .ascending
+            }
+            settingSort = true
+            tableView.sortDescriptors = [NSSortDescriptor(key: key, ascending: doingOrder != .descending)]
+            settingSort = false
+        } else {
+            doingOrder = .ascending
+        }
+        tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("topic"))?.title =
+            doingOrder == .detachedLast && tableView.sortDescriptors.first?.key == "topic" ? "Doing · detached last" : "Doing"
         if let key = tableView.sortDescriptors.first?.key, isCache(key) {
             // AppKit only flips ascending; the third order is ours to add.
             if isCache(old.first?.key) {
@@ -8795,6 +8834,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private func sortRows() {
         guard let descriptor = table.sortDescriptors.first, let key = descriptor.key else { return }
         let ascending = descriptor.ascending
+
+        func isDetached(_ entry: (session: Session, past: Bool)) -> Bool {
+            entry.session.tty.map(detachedPaneTtys.contains) == true
+        }
 
         func rank(_ entry: (session: Session, past: Bool)) -> (Double, String) {
             let s = entry.session.summary
@@ -8833,6 +8876,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         rows.sort { a, b in
             if a.past != b.past { return !a.past }
+            if key == "topic", doingOrder == .detachedLast, !a.past {
+                let da = isDetached(a), db = isDetached(b)
+                if da != db { return !da }
+            }
             let (an, at) = rank(a)
             let (bn, bt) = rank(b)
             if an != bn { return ascending ? an < bn : an > bn }
@@ -9247,7 +9294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """
         }
         let json = """
-            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one", name: "Named fixture")),
+            {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one", name: "Named fixture", tty: "/dev/fixture-attached")),
                       \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false, tty: "/dev/fixture-detached"))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
             """
