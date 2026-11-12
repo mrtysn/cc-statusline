@@ -6827,6 +6827,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let live = rows.filter { !$0.past }.map { $0.session.summary.session_id }
             if live != ["fixture-b", "fixture-a"] { problems.append("live order is \(live), want attached fixture-b first") }
             detachedPaneTtys = savedTtys
+            // Finished sessions stay newest first even under Doing, whose names would put "fourth" before "third".
+            let savedSort = table.sortDescriptors
+            settingSort = true
+            table.sortDescriptors = [NSSortDescriptor(key: "topic", ascending: true)]
+            settingSort = false
+            sortRows()
+            let past = rows.filter { $0.past }.map { $0.session.summary.session_id }
+            if past != ["fixture-c", "fixture-d"] { problems.append("finished order under Doing is \(past), want newest first") }
+            settingSort = true
+            table.sortDescriptors = savedSort
+            settingSort = false
             sortRows()
         }
 
@@ -8848,6 +8859,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         rows.sort { a, b in
             if a.past != b.past { return !a.past }
+            // Finished sessions stay newest first, whichever column is sorted.
+            if a.past { return (a.session.active_at ?? a.session.updated_at) > (b.session.active_at ?? b.session.updated_at) }
             // Within the live sessions, those with a terminal attached come before the detached
             // ones, and the sort applies inside each group.
             if !a.past {
@@ -9255,9 +9268,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// It reads no Claude data, starts no watcher or sender, and writes only under `selfTestRoot`.
     private func runSelfTest() {
         let now = Date().timeIntervalSince1970
-        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil, name: String? = nil, tty: String? = nil) -> String {
+        func session(_ id: String, dir: String, topic: String, ended: Bool, peer: String? = nil, name: String? = nil, tty: String? = nil, ago: Double = 0) -> String {
             """
-            {"updated_at": \(now), "active_at": \(now), "rows": ["fixture", "fixture"],
+            {"updated_at": \(now - ago), "active_at": \(now - ago), "rows": ["fixture", "fixture"],
              \(tty.map { "\"tty\": \"\($0)\"," } ?? "")
              \(peer.map { "\"peer_name\": \"\($0)\"," } ?? "")
              \(ended ? "\"ended\": {\"reason\": \"exited\", \"at\": \(now)}," : "")
@@ -9270,7 +9283,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let json = """
             {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one", name: "Named fixture", tty: "/dev/fixture-attached")),
                       \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false, tty: "/dev/fixture-detached"))],
-             "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true))]}
+             "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true, ago: 10)),
+                        \(session("fixture-d", dir: "/fixture/four", topic: "fourth fixture", ended: true, ago: 100))]}
             """
         var problems: [String] = []
         // CC_SESSIONS_WINDOW_DETACHED=1 draws the second fixture as a tmux session with no terminal attached.
