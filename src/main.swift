@@ -2956,6 +2956,9 @@ func tmuxLookupProblems() -> [String] {
     if resume != "cd '/tmp/a b' && if command -v clo >/dev/null; then command clo --run-claude --resume x --effort low; else claude --resume x --effort low; fi" {
         problems.append("resume did not go through clo --run-claude: \(resume)")
     }
+    for (mode, want) in [("default", "manual"), ("manual", "manual"), ("plan", "plan"), ("auto", "auto"), ("acceptEdits", "acceptEdits"), ("bypassPermissions", nil), (nil, nil)] as [(String?, String?)] where remoteMode(mode) != want {
+        problems.append("remoteMode(\(mode ?? "nil")) was \(remoteMode(mode) ?? "nil"), not \(want ?? "nil")")
+    }
     // The app runs with launchd's bare environment: with a tmux server up, its
     // real output must still split into fields there.
     if let live = tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat], environment: ["HOME": home.path, "PATH": "/usr/bin:/bin"]),
@@ -3034,6 +3037,62 @@ func resumeCommand(_ s: Summary, mode: String?) -> String? {
 /// `claude` otherwise. `command` skips the shell function `clo --init zsh` defines.
 func resumeShellCommand(directory: String, arguments: String) -> String {
     "cd \(directory) && if command -v clo >/dev/null; then command clo --run-claude \(arguments); else claude \(arguments); fi"
+}
+
+/// The permission mode clo-remote's start call takes for a transcript's mode, nil when it takes none.
+func remoteMode(_ mode: String?) -> String? {
+    switch mode {
+    case "default", "manual": return "manual"
+    case "plan", "auto", "acceptEdits": return mode
+    default: return nil
+    }
+}
+
+/// True when the tmux server answering on the default socket is a child of `clo-tmux-host`,
+/// the signed program that hosts it: the server a takeover waits for.
+func tmuxServerIsHosted() -> Bool {
+    guard let pid = tmuxOutput(["display-message", "-p", "#{pid}"])?.trimmingCharacters(in: .whitespacesAndNewlines), !pid.isEmpty else { return false }
+    let run = { (args: [String]) -> String in
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = args
+        let out = Pipe()
+        task.standardOutput = out
+        task.standardError = FileHandle.nullDevice
+        guard (try? task.run()) != nil else { return "" }
+        let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
+        task.waitUntilExit()
+        return (String(data: data ?? Data(), encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    let parent = run(["-o", "ppid=", "-p", pid])
+    return !parent.isEmpty && run(["-o", "comm=", "-p", parent]).hasSuffix("clo-tmux-host")
+}
+
+/// Starts a Claude session again through clo-remote's server, so it comes back in tmux with no
+/// terminal attached, as a session started from the phone does. nil on success, else why not.
+func startDetached(dir: String, model: String, effort: String?, mode: String?, resume: String) -> String? {
+    let port = ProcessInfo.processInfo.environment["CLO_WEB_PORT"] ?? "8731"
+    guard let url = URL(string: "http://127.0.0.1:\(port)/api/sessions") else { return "bad address" }
+    var body: [String: Any] = ["dir": dir, "model": model, "resume": resume]
+    if let effort = effort { body["effort"] = effort }
+    if let mode = remoteMode(mode) { body["mode"] = mode }
+    var request = URLRequest(url: url, timeoutInterval: 30)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "content-type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    var failure: String? = "no answer"
+    let done = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, response, error in
+        if let error = error { failure = error.localizedDescription }
+        else if let http = response as? HTTPURLResponse, http.statusCode == 201 { failure = nil }
+        else {
+            let text = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["error"] as? String
+            failure = text ?? "refused"
+        }
+        done.signal()
+    }.resume()
+    _ = done.wait(timeout: .now() + 35)
+    return failure
 }
 
 /// Runs a command in a new tab of iTerm's hotkey window, and shows that window;
@@ -8132,6 +8191,103 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
+    /// One live tmux-hosted Claude session as a restart needs it.
+    private struct Restartable {
+        let name: String
+        let id: String
+        let pid: pid_t
+        let tty: String
+        let command: String
+        let dir: String
+        let model: String
+        let effort: String?
+        let mode: String?
+        let attached: Bool
+        let busy: Bool
+    }
+
+    /// Every live Claude session in a tmux pane, split by whether an iTerm window shows it.
+    private func restartables() -> [Restartable] {
+        let panes = tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat]) ?? ""
+        var attached: [String: Bool] = [:]
+        for line in (tmuxOutput(["list-sessions", "-F", "#{session_name}\t#{session_attached}"]) ?? "").split(separator: "\n") {
+            let parts = line.split(separator: "\t").map(String.init)
+            if parts.count == 2 { attached[parts[0]] = parts[1] != "0" }
+        }
+        return allRows.filter { !$0.past }.map(\.session).compactMap { session in
+            guard let pid = session.pid, let tty = session.tty, let id = session.summary.session_id,
+                  let dir = session.summary.project_dir, let model = session.summary.model_id,
+                  session.transcript != nil,
+                  let command = resumeCommand(session.summary, mode: session.transcript?.mode),
+                  let pane = tmuxPane(forTty: tty, in: panes) else { return nil }
+            let busy = stateWords(session, past: false).0 != "your turn" || (session.transcript?.agents?.running ?? 0) > 0
+            return Restartable(name: pane.session, id: id, pid: pid, tty: tty, command: command, dir: (dir as NSString).expandingTildeInPath,
+                               model: model, effort: session.summary.effort, mode: session.transcript?.mode,
+                               attached: attached[pane.session] ?? false, busy: busy)
+        }
+    }
+
+    /// Ends every tmux session and resumes the Claude ones: the takeover of the tmux server by the
+    /// signed host, with nothing lost. Each Claude exits cleanly first (its SessionEnd hooks run),
+    /// then the old tmux server is ended, and once `clo-tmux-host` runs the next one the sessions
+    /// an iTerm window showed return in new iTerm tabs and the rest return detached, through clo-remote.
+    @objc func restartAllSessions() {
+        guard let window = window else { return }
+        let found = restartables()
+        guard !found.isEmpty else { note("No live Claude session in tmux to restart"); return }
+        let shown = found.filter(\.attached), hidden = found.filter { !$0.attached }, busy = found.filter(\.busy)
+        let alert = NSAlert()
+        alert.messageText = "Restart \(found.count) session\(found.count == 1 ? "" : "s") and the tmux server?"
+        alert.informativeText = "\(shown.count) in iTerm return in new iTerm tabs, \(hidden.count) detached return from clo-remote. "
+            + "Each Claude exits first; then every tmux session ends, shells included, and the next server is hosted by clo-tmux-host."
+            + (busy.isEmpty ? "" : "\n\nWorking now, cut off mid-turn: " + busy.map(\.name).joined(separator: ", "))
+            + "\n\nThe list is saved in Application Support/CC Sessions/restart-all.json first."
+        alert.addButton(withTitle: "Restart")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self = self else { return }
+            self.runRestartAll(found)
+        }
+    }
+
+    private func runRestartAll(_ found: [Restartable]) {
+        let sampler = self.sampler
+        let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
+        // Saved first, so a failure partway leaves the list to resume from.
+        let folder = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/CC Sessions")
+        try? fm.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        let record = found.map { ["name": $0.name, "id": $0.id, "dir": $0.dir, "model": $0.model, "effort": $0.effort ?? "", "mode": $0.mode ?? "", "attached": $0.attached] as [String: Any] }
+        if let data = try? JSONSerialization.data(withJSONObject: ["savedAt": ISO8601DateFormatter().string(from: Date()), "sessions": record], options: [.prettyPrinted]) {
+            fm.createFile(atPath: (folder as NSString).appendingPathComponent("restart-all.json"), contents: data)
+        }
+        report("Restarting \(found.count) sessions: ending Claude in each", 30)
+        DispatchQueue.global(qos: .userInitiated).async {
+            for item in found where sampler.owns(pid: item.pid, tty: item.tty) { kill(item.pid, SIGTERM) }
+            var stuck: [String] = []
+            for item in found where !waitForExit(item.pid, seconds: 15) { stuck.append(item.name) }
+            guard stuck.isEmpty else {
+                return report("Not restarted: \(stuck.joined(separator: ", ")) did not exit; nothing else was ended", 15)
+            }
+            _ = tmuxOutput(["kill-server"])
+            report("Waiting for clo-tmux-host to start the next tmux server", 120)
+            var hosted = false
+            for _ in 0..<150 where !hosted { hosted = tmuxServerIsHosted(); if !hosted { sleep(2) } }
+            guard hosted else {
+                return report("The new tmux server did not start; the sessions are saved in restart-all.json", 20)
+            }
+            DispatchQueue.main.async {
+                for (i, item) in found.filter(\.attached).enumerated() {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 1.5) { _ = runInNewTab(item.command) }
+                }
+            }
+            var failed: [String] = []
+            for item in found where !item.attached {
+                if let why = startDetached(dir: item.dir, model: item.model, effort: item.effort, mode: item.mode, resume: item.id) { failed.append("\(item.name): \(why)") }
+            }
+            report(failed.isEmpty ? "Restarted \(found.count) sessions" : "Detached sessions not resumed: " + failed.joined(separator: "; "), 20)
+        }
+    }
+
     /// The finished sessions that ended within `seconds`, newest first, each with the command that
     /// opens it again: the sessions a tmux restart or a reboot closed together. A session open
     /// again elsewhere, one that never had a prompt and one with no recorded launch directory are left out.
@@ -9693,6 +9849,9 @@ func buildMenu() {
         keyEquivalent: "S")
     sessionMenu.addItem(
         withTitle: "Restart Outdated Sessions…", action: #selector(SessionsWindow.restartOutdatedSessions),
+        keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "Restart All Sessions and tmux…", action: #selector(SessionsWindow.restartAllSessions),
         keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "Resume Closed Sessions…", action: #selector(SessionsWindow.resumeClosedSessions),
