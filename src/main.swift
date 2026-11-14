@@ -2956,6 +2956,7 @@ func tmuxLookupProblems() -> [String] {
     if resume != "cd '/tmp/a b' && if command -v clo >/dev/null; then command clo --run-claude --resume x --effort low; else claude --resume x --effort low; fi" {
         problems.append("resume did not go through clo --run-claude: \(resume)")
     }
+    problems += restartProblems()
     for (mode, want) in [("default", "manual"), ("manual", "manual"), ("plan", "plan"), ("auto", "auto"), ("acceptEdits", "acceptEdits"), ("bypassPermissions", nil), (nil, nil)] as [(String?, String?)] where remoteMode(mode) != want {
         problems.append("remoteMode(\(mode ?? "nil")) was \(remoteMode(mode) ?? "nil"), not \(want ?? "nil")")
     }
@@ -3039,6 +3040,114 @@ func resumeShellCommand(directory: String, arguments: String) -> String {
     "cd \(directory) && if command -v clo >/dev/null; then command clo --run-claude \(arguments); else claude \(arguments); fi"
 }
 
+/// One live Claude session in a tmux pane, as a restart needs it.
+struct RestartItem {
+    let name: String
+    let id: String
+    let pid: pid_t
+    let tty: String
+    let command: String
+    let dir: String
+    let model: String
+    let effort: String?
+    let mode: String?
+    let attached: Bool
+    let busy: Bool
+}
+
+/// What a restart does to the outside world, so the order of its steps can be checked without any.
+struct RestartSteps {
+    var exitClaude: (RestartItem) -> Bool
+    var endServer: () -> Void
+    var hosted: () -> Bool
+    var openTab: (RestartItem) -> Void
+    var startDetached: (RestartItem) -> String?
+    var pause: (Double) -> Void
+    var log: (String) -> Void
+    var report: (String, Double) -> Void
+    var hostWaitSeconds = 60
+}
+
+/// Ends every Claude cleanly, ends the old tmux server, waits for the host to run the next one, then
+/// brings every session back: iTerm ones in new tabs first, then the detached ones. Nothing is ended
+/// unless every Claude exited. If the host never starts the new server, every session still returns,
+/// on whatever server is there, and the report says it is not hosted. Returns the final report.
+@discardableResult
+func runRestart(_ items: [RestartItem], _ steps: RestartSteps) -> String {
+    steps.log("restarting \(items.count) sessions: \(items.map(\.name).joined(separator: ", "))")
+    steps.report("Restarting \(items.count) sessions: ending Claude in each", 60)
+    var stuck: [String] = []
+    for item in items {
+        let ok = steps.exitClaude(item)
+        steps.log("\(item.name): \(ok ? "claude exited" : "claude did not exit")")
+        if !ok { stuck.append(item.name) }
+    }
+    guard stuck.isEmpty else {
+        let message = "Not restarted: \(stuck.joined(separator: ", ")) did not exit; the tmux server was left running"
+        steps.log(message); steps.report(message, 30)
+        return message
+    }
+    steps.endServer()
+    steps.log("old tmux server ended")
+    steps.report("Waiting for clo-tmux-host to start the next tmux server", 90)
+    var hosted = false
+    for _ in 0..<max(1, steps.hostWaitSeconds) where !hosted {
+        hosted = steps.hosted()
+        if !hosted { steps.pause(1) }
+    }
+    steps.log(hosted ? "the next tmux server is hosted by clo-tmux-host" : "no hosted tmux server after \(steps.hostWaitSeconds) s; resuming on whatever server is there")
+    for (i, item) in items.filter(\.attached).enumerated() {
+        if i > 0 { steps.pause(1.5) }
+        steps.openTab(item)
+        steps.log("\(item.name): opened in a new iTerm tab")
+    }
+    var failed: [String] = []
+    for item in items where !item.attached {
+        if let why = steps.startDetached(item) { failed.append("\(item.name): \(why)"); steps.log("\(item.name): detached resume failed: \(why)") }
+        else { steps.log("\(item.name): resumed detached") }
+    }
+    var message = "Restarted \(items.count) sessions"
+    if !hosted { message += ", but the new tmux server is not hosted by clo-tmux-host: protected folders will ask again" }
+    if !failed.isEmpty { message += "; detached sessions not resumed: " + failed.joined(separator: "; ") }
+    steps.log(message); steps.report(message, 60)
+    return message
+}
+
+/// The checks of a restart's order, on stand-in steps.
+func restartProblems() -> [String] {
+    var problems: [String] = []
+    func item(_ name: String, attached: Bool) -> RestartItem {
+        RestartItem(name: name, id: name + "-id", pid: 1, tty: "/dev/x", command: "cmd-" + name, dir: "/tmp", model: "m", effort: nil, mode: nil, attached: attached, busy: false)
+    }
+    let items = [item("a", attached: true), item("b", attached: false), item("c", attached: true)]
+    func run(exit: @escaping (String) -> Bool, hostedAfter: Int?, wait: Int) -> (calls: [String], result: String) {
+        var calls: [String] = [], polls = 0
+        let steps = RestartSteps(
+            exitClaude: { calls.append("exit \($0.name)"); return exit($0.name) },
+            endServer: { calls.append("end") },
+            hosted: { polls += 1; calls.append("poll"); return hostedAfter.map { polls >= $0 } ?? false },
+            openTab: { calls.append("tab \($0.name)") },
+            startDetached: { calls.append("detached \($0.name)"); return nil },
+            pause: { _ in }, log: { _ in }, report: { _, _ in }, hostWaitSeconds: wait)
+        let result = runRestart(items, steps)
+        return (calls, result)
+    }
+    let normal = run(exit: { _ in true }, hostedAfter: 3, wait: 10)
+    if normal.calls != ["exit a", "exit b", "exit c", "end", "poll", "poll", "poll", "tab a", "tab c", "detached b"] {
+        problems.append("restart order was \(normal.calls)")
+    }
+    let stuck = run(exit: { $0 != "b" }, hostedAfter: 1, wait: 10)
+    if stuck.calls.contains("end") || stuck.calls.contains(where: { $0.hasPrefix("tab") || $0.hasPrefix("detached") }) {
+        problems.append("a Claude that did not exit still let the server end or sessions start: \(stuck.calls)")
+    }
+    let unhosted = run(exit: { _ in true }, hostedAfter: nil, wait: 4)
+    if unhosted.calls.filter({ $0 == "poll" }).count != 4 || !unhosted.calls.contains("tab a") || !unhosted.calls.contains("tab c") || !unhosted.calls.contains("detached b") {
+        problems.append("with no hosted server the sessions were not all resumed after the wait: \(unhosted.calls)")
+    }
+    if !unhosted.result.contains("not hosted") { problems.append("an unhosted restart did not say so: \(unhosted.result)") }
+    return problems
+}
+
 /// The permission mode clo-remote's start call takes for a transcript's mode, nil when it takes none.
 func remoteMode(_ mode: String?) -> String? {
     switch mode {
@@ -3066,6 +3175,34 @@ func tmuxServerIsHosted() -> Bool {
     }
     let parent = run(["-o", "ppid=", "-p", pid])
     return !parent.isEmpty && run(["-o", "comm=", "-p", parent]).hasSuffix("clo-tmux-host")
+}
+
+/// True when launchd runs the job: `launchctl list <label>` shows a PID.
+func launchdJobRunning(_ label: String) -> Bool {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    task.arguments = ["list", label]
+    let out = Pipe()
+    task.standardOutput = out
+    task.standardError = FileHandle.nullDevice
+    guard (try? task.run()) != nil else { return false }
+    let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
+    task.waitUntilExit()
+    return task.terminationStatus == 0 && (String(data: data ?? Data(), encoding: .utf8) ?? "").contains("\"PID\"")
+}
+
+/// True when clo-remote's server answers its health check.
+func cloRemoteAnswers() -> Bool {
+    let port = ProcessInfo.processInfo.environment["CLO_WEB_PORT"] ?? "8731"
+    guard let url = URL(string: "http://127.0.0.1:\(port)/api/health") else { return false }
+    var ok = false
+    let done = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: URLRequest(url: url, timeoutInterval: 3)) { _, response, _ in
+        ok = (response as? HTTPURLResponse)?.statusCode == 200
+        done.signal()
+    }.resume()
+    _ = done.wait(timeout: .now() + 4)
+    return ok
 }
 
 /// Starts a Claude session again through clo-remote's server, so it comes back in tmux with no
@@ -8191,100 +8328,89 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
-    /// One live tmux-hosted Claude session as a restart needs it.
-    private struct Restartable {
-        let name: String
-        let id: String
-        let pid: pid_t
-        let tty: String
-        let command: String
-        let dir: String
-        let model: String
-        let effort: String?
-        let mode: String?
-        let attached: Bool
-        let busy: Bool
-    }
-
-    /// Every live Claude session in a tmux pane, split by whether an iTerm window shows it.
-    private func restartables() -> [Restartable] {
+    /// Every live Claude session in a tmux pane, split by whether an iTerm window shows it, and the
+    /// names of tmux sessions that cannot be resumed (shells, sessions without a prompt) and end for good.
+    private func restartables() -> (items: [RestartItem], lost: [String]) {
         let panes = tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat]) ?? ""
         var attached: [String: Bool] = [:]
         for line in (tmuxOutput(["list-sessions", "-F", "#{session_name}\t#{session_attached}"]) ?? "").split(separator: "\n") {
             let parts = line.split(separator: "\t").map(String.init)
             if parts.count == 2 { attached[parts[0]] = parts[1] != "0" }
         }
-        return allRows.filter { !$0.past }.map(\.session).compactMap { session in
+        let items: [RestartItem] = allRows.filter { !$0.past }.map(\.session).compactMap { session in
             guard let pid = session.pid, let tty = session.tty, let id = session.summary.session_id,
                   let dir = session.summary.project_dir, let model = session.summary.model_id,
                   session.transcript != nil,
                   let command = resumeCommand(session.summary, mode: session.transcript?.mode),
                   let pane = tmuxPane(forTty: tty, in: panes) else { return nil }
             let busy = stateWords(session, past: false).0 != "your turn" || (session.transcript?.agents?.running ?? 0) > 0
-            return Restartable(name: pane.session, id: id, pid: pid, tty: tty, command: command, dir: (dir as NSString).expandingTildeInPath,
+            return RestartItem(name: pane.session, id: id, pid: pid, tty: tty, command: command, dir: (dir as NSString).expandingTildeInPath,
                                model: model, effort: session.summary.effort, mode: session.transcript?.mode,
                                attached: attached[pane.session] ?? false, busy: busy)
         }
+        let kept = Set(items.map(\.name))
+        return (items, attached.keys.filter { !kept.contains($0) }.sorted())
+    }
+
+    /// Why a restart must not start: the job that hosts the next server is not running, its program is
+    /// missing, clo-remote does not answer, or the server is already hosted so there is nothing to take over.
+    private func restartBlockers() -> [String] {
+        var why: [String] = []
+        let host = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/clo-web/clo-tmux-host")
+        if !fm.isExecutableFile(atPath: host) { why.append("The host program is not built (project-lifecycle install in clo-remote/jobs/clo-tmux)") }
+        if !launchdJobRunning("local.clo-tmux") { why.append("The clo-tmux job is not running, so nothing would start the next tmux server") }
+        if !cloRemoteAnswers() { why.append("clo-remote does not answer on this Mac, so detached sessions could not return") }
+        if tmuxServerIsHosted() { why.append("The tmux server is already hosted by clo-tmux-host: there is nothing to take over") }
+        return why
     }
 
     /// Ends every tmux session and resumes the Claude ones: the takeover of the tmux server by the
-    /// signed host, with nothing lost. Each Claude exits cleanly first (its SessionEnd hooks run),
-    /// then the old tmux server is ended, and once `clo-tmux-host` runs the next one the sessions
-    /// an iTerm window showed return in new iTerm tabs and the rest return detached, through clo-remote.
+    /// signed host, with nothing lost. See `runRestart`.
     @objc func restartAllSessions() {
         guard let window = window else { return }
-        let found = restartables()
-        guard !found.isEmpty else { note("No live Claude session in tmux to restart"); return }
+        let blockers = restartBlockers()
+        let (found, lost) = restartables()
+        guard blockers.isEmpty, !found.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = found.isEmpty && blockers.isEmpty ? "No live Claude session in tmux to restart" : "Not restarting"
+            alert.informativeText = blockers.joined(separator: "\n")
+            alert.beginSheetModal(for: window)
+            return
+        }
         let shown = found.filter(\.attached), hidden = found.filter { !$0.attached }, busy = found.filter(\.busy)
         let alert = NSAlert()
         alert.messageText = "Restart \(found.count) session\(found.count == 1 ? "" : "s") and the tmux server?"
-        alert.informativeText = "\(shown.count) in iTerm return in new iTerm tabs, \(hidden.count) detached return from clo-remote. "
-            + "Each Claude exits first; then every tmux session ends, shells included, and the next server is hosted by clo-tmux-host."
-            + (busy.isEmpty ? "" : "\n\nWorking now, cut off mid-turn: " + busy.map(\.name).joined(separator: ", "))
-            + "\n\nThe list is saved in Application Support/CC Sessions/restart-all.json first."
+        var text = "\(shown.count) in iTerm return in new iTerm tabs, \(hidden.count) detached return through clo-remote. "
+        text += "Each Claude exits first; then every tmux session ends and clo-tmux-host starts the next server."
+        if !busy.isEmpty { text += "\n\nWorking now, cut off mid-turn: " + busy.map(\.name).joined(separator: ", ") }
+        if !lost.isEmpty { text += "\n\nEnd for good, they cannot be resumed: " + lost.joined(separator: ", ") }
+        text += "\n\nThe list is saved in Application Support/CC Sessions/restart-all.json first, and each step is logged."
+        alert.informativeText = text
         alert.addButton(withTitle: "Restart")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertFirstButtonReturn, let self = self else { return }
-            self.runRestartAll(found)
-        }
-    }
-
-    private func runRestartAll(_ found: [Restartable]) {
-        let sampler = self.sampler
-        let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
-        // Saved first, so a failure partway leaves the list to resume from.
-        let folder = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/CC Sessions")
-        try? fm.createDirectory(atPath: folder, withIntermediateDirectories: true)
-        let record = found.map { ["name": $0.name, "id": $0.id, "dir": $0.dir, "model": $0.model, "effort": $0.effort ?? "", "mode": $0.mode ?? "", "attached": $0.attached] as [String: Any] }
-        if let data = try? JSONSerialization.data(withJSONObject: ["savedAt": ISO8601DateFormatter().string(from: Date()), "sessions": record], options: [.prettyPrinted]) {
-            fm.createFile(atPath: (folder as NSString).appendingPathComponent("restart-all.json"), contents: data)
-        }
-        report("Restarting \(found.count) sessions: ending Claude in each", 30)
-        DispatchQueue.global(qos: .userInitiated).async {
-            for item in found where sampler.owns(pid: item.pid, tty: item.tty) { kill(item.pid, SIGTERM) }
-            var stuck: [String] = []
-            for item in found where !waitForExit(item.pid, seconds: 15) { stuck.append(item.name) }
-            guard stuck.isEmpty else {
-                return report("Not restarted: \(stuck.joined(separator: ", ")) did not exit; nothing else was ended", 15)
+            let sampler = self.sampler
+            let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
+            let folder = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/CC Sessions")
+            try? fm.createDirectory(atPath: folder, withIntermediateDirectories: true)
+            let record = found.map { ["name": $0.name, "id": $0.id, "dir": $0.dir, "model": $0.model, "effort": $0.effort ?? "", "mode": $0.mode ?? "", "attached": $0.attached] as [String: Any] }
+            if let data = try? JSONSerialization.data(withJSONObject: ["savedAt": ISO8601DateFormatter().string(from: Date()), "sessions": record, "ended for good": lost], options: [.prettyPrinted]) {
+                fm.createFile(atPath: (folder as NSString).appendingPathComponent("restart-all.json"), contents: data)
             }
-            _ = tmuxOutput(["kill-server"])
-            report("Waiting for clo-tmux-host to start the next tmux server", 120)
-            var hosted = false
-            for _ in 0..<150 where !hosted { hosted = tmuxServerIsHosted(); if !hosted { sleep(2) } }
-            guard hosted else {
-                return report("The new tmux server did not start; the sessions are saved in restart-all.json", 20)
-            }
-            DispatchQueue.main.async {
-                for (i, item) in found.filter(\.attached).enumerated() {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 1.5) { _ = runInNewTab(item.command) }
-                }
-            }
-            var failed: [String] = []
-            for item in found where !item.attached {
-                if let why = startDetached(dir: item.dir, model: item.model, effort: item.effort, mode: item.mode, resume: item.id) { failed.append("\(item.name): \(why)") }
-            }
-            report(failed.isEmpty ? "Restarted \(found.count) sessions" : "Detached sessions not resumed: " + failed.joined(separator: "; "), 20)
+            let steps = RestartSteps(
+                exitClaude: { item in
+                    if sampler.owns(pid: item.pid, tty: item.tty) { kill(item.pid, SIGTERM) }
+                    return waitForExit(item.pid, seconds: 15)
+                },
+                endServer: { _ = tmuxOutput(["kill-server"]) },
+                hosted: { tmuxServerIsHosted() },
+                openTab: { item in DispatchQueue.main.async { _ = runInNewTab(item.command) } },
+                startDetached: { item in startDetached(dir: item.dir, model: item.model, effort: item.effort, mode: item.mode, resume: item.id) },
+                pause: { sleep(UInt32($0)) },
+                log: { log("restart-all: \($0)") },
+                report: report)
+            DispatchQueue.global(qos: .userInitiated).async { runRestart(found, steps) }
         }
     }
 
