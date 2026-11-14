@@ -163,6 +163,13 @@ struct Segments: Decodable {
     let cache: String?
 }
 
+/// Calls a closure when a control it targets fires.
+final class PopupAction: NSObject {
+    private let run: () -> Void
+    init(_ run: @escaping () -> Void) { self.run = run }
+    @objc func fire() { run() }
+}
+
 struct Ended: Decodable {
     let reason: String?
     let at: Double?
@@ -8125,6 +8132,59 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
+    /// The finished sessions that ended within `seconds`, newest first, each with the command that
+    /// opens it again: the sessions a tmux restart or a reboot closed together. A session open
+    /// again elsewhere, one that never had a prompt and one with no recorded launch directory are left out.
+    private func closedSessions(within seconds: Double) -> [(session: Session, command: String)] {
+        let cutoff = (Date().timeIntervalSince1970 - seconds) * 1000
+        let open = Set(allRows.filter { !$0.past }.compactMap { $0.session.summary.session_id })
+        var seen = Set<String>()
+        return allRows.filter { $0.past }.map(\.session)
+            .filter { ($0.ended?.at ?? $0.active_at ?? $0.updated_at) >= cutoff }
+            .sorted { ($0.ended?.at ?? $0.active_at ?? $0.updated_at) > ($1.ended?.at ?? $1.active_at ?? $1.updated_at) }
+            .compactMap { session in
+                guard let id = session.summary.session_id, !open.contains(id), seen.insert(id).inserted,
+                      session.transcript != nil,
+                      let command = resumeCommand(session.summary, mode: session.transcript?.mode) else { return nil }
+                return (session, command)
+            }
+    }
+
+    /// Opens every session that ended within the chosen time again, each in its own iTerm tab
+    /// (through clo, so each runs in tmux), a second apart.
+    @objc func resumeClosedSessions() {
+        guard let window = window else { return }
+        let choices: [(title: String, seconds: Double)] = [("15 minutes", 900), ("hour", 3600), ("6 hours", 21600), ("day", 86400)]
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 200, height: 26))
+        popup.addItems(withTitles: choices.map { "Closed in the last \($0.title)" })
+        popup.selectItem(at: 1)
+        let alert = NSAlert()
+        alert.addButton(withTitle: "Resume")
+        alert.addButton(withTitle: "Cancel")
+        alert.accessoryView = popup
+        let describe = {
+            let found = self.closedSessions(within: choices[popup.indexOfSelectedItem].seconds)
+            let names = found.prefix(12).map { "\u{2022} " + ($0.session.summary.session_name ?? $0.session.summary.session_id.map { String($0.prefix(8)) } ?? "session") }
+            alert.messageText = found.isEmpty ? "No closed sessions to resume" : "Resume \(found.count) closed session\(found.count == 1 ? "" : "s")?"
+            alert.informativeText = found.isEmpty ? "None ended in that time, or each is open again."
+                : "Each opens in its own iTerm tab with its model, effort and permission mode.\n" + names.joined(separator: "\n") + (found.count > 12 ? "\n\u{2026} and \(found.count - 12) more" : "")
+            alert.buttons.first?.isEnabled = !found.isEmpty
+        }
+        let target = PopupAction(describe)
+        popup.target = target
+        popup.action = #selector(PopupAction.fire)
+        describe()
+        alert.beginSheetModal(for: window) { [weak self] response in
+            withExtendedLifetime(target) {}
+            guard response == .alertFirstButtonReturn, let self = self else { return }
+            let found = self.closedSessions(within: choices[popup.indexOfSelectedItem].seconds)
+            self.note("Resuming \(found.count) session\(found.count == 1 ? "" : "s")", seconds: 6)
+            for (i, entry) in found.enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i)) { runInNewTab(entry.command) }
+            }
+        }
+    }
+
     /// Ends Claude Code in its own tab and types the resume command there, so
     /// the tab keeps its place. SIGTERM is a clean exit: Claude Code runs its
     /// SessionEnd hooks, and the session is idle, so no turn is cut off. A tab
@@ -9633,6 +9693,9 @@ func buildMenu() {
         keyEquivalent: "S")
     sessionMenu.addItem(
         withTitle: "Restart Outdated Sessions…", action: #selector(SessionsWindow.restartOutdatedSessions),
+        keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "Resume Closed Sessions…", action: #selector(SessionsWindow.resumeClosedSessions),
         keyEquivalent: "")
     sessionMenu.addItem(.separator())
     sessionMenu.addItem(withTitle: "Repo Tags…", action: #selector(SessionsWindow.openRepoTags), keyEquivalent: "")
