@@ -2956,12 +2956,12 @@ func tmuxOutput(_ arguments: [String], environment: [String: String]? = nil) -> 
 /// The tmux lookups, exercised by the self-test on fixed output.
 func tmuxLookupProblems() -> [String] {
     var problems: [String] = []
-    let panes = "/dev/ttys004\tai-job-search-72\t%0\n/dev/ttys009\tnotebook-3f\t%22\n"
+    let panes = "/dev/ttys004\tproject-a-72\t%0\n/dev/ttys009\tproject-b-3f\t%22\n"
     let found = tmuxPane(forTty: "/dev/ttys009", in: panes)
-    if found?.session != "notebook-3f" || found?.paneNumber != "22" { problems.append("tmux pane tty did not map to its session and pane") }
+    if found?.session != "project-b-3f" || found?.paneNumber != "22" { problems.append("tmux pane tty did not map to its session and pane") }
     if tmuxPane(forTty: "/dev/ttys001", in: panes) != nil { problems.append("a tty no pane has mapped to a session") }
     if tmuxPane(forTty: "/dev/ttys004", in: "") != nil { problems.append("empty tmux output mapped to a session") }
-    if tmuxPane(forTty: "/dev/ttys004", in: "/dev/ttys004_ai-job-search-72_%0\n") != nil { problems.append("tmux output without tabs mapped to a session") }
+    if tmuxPane(forTty: "/dev/ttys004", in: "/dev/ttys004_project-a-72_%0\n") != nil { problems.append("tmux output without tabs mapped to a session") }
     if detachedTtys(in: "/dev/ttys004\t0\n/dev/ttys009\t2\n/dev/ttys011\t0\nbroken\n") != ["/dev/ttys004", "/dev/ttys011"] { problems.append("detached panes were not read") }
     if launchersByTty(in: "/dev/ttys004\t0\torchestrator-1f\n/dev/ttys009\t1\t\nbroken\n") != ["/dev/ttys004": "orchestrator-1f"] { problems.append("agent launchers were not read") }
     if tmuxClientTtys(in: "/dev/ttys002\n\n/dev/ttys007\n") != ["/dev/ttys002", "/dev/ttys007"] { problems.append("client ttys were not read") }
@@ -5258,7 +5258,7 @@ final class LeaderboardWindow: NSWindowController, NSTableViewDataSource, NSTabl
             """
             {"since": \(since), "until": \(until), "first": "\(first)", "last": "\(last)", "total": 1911, "sub": 990,
              "daily": \(daily(days)),
-             "sessions": [\(session("7386be92", "Puppet body build", 449.7, 400.1, "opus-5-5")),
+             "sessions": [\(session("7386be92", "Fixture build", 449.7, 400.1, "opus-5-5")),
                           \(session("2370cc4b", "Character roster and variant generator", 315.1, 240.2, "sonnet-5-5")),
                           \(session("aaaaaaaa", "A third fixture", 90.5, 12, "fable-5-1"))],
              "folders": [{"project": "dev-fixture", "sessions": 13, "first": "\(first)", "last": "\(last)", "requests": 4000, "cost": 900.5, "sub": 700.3},
@@ -7119,7 +7119,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     func selfTestProblems(fixture: Snapshot) -> [String] {
         var problems: [String] = []
         guard let window else { return ["no window"] }
-        let auto = ["my", "fork", "generated", "interview-prep", "third-party"].map(TagStore.autoHex)
+        let auto = ["my", "fork", "generated", "sample-tag", "third-party"].map(TagStore.autoHex)
         if Set(auto).count != auto.count || TagStore.autoHex("my") != auto[0] || auto.contains(where: { $0.count != 6 }) {
             problems.append("auto tag colours are not distinct and stable: \(auto)")
         }
@@ -9883,7 +9883,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let json = """
             {"live": [\(session("fixture-a", dir: "/fixture/one", topic: "first fixture", ended: false, peer: "fixture-one", name: "Named fixture", tty: "/dev/fixture-attached")),
-                      \(session("fixture-b", dir: "~/dev/job-search/ai-job-search-with-a-long-folder-name", topic: "second fixture", ended: false, tty: "/dev/fixture-detached", estimate: 41))],
+                      \(session("fixture-b", dir: "~/dev/project-c/project-c-with-a-long-folder-name", topic: "second fixture", ended: false, tty: "/dev/fixture-detached", estimate: 41))],
              "history": [\(session("fixture-c", dir: "/fixture/three", topic: "third fixture", ended: true, ago: 10)),
                         \(session("fixture-d", dir: "/fixture/four", topic: "fourth fixture", ended: true, ago: 100))]}
             """
