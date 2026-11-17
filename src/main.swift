@@ -603,6 +603,16 @@ final class SelfCost {
 
 // MARK: - Session events and sounds
 
+/// Whether this Mac's profile, one word in ~/.config/tools/profile (the tools repo's file), is
+/// "work". On a work machine the app asks no third party for anything: no npm registry check for
+/// Claude Code's latest version, no sound-pack registry or downloads. Installed packs still play.
+let workMachine: Bool = {
+    let base = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"].map { URL(fileURLWithPath: $0) }
+        ?? home.appendingPathComponent(".config")
+    let text = try? String(contentsOf: base.appendingPathComponent("tools/profile"), encoding: .utf8)
+    return text?.trimmingCharacters(in: .whitespacesAndNewlines) == "work"
+}()
+
 /// The app's own files: the sound packs and their settings.
 let supportDir: URL = selfTest ? selfTestRoot.appendingPathComponent("support") :
     (fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? home.appendingPathComponent("Library"))
@@ -1819,7 +1829,7 @@ final class LatestVersion {
     }
 
     func refreshIfDue() {
-        guard !selfTest else { return }
+        guard !selfTest, !workMachine else { return }
         let now = Date().timeIntervalSince1970
         guard !inFlight, now - cache.fetched_at > Self.freshFor,
             now - (cache.failed_at ?? 0) > Self.pauseAfterFailure
@@ -2100,6 +2110,9 @@ final class PackStore {
 
     /// A GET whose answer arrives on the main queue: the body on a 200, else why not.
     private func fetch(_ url: URL, _ done: @escaping (Data?, String?) -> Void) {
+        if workMachine {
+            return DispatchQueue.main.async { done(nil, "sound packs are not downloaded on a work machine") }
+        }
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
         URLSession.shared.dataTask(with: request) { data, response, error in
