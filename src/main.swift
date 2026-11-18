@@ -3245,6 +3245,9 @@ func startDetached(dir: String, model: String, effort: String?, mode: String?, r
     return failure
 }
 
+/// The iTerm profile of the hotkey window (dev-env's iterm-profiles/hotkey-window.json).
+let hotkeyProfileName = "Hotkey Window"
+
 /// Runs a command in a new tab of iTerm's hotkey window, and shows that window;
 /// with no hotkey window, in a new window. The tab starts with the command rather
 /// than having it typed: text written into a fresh tab races the shell's startup,
@@ -3263,13 +3266,21 @@ func runInNewTab(_ command: String) -> Bool {
           repeat with w in windows
             if is hotkey window of w then set target to w
           end repeat
+          -- iTerm makes its hotkey window on the first press of the key, so right after
+          -- iTerm starts there is none: make it, with its own profile, as the key would.
+          -- A tmux -CC tab draws its windows with the profile it was opened with, so the
+          -- tab takes the hotkey window's profile, never the default one.
           if target is missing value then
-            set target to (create window with default profile command "\(text)")
-            select target
-            activate
-            return "window"
+            try
+              set target to (create hotkey window with profile "\(hotkeyProfileName)")
+            on error
+              set target to (create window with default profile command "\(text)")
+              select target
+              activate
+              return "window"
+            end try
           end if
-          tell target to create tab with default profile command "\(text)"
+          tell target to create tab with profile "\(hotkeyProfileName)" command "\(text)"
           reveal hotkey window
           return "ok"
         end tell
