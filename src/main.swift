@@ -387,10 +387,10 @@ func refreshLeaderboardOnce() {
 /// Fetches the account's usage once, for the Fable quota: it only moves while
 /// Fable runs, and a Fable session keeps the shared cache fresh by itself, so
 /// one reading at launch covers the rest. Blocks; call it off the main thread.
-func refreshUsageOnce() {
+func refreshUsageOnce(maxAgeSeconds: Int? = nil) {
     let script = repoDir.appendingPathComponent("cc-statusline.js")
     guard fm.isExecutableFile(atPath: script.path) else { return }
-    let task = scriptProcess(script, ["refresh-usage"])
+    let task = scriptProcess(script, maxAgeSeconds.map { ["refresh-usage", "--max-age", "\($0)"] } ?? ["refresh-usage"])
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
     do {
@@ -7683,8 +7683,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             self?.reload()
             self?.pollDetachedPanes()
             // The account's quotas, so a reset made on claude.ai reaches the bar with no
-            // session redrawing: the script gates it to one request per five minutes.
-            DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
+            // session redrawing: the script gates it to one request per five minutes (one per minute while the window is open).
+            // While the window is open it follows the account within a minute, not five.
+            let watching = self?.window?.isVisible == true
+            DispatchQueue.global(qos: .utility).async { refreshUsageOnce(maxAgeSeconds: watching ? 60 : nil) }
         }
     }
 
