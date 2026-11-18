@@ -9258,6 +9258,13 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             quotaBar.addArrangedSubview(
                 quotaItem("5-hour quota", readAt: five?.updated_at, five?.summary.five_hour, window: 5 * hour))
         }
+        // An account with no weekly limits at all (an enterprise seat) reports only its monthly
+        // spend cap; two dashed rows would say nothing, so that figure takes their place.
+        if sevenLimit?.percent == nil, snapshot.fable?.percent == nil,
+           let spend = snapshot.usage?.spend, let cap = spend.limit, cap > 0, spend.enabled == true {
+            quotaBar.addArrangedSubview(spendItem(used: spend.used ?? 0, cap: cap, readAt: snapshot.usage?.read_at))
+            return
+        }
         quotaBar.addArrangedSubview(
             quotaItem("7-day quota", readAt: sevenReadAt, sevenLimit, window: 168 * hour))
         // Fable comes from the account's own reading, not from a session: only a
@@ -9265,6 +9272,42 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         let fable = snapshot.fable.map { Limit(percent: $0.percent, resets_at: $0.resets_at) }
         quotaBar.addArrangedSubview(
             quotaItem("Fable quota", readAt: snapshot.fable?.read_at, fable, window: 168 * hour))
+    }
+
+    /// The monthly spend cap as a quota-shaped item: used share of the cap, the dollars under it.
+    private func spendItem(used: Double, cap: Double, readAt: Double?) -> NSView {
+        let grid = NSGridView()
+        grid.rowSpacing = 4
+        grid.columnSpacing = 8
+        grid.yPlacement = .center
+        let percent = min(100, used / cap * 100)
+        let colour = Palette.threshold(percent)
+        let small = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        func label(_ text: String, _ colour: NSColor, _ font: NSFont) -> NSTextField {
+            let field = NSTextField(labelWithString: text)
+            field.font = font
+            field.textColor = colour
+            return field
+        }
+        let bar = BarView()
+        bar.fraction = percent / 100
+        bar.colour = colour
+        bar.divisions = 0
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        bar.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        remember(bar, "Monthly spend used")
+        var caption = "\(moneyText(used)) of \(moneyText(cap))"
+        if let at = readAt, Date().timeIntervalSince1970 - at / 1000 > 120 { caption += " · read \(ago(at)) ago" }
+        grid.addRow(with: [NSView(), label(caption, Palette.dim, small)])
+        grid.addRow(with: [
+            label("Monthly spend", Palette.dim, NSFont.systemFont(ofSize: 11)), bar,
+            label("\(Int(percent.rounded()))%", colour, NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)),
+        ])
+        grid.addRow(with: [NSView(), label(" ", Palette.dim, small)])
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 2).xPlacement = .trailing
+        return grid
     }
 
     /// One quota: its name, a drawn bar, the share, and when it comes back. The
