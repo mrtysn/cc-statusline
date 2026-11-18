@@ -4289,6 +4289,19 @@ final class UsageWindow: NSWindowController {
         ])
     }
 
+    /// When the monthly cap resets: the 1st at 00:00 UTC, as claude.ai states it (the usage
+    /// response has no field for it), shown in local time.
+    private func nextMonthStart() -> String {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
+        guard let next = utc.nextDate(after: Date(), matching: DateComponents(day: 1, hour: 0, minute: 0, second: 0),
+                                      matchingPolicy: .nextTime) else { return "on the 1st" }
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US")
+        format.setLocalizedDateFormatFromTemplate("EEEMMMd jm")
+        return format.string(from: next)
+    }
+
     /// Why extra spending can or cannot happen, in a sentence: the toggle and the
     /// balance are two facts, and an empty balance is not the same as switched off.
     private func spendNote(_ spend: SpendCap) -> String {
@@ -4405,7 +4418,7 @@ final class UsageWindow: NSWindowController {
                 heading("EXTRA SPENDING (only after the weekly limit is hit)")
                 let used = spend.used ?? 0
                 row("this month", bar: limit > 0 ? used / limit * 100 : nil, "\(money(used)) of the \(money(limit)) cap",
-                    spendNote(spend))
+                    "\(spendNote(spend)) · resets \(nextMonthStart())")
             }
             if let surfaces = usage.surfaces, !surfaces.isEmpty {
                 heading("WHERE THIS WEEK WENT (share of what was used)")
@@ -9298,17 +9311,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         bar.heightAnchor.constraint(equalToConstant: 12).isActive = true
         remember(bar, "Monthly spend used")
         var caption = "\(moneyText(used)) of \(moneyText(cap))"
-        // The response has no reset field; claude.ai showed the cap resetting on the 1st at
-        // 00:00 UTC (2026-11-18), so the next one is assumed and marked so.
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
-        if let next = utc.nextDate(after: Date(), matching: DateComponents(day: 1, hour: 0, minute: 0, second: 0),
-                                   matchingPolicy: .nextTime) {
-            let day = DateFormatter()
-            day.locale = Locale(identifier: "en_US")
-            day.setLocalizedDateFormatFromTemplate("MMMd")
-            caption += " · resets \(day.string(from: next)) (assumed)"
-        }
         if let at = readAt, Date().timeIntervalSince1970 - at / 1000 > 120 { caption += " · read \(ago(at)) ago" }
         grid.addRow(with: [NSView(), label(caption, Palette.dim, small)])
         grid.addRow(with: [
