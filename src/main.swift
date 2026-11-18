@@ -62,6 +62,15 @@ func log(_ message: String) {
 
 // MARK: - Model
 
+/// The spend cap's month: the 1st at 00:00 UTC to the next 1st, as claude.ai states the reset
+/// (the usage response has no field for it).
+func spendMonthUTC(_ now: Date = Date()) -> (start: Date, end: Date) {
+    var utc = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(identifier: "UTC") ?? .current
+    let start = utc.date(from: utc.dateComponents([.year, .month], from: now)) ?? now
+    return (start, utc.date(byAdding: .month, value: 1, to: start) ?? start.addingTimeInterval(30 * 86400))
+}
+
 struct Limit: Decodable {
     let percent: Double?
     let resets_at: Double?
@@ -4289,17 +4298,12 @@ final class UsageWindow: NSWindowController {
         ])
     }
 
-    /// When the monthly cap resets: the 1st at 00:00 UTC, as claude.ai states it (the usage
-    /// response has no field for it), shown in local time.
+    /// When the monthly cap resets, in local time.
     private func nextMonthStart() -> String {
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
-        guard let next = utc.nextDate(after: Date(), matching: DateComponents(day: 1, hour: 0, minute: 0, second: 0),
-                                      matchingPolicy: .nextTime) else { return "on the 1st" }
         let format = DateFormatter()
         format.locale = Locale(identifier: "en_US")
         format.setLocalizedDateFormatFromTemplate("EEEMMMd jm")
-        return format.string(from: next)
+        return format.string(from: spendMonthUTC().end)
     }
 
     /// Why extra spending can or cannot happen, in a sentence: the toggle and the
@@ -9275,7 +9279,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // spend cap; two dashed rows would say nothing, so that figure takes their place.
         if sevenLimit?.percent == nil, snapshot.fable?.percent == nil,
            let spend = snapshot.usage?.spend, let cap = spend.limit, cap > 0, spend.enabled == true {
-            quotaBar.addArrangedSubview(spendItem(used: spend.used ?? 0, cap: cap, readAt: snapshot.usage?.read_at))
+            let (start, end) = spendMonthUTC()
+            let month = end.timeIntervalSince(start)
+            quotaBar.addArrangedSubview(
+                quotaItem("Monthly spend", readAt: snapshot.usage?.read_at,
+                          Limit(percent: min(100, (spend.used ?? 0) / cap * 100), resets_at: end.timeIntervalSince1970 * 1000),
+                          window: month, note: "\(moneyText(spend.used ?? 0)) of \(moneyText(cap))"))
             return
         }
         quotaBar.addArrangedSubview(
@@ -9287,48 +9296,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             quotaItem("Fable quota", readAt: snapshot.fable?.read_at, fable, window: 168 * hour))
     }
 
-    /// The monthly spend cap as a quota-shaped item: used share of the cap, the dollars under it.
-    private func spendItem(used: Double, cap: Double, readAt: Double?) -> NSView {
-        let grid = NSGridView()
-        grid.rowSpacing = 4
-        grid.columnSpacing = 8
-        grid.yPlacement = .center
-        let percent = min(100, used / cap * 100)
-        let colour = Palette.threshold(percent)
-        let small = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        func label(_ text: String, _ colour: NSColor, _ font: NSFont) -> NSTextField {
-            let field = NSTextField(labelWithString: text)
-            field.font = font
-            field.textColor = colour
-            return field
-        }
-        let bar = BarView()
-        bar.fraction = percent / 100
-        bar.colour = colour
-        bar.divisions = 0
-        bar.translatesAutoresizingMaskIntoConstraints = false
-        bar.widthAnchor.constraint(equalToConstant: 96).isActive = true
-        bar.heightAnchor.constraint(equalToConstant: 12).isActive = true
-        remember(bar, "Monthly spend used")
-        var caption = "\(moneyText(used)) of \(moneyText(cap))"
-        if let at = readAt, Date().timeIntervalSince1970 - at / 1000 > 120 { caption += " · read \(ago(at)) ago" }
-        grid.addRow(with: [NSView(), label(caption, Palette.dim, small)])
-        grid.addRow(with: [
-            label("Monthly spend", Palette.dim, NSFont.systemFont(ofSize: 11)), bar,
-            label("\(Int(percent.rounded()))%", colour, NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)),
-        ])
-        grid.addRow(with: [NSView(), label(" ", Palette.dim, small)])
-        grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 2).xPlacement = .trailing
-        return grid
-    }
-
     /// One quota: its name, a drawn bar, the share, and when it comes back. The
     /// colours are the status line's own thresholds. Under it, dimmed, the pace
     /// row: how much of the window's time has gone, drawn on the same scale, and
     /// where spending at this rate would end up by the reset. Level bars mean an
     /// even pace; a used bar ahead of its ghost runs out early.
-    private func quotaItem(_ title: String, readAt: Double?, _ limit: Limit?, window: Double) -> NSView {
+    private func quotaItem(_ title: String, readAt: Double?, _ limit: Limit?, window: Double, note dollars: String? = nil) -> NSView {
         let grid = NSGridView()
         grid.rowSpacing = 4
         grid.columnSpacing = 8
@@ -9378,7 +9351,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // A reading only changes when a session redraws, so an old one is still
         // the truth — as long as the bar says how old it is.
         let age = Date().timeIntervalSince1970 - readAt / 1000
-        var caption = limitWords(limit)
+        var caption = dollars ?? limitWords(limit)
         if age > 120 {
             caption += caption.isEmpty ? "" : " · "
             caption += "read \(ago(readAt)) ago"
@@ -9972,8 +9945,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             exit(0)
         }
+        // CC_SESSIONS_WINDOW_SPEND=1 gives the fixture an enterprise account: no weekly limits, a spend cap.
+        let spendFixture = ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_SPEND"] == "1"
+            ? json.replacingOccurrences(of: "\"history\":", with: "\"usage\": {\"read_at\": \(Int(Date().timeIntervalSince1970 * 1000)), \"spend\": {\"used\": 4200, \"limit\": 10000, \"enabled\": true}},\n             \"history\":")
+            : json
         do {
-            let fixture = try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
+            let fixture = try JSONDecoder().decode(Snapshot.self, from: Data(spendFixture.utf8))
             let controller = SessionsWindow(fixture: fixture)
             self.controller = controller
             problems = controller.selfTestProblems(fixture: fixture)
