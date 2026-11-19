@@ -3196,6 +3196,9 @@ final class RecoverSheet: NSObject {
         if !detachedAvailable { openPopup.item(at: 1)?.title = "Open detached, through clo-remote (not answering)" }
         alert.addButton(withTitle: "Resume")
         alert.addButton(withTitle: "Cancel")
+        // Opens on the last day: crashes come one at a time as often as together, so the last batch
+        // alone missed all but the newest of four crashes hours apart.
+        rangePopup.selectItem(at: ranges.firstIndex { $0.0 == "Ended in the last day" } ?? 0)
         alert.accessoryView = buildView()
         update()
     }
