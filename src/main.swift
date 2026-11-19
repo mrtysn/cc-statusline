@@ -3516,6 +3516,11 @@ let hotkeyProfileName = "Hotkey Window"
 /// and a terminal reply landing in front of it garbled the first word. The shell
 /// is interactive so aliases and functions load, and replaces itself with a
 /// plain login shell afterwards so the tab outlives the command.
+/// The tab runs `clo --run-claude`, which attaches tmux in control mode (-CC). iTerm appends
+/// that tmux tab at the end of the window; clo's place_iterm_tmux_tab (agents-shared
+/// scripts/iterm-place-tmux-tab.py, via iTerm's Python API) moves it into the slot of the tab
+/// that opened it. Tabs opened one after another land in the order they are opened; no tab
+/// position is recorded anywhere.
 @discardableResult
 func runInNewTab(_ command: String) -> Bool {
     let shell = getpwuid(getuid()).flatMap { String(validatingUTF8: $0.pointee.pw_shell) } ?? "/bin/zsh"
