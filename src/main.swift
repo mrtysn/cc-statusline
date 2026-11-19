@@ -172,6 +172,11 @@ struct Segments: Decodable {
     let cache: String?
 }
 
+/// A view whose content starts at the top, for a scroll view's document.
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 /// Calls a closure when a control it targets fires.
 final class PopupAction: NSObject {
     private let run: () -> Void
@@ -2979,6 +2984,7 @@ func tmuxLookupProblems() -> [String] {
         problems.append("resume did not go through clo --run-claude: \(resume)")
     }
     problems += restartProblems()
+    problems += recoverProblems()
     for (mode, want) in [("default", "manual"), ("manual", "manual"), ("plan", "plan"), ("auto", "auto"), ("acceptEdits", "acceptEdits"), ("bypassPermissions", nil), (nil, nil)] as [(String?, String?)] where remoteMode(mode) != want {
         problems.append("remoteMode(\(mode ?? "nil")) was \(remoteMode(mode) ?? "nil"), not \(want ?? "nil")")
     }
@@ -3046,10 +3052,16 @@ func focusITermSession(where condition: String, label: String) -> Bool {
 /// and with the model, effort and permission mode it last ran.
 func resumeCommand(_ s: Summary, mode: String?) -> String? {
     guard let id = s.session_id, let dir = s.project_dir else { return nil }
+    return resumeCommand(id: id, dir: dir, model: s.model_id, effort: s.effort, mode: mode)
+}
+
+/// The same, from the fields a saved record keeps.
+func resumeCommand(id: String, dir: String, model: String?, effort: String?, mode: String?) -> String {
     let quote = { (text: String) in "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     var args = ["--resume", id]
-    if let model = s.model_id { args += ["--model", quote(model)] }
-    if let effort = s.effort { args += ["--effort", effort] }
+    if let model = model, !model.isEmpty { args += ["--model", quote(model)] }
+    if let effort = effort, !effort.isEmpty { args += ["--effort", effort] }
+    let mode = mode.flatMap { $0.isEmpty ? nil : $0 }
     // The transcript still says `default` for what the command line calls `manual`.
     if let mode = mode { args += ["--permission-mode", mode == "default" ? "manual" : mode] }
     return resumeShellCommand(directory: quote((dir as NSString).expandingTildeInPath), arguments: args.joined(separator: " "))
@@ -3060,6 +3072,244 @@ func resumeCommand(_ s: Summary, mode: String?) -> String? {
 /// `claude` otherwise. `command` skips the shell function `clo --init zsh` defines.
 func resumeShellCommand(directory: String, arguments: String) -> String {
     "cd \(directory) && if command -v clo >/dev/null; then command clo --run-claude \(arguments); else claude \(arguments); fi"
+}
+
+// MARK: Recovering closed sessions
+
+/// Whether a session ended against the user's will: killed outright, or its tab, iTerm or the Mac
+/// went away under it. /exit, /clear, a logout and a resume elsewhere are the user's own doing.
+func endedInvoluntarily(_ reason: String?) -> Bool { reason == "crashed" || reason == "other" }
+
+/// How many of `ends` (epoch ms, newest first) ended together with the newest: each within
+/// `gapMs` of the one after it, as a crash, a tmux restart or a reboot closes them.
+func lastBatchCount(_ ends: [Double], gapMs: Double = 60_000) -> Int {
+    guard !ends.isEmpty else { return 0 }
+    var count = 1
+    while count < ends.count, ends[count - 1] - ends[count] <= gapMs { count += 1 }
+    return count
+}
+
+/// When this Mac last started, in epoch ms.
+func bootTimeMs() -> Double? {
+    var boot = timeval()
+    var size = MemoryLayout<timeval>.size
+    var mib = [CTL_KERN, KERN_BOOTTIME]
+    guard sysctl(&mib, 2, &boot, &size, nil, 0) == 0 else { return nil }
+    return Double(boot.tv_sec) * 1000 + Double(boot.tv_usec) / 1000
+}
+
+/// One finished session the recovery sheet can open again.
+struct RecoverCandidate {
+    let id: String
+    let name: String
+    let folder: String
+    let state: String
+    let endedAt: Double
+    let involuntary: Bool
+    let command: String
+    let dir: String
+    let model: String?
+    let effort: String?
+    let mode: String?
+}
+
+/// What a range of the recovery sheet shows: the sessions that ended together most recently,
+/// or those that ended after a time.
+enum RecoverRange {
+    case lastBatch
+    case since(Double)
+}
+
+/// The candidates a range shows, newest first, before any are unticked.
+func recoverShown(_ all: [RecoverCandidate], range: RecoverRange, includeChosen: Bool) -> [RecoverCandidate] {
+    let pool = all.filter { includeChosen || $0.involuntary }.sorted { $0.endedAt > $1.endedAt }
+    switch range {
+    case .lastBatch: return Array(pool.prefix(lastBatchCount(pool.map(\.endedAt))))
+    case .since(let cutoff): return pool.filter { $0.endedAt >= cutoff }
+    }
+}
+
+/// The checks of what the recovery sheet offers, on made-up sessions.
+func recoverProblems() -> [String] {
+    var problems: [String] = []
+    if !endedInvoluntarily("crashed") || !endedInvoluntarily("other") { problems.append("a crash or a closed tab did not count as involuntary") }
+    for reason in ["prompt_input_exit", "clear", "resume", "logout", nil] as [String?] where endedInvoluntarily(reason) {
+        problems.append("\(reason ?? "no reason") counted as involuntary")
+    }
+    if lastBatchCount([]) != 0 || lastBatchCount([5_000_000]) != 1 { problems.append("a batch of none or one was miscounted") }
+    if lastBatchCount([10_000_000, 9_970_000, 9_920_000, 9_000_000]) != 3 { problems.append("ends a minute apart did not form one batch") }
+    if lastBatchCount([10_000_000, 9_000_000, 8_999_000]) != 1 { problems.append("a lone newest end took in an older batch") }
+    func candidate(_ id: String, at: Double, involuntary: Bool) -> RecoverCandidate {
+        RecoverCandidate(id: id, name: id, folder: "f", state: involuntary ? "crashed" : "exited", endedAt: at, involuntary: involuntary,
+                         command: "cmd", dir: "/tmp", model: nil, effort: nil, mode: nil)
+    }
+    let all = [candidate("old", at: 1_000_000, involuntary: true), candidate("exit", at: 9_990_000, involuntary: false),
+               candidate("a", at: 10_000_000, involuntary: true), candidate("b", at: 9_950_000, involuntary: true)]
+    if recoverShown(all, range: .lastBatch, includeChosen: false).map(\.id) != ["a", "b"] { problems.append("the last batch was not the newest crashed and closed sessions") }
+    if recoverShown(all, range: .lastBatch, includeChosen: true).map(\.id) != ["a", "exit", "b"] { problems.append("the last batch left out sessions the user ended when asked to include them") }
+    if recoverShown(all, range: .since(5_000_000), includeChosen: false).map(\.id) != ["a", "b"] { problems.append("a time range took in an older or chosen end") }
+    let command = resumeCommand(id: "x", dir: "/tmp/a", model: "m", effort: "", mode: "default")
+    if !command.contains("--resume x --model 'm' --permission-mode manual") || command.contains("--effort") {
+        problems.append("a saved record's resume command was wrong: \(command)")
+    }
+    return problems
+}
+
+/// The recovery sheet's controls: which range, whether sessions the user ended count, where they
+/// open, and a ticked list of the sessions that match. It lives as long as its alert.
+final class RecoverSheet: NSObject {
+    let alert = NSAlert()
+    private let all: [RecoverCandidate]
+    private let ranges: [(title: String, range: RecoverRange)]
+    private let rangePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let includeChosen = NSButton(checkboxWithTitle: "Also sessions you ended yourself (exited, cleared, logged out)", target: nil, action: nil)
+    private let openPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let list = NSStackView()
+    private var unticked: Set<String> = []
+    private(set) var shown: [RecoverCandidate] = []
+    static let width: CGFloat = 540
+
+    var ticked: [RecoverCandidate] { shown.filter { !unticked.contains($0.id) } }
+    var detached: Bool { openPopup.indexOfSelectedItem == 1 }
+
+    init(_ all: [RecoverCandidate], now: Double, boot: Double?, detachedAvailable: Bool) {
+        self.all = all
+        var ranges: [(String, RecoverRange)] = [("The last batch", .lastBatch)]
+        ranges += [("15 minutes", 900.0), ("hour", 3600), ("6 hours", 21600), ("day", 86400), ("week", 604800)]
+            .map { ("Ended in the last \($0.0)", .since(now - $0.1 * 1000)) }
+        if let boot = boot {
+            let f = DateFormatter()
+            f.dateFormat = Calendar.current.isDate(Date(timeIntervalSince1970: boot / 1000), inSameDayAs: Date()) ? "HH:mm" : "EEE d MMM HH:mm"
+            ranges.append(("Ended since this Mac started (\(f.string(from: Date(timeIntervalSince1970: boot / 1000))))", .since(boot)))
+        }
+        self.ranges = ranges
+        super.init()
+        rangePopup.addItems(withTitles: ranges.map(\.0))
+        rangePopup.target = self
+        rangePopup.action = #selector(changed)
+        includeChosen.target = self
+        includeChosen.action = #selector(changed)
+        includeChosen.toolTip = "Off: only sessions that crashed, or whose tab, iTerm or Mac closed under them"
+        openPopup.autoenablesItems = false
+        openPopup.addItems(withTitles: ["Open each in a new iTerm tab", "Open detached, through clo-remote"])
+        openPopup.item(at: 1)?.isEnabled = detachedAvailable
+        if !detachedAvailable { openPopup.item(at: 1)?.title = "Open detached, through clo-remote (not answering)" }
+        alert.addButton(withTitle: "Resume")
+        alert.addButton(withTitle: "Cancel")
+        alert.accessoryView = buildView()
+        update()
+    }
+
+    private func label(_ text: String) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.systemFont(ofSize: 12)
+        field.textColor = .secondaryLabelColor
+        return field
+    }
+
+    private func link(_ title: String, _ action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.isBordered = false
+        button.attributedTitle = NSAttributedString(string: title, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.linkColor])
+        return button
+    }
+
+    private func buildView() -> NSView {
+        let width = Self.width
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 4
+        list.translatesAutoresizingMaskIntoConstraints = false
+        let document = FlippedView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(list)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.drawsBackground = false
+        scroll.documentView = document
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            list.topAnchor.constraint(equalTo: document.topAnchor, constant: 6),
+            list.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 8),
+            list.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor, constant: -8),
+            list.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -6),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            scroll.widthAnchor.constraint(equalToConstant: width),
+            scroll.heightAnchor.constraint(equalToConstant: 220),
+        ])
+        let tickRow = NSStackView(views: [label("Tick:"), link("all", #selector(tickAll)), link("none", #selector(tickNone))])
+        tickRow.spacing = 8
+        let stack = NSStackView(views: [rangePopup, includeChosen, scroll, tickRow, openPopup])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.setCustomSpacing(4, after: scroll)
+        stack.setCustomSpacing(12, after: tickRow)
+        stack.frame = NSRect(origin: .zero, size: NSSize(width: width, height: stack.fittingSize.height))
+        return stack
+    }
+
+    @objc private func changed() { update() }
+    @objc private func tickAll() { shown.forEach { unticked.remove($0.id) }; update() }
+    @objc private func tickNone() { shown.forEach { unticked.insert($0.id) }; update() }
+    @objc private func toggled(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        if sender.state == .on { unticked.remove(id) } else { unticked.insert(id) }
+        update(rebuild: false)
+    }
+
+    /// Selects the range at `index`, as a click on the popup would.
+    func chooseRange(_ index: Int) { rangePopup.selectItem(at: index); update() }
+
+    private func update(rebuild: Bool = true) {
+        let include = includeChosen.state == .on
+        let batch = recoverShown(all, range: .lastBatch, includeChosen: include)
+        let batchTitle: String
+        if let first = batch.first {
+            let f = DateFormatter()
+            f.dateFormat = Calendar.current.isDateInToday(Date(timeIntervalSince1970: first.endedAt / 1000)) ? "HH:mm" : "EEE d MMM HH:mm"
+            batchTitle = "The last batch: \(batch.count) ended together at \(f.string(from: Date(timeIntervalSince1970: first.endedAt / 1000)))"
+        } else {
+            batchTitle = "The last batch: none"
+        }
+        rangePopup.item(at: 0)?.title = batchTitle
+        rangePopup.synchronizeTitleAndSelectedItem()
+        shown = recoverShown(all, range: ranges[max(0, rangePopup.indexOfSelectedItem)].range, includeChosen: include)
+        if rebuild {
+            list.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            for c in shown {
+                let box = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggled(_:)))
+                box.identifier = NSUserInterfaceItemIdentifier(c.id)
+                box.alignment = .left
+                box.state = unticked.contains(c.id) ? .off : .on
+                // Cut short so the folder, the state and the age stay in view.
+                let name = c.name.count > 56 ? String(c.name.prefix(55)) + "\u{2026}" : c.name
+                let title = NSMutableAttributedString(string: name, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.labelColor])
+                title.append(NSAttributedString(string: "   \(c.folder) · \(c.state) · \(ago(c.endedAt)) ago",
+                    attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
+                // A button's title is centred unless told otherwise.
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = .left
+                paragraph.lineBreakMode = .byTruncatingTail
+                title.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: title.length))
+                box.attributedTitle = title
+                (box.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
+                box.widthAnchor.constraint(lessThanOrEqualToConstant: Self.width - 36).isActive = true
+                box.toolTip = c.dir
+                list.addArrangedSubview(box)
+            }
+            if shown.isEmpty {
+                list.addArrangedSubview(label(includeChosen.state == .on ? "None ended in that time, or each is open again."
+                    : "None crashed or closed in that time, or each is open again."))
+            }
+        }
+        let n = ticked.count
+        alert.messageText = shown.isEmpty ? "No closed sessions to resume"
+            : "Resume \(n == shown.count ? "" : "\(n) of ")\(shown.count) closed session\(shown.count == 1 ? "" : "s")?"
+        alert.informativeText = "Each opens with its model, effort and permission mode, from the folder it was launched in."
+        alert.buttons.first?.isEnabled = n > 0
+    }
 }
 
 /// One live Claude session in a tmux pane, as a restart needs it.
@@ -6638,6 +6888,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         table.selectionHighlightStyle = .none
         table.allowsTypeSelect = false
         table.allowsEmptySelection = true
+        // ⌘-click and ⇧-click select several rows, for Resume Selected Sessions.
+        table.allowsMultipleSelection = true
         table.target = self
         // A double-click on the columns that name a session goes to its terminal.
         table.doubleAction = #selector(showClickedTerminal)
@@ -7063,7 +7315,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
     /// Rows from the last snapshot through the tag filter, sorted and drawn.
     private func applyFilter() {
-        let keep = selected?.session.summary.session_id
+        let keep = keptSelection
         rows = allRows.filter { tagStore.matches(tagFilter, $0.session.summary.session_id, $0.session.summary.project_dir) }
         emptyLabel.stringValue = allRows.isEmpty
             ? "No session has drawn a status line yet." : "No session has \(filterWords)."
@@ -7421,7 +7673,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         self.loads = loads
         events.prune(keeping: Set(snapshot.live.compactMap { $0.summary.session_id }))
-        let keep = selected?.session.summary.session_id
+        let keep = keptSelection
         let ended = { (s: Session) in reused.contains(s.summary.session_id ?? "") }
         let live = snapshot.live.filter { !ended($0) }
         let past = snapshot.live.filter(ended) + snapshot.history
@@ -7536,13 +7788,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// A selection belongs to a session, not to a row number: new data or a new
     /// sort moves rows, and the selected session keeps its highlight wherever it
     /// lands. Gone from the list, nothing stays selected.
-    private func select(_ id: String?) {
-        guard let id = id, let row = rows.firstIndex(where: { $0.session.summary.session_id == id }) else {
+    private func select(_ keep: (primary: String?, all: Set<String>)) {
+        var wanted = IndexSet()
+        var primary: Int?
+        for (i, entry) in rows.enumerated() {
+            guard let id = entry.session.summary.session_id, keep.all.contains(id) else { continue }
+            wanted.insert(i + 1)
+            if id == keep.primary { primary = i + 1 }
+        }
+        guard !wanted.isEmpty else {
             table.deselectAll(nil)
             return
         }
-        if table.selectedRow != row + 1 {
-            table.selectRowIndexes(IndexSet(integer: row + 1), byExtendingSelection: false)
+        guard table.selectedRowIndexes != wanted || (primary != nil && table.selectedRow != primary) else { return }
+        // The keyboard's row is added last, so it stays the one ⌘C and ⌘↩ act on.
+        if let primary = primary {
+            table.selectRowIndexes(wanted.subtracting(IndexSet(integer: primary)), byExtendingSelection: false)
+            table.selectRowIndexes(IndexSet(integer: primary), byExtendingSelection: true)
+        } else {
+            table.selectRowIndexes(wanted, byExtendingSelection: false)
         }
     }
 
@@ -7576,7 +7840,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             self.settleTimer?.invalidate()
             self.settleTimer = nil
             self.orderPending = false
-            let keep = self.selected?.session.summary.session_id
+            let keep = self.keptSelection
             self.sortRows()
             self.refreshTable()
             self.select(keep)
@@ -7918,6 +8182,33 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         return row >= 0 && row < rows.count ? rows[row] : nil
     }
 
+    /// Every selected row: ⌘-click and ⇧-click add to the selection.
+    private var selectedEntries: [(session: Session, past: Bool)] {
+        table.selectedRowIndexes.compactMap { rows[safe: $0 - 1] }
+    }
+
+    /// The finished sessions among the selected rows, when more than one row is selected: what
+    /// Resume Selected Sessions opens again.
+    private var selectedFinished: [Session] {
+        let entries = selectedEntries
+        return entries.count > 1 ? entries.filter(\.past).map(\.session).filter { $0.transcript != nil } : []
+    }
+
+    /// The selection as session ids, kept across a reload: the row the keyboard is on, and the rest.
+    private var keptSelection: (primary: String?, all: Set<String>) {
+        (selected?.session.summary.session_id, Set(selectedEntries.compactMap { $0.session.summary.session_id }))
+    }
+
+    /// Opens every selected finished session again, a second apart.
+    @objc func resumeSelectedSessions() {
+        let sessions = selectedFinished
+        guard !sessions.isEmpty else { return }
+        note("Resuming \(sessions.count) session\(sessions.count == 1 ? "" : "s")", seconds: 6)
+        for (i, session) in sessions.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i)) { [weak self] in self?.resume(session) }
+        }
+    }
+
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(toggleSSHBypassAll) {
             item.state = GuardBypassAll.on(GuardBypassAll.ssh) ? .on : .off
@@ -7939,6 +8230,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if item.action == #selector(toggleSelectMode) {
             item.state = selecting ? .on : .off
             return true
+        }
+        if item.action == #selector(finishLastRestartAll) { return fm.fileExists(atPath: restartRecordPath) }
+        if item.action == #selector(resumeSelectedSessions) {
+            let n = selectedFinished.count
+            item.title = n > 0 ? "Resume \(n) Selected Session\(n == 1 ? "" : "s")" : "Resume Selected Sessions (⌘-click rows)"
+            return n > 0
         }
         guard item.action == #selector(showSelectedTerminal) else { return true }
         item.title = selected?.past == true ? "Resume Session" : "Show Terminal"
@@ -8042,6 +8339,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         menu.removeAllItems()
         let row = table.clickedRow - 1
         guard row >= 0, row < rows.count else { return }
+        let several = selectedFinished
+        if table.selectedRowIndexes.contains(row + 1), !several.isEmpty {
+            menu.autoenablesItems = false
+            menu.addItem(ActionItem("Resume \(several.count) Selected Session\(several.count == 1 ? "" : "s")") { [weak self] in
+                self?.resumeSelectedSessions()
+            })
+            menu.addItem(.separator())
+        }
         fillSessionMenu(menu, rows[row], flash: nil)
     }
 
@@ -8457,56 +8762,121 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
     }
 
-    /// The finished sessions that ended within `seconds`, newest first, each with the command that
-    /// opens it again: the sessions a tmux restart or a reboot closed together. A session open
-    /// again elsewhere, one that never had a prompt and one with no recorded launch directory are left out.
-    private func closedSessions(within seconds: Double) -> [(session: Session, command: String)] {
-        let cutoff = (Date().timeIntervalSince1970 - seconds) * 1000
+    /// Every finished session that can be opened again, newest first: not open again elsewhere, with
+    /// a prompt sent and a recorded launch directory. Each id once, at its latest end.
+    private func recoverCandidates() -> [RecoverCandidate] {
         let open = Set(allRows.filter { !$0.past }.compactMap { $0.session.summary.session_id })
         var seen = Set<String>()
         return allRows.filter { $0.past }.map(\.session)
-            .filter { ($0.ended?.at ?? $0.active_at ?? $0.updated_at) >= cutoff }
             .sorted { ($0.ended?.at ?? $0.active_at ?? $0.updated_at) > ($1.ended?.at ?? $1.active_at ?? $1.updated_at) }
             .compactMap { session in
-                guard let id = session.summary.session_id, !open.contains(id), seen.insert(id).inserted,
-                      session.transcript != nil,
-                      let command = resumeCommand(session.summary, mode: session.transcript?.mode) else { return nil }
-                return (session, command)
+                let s = session.summary
+                guard let id = s.session_id, !open.contains(id), seen.insert(id).inserted, session.transcript != nil,
+                      let dir = s.project_dir,
+                      let command = resumeCommand(s, mode: session.transcript?.mode) else { return nil }
+                return RecoverCandidate(
+                    id: id, name: s.session_name ?? s.topic ?? String(id.prefix(8)),
+                    folder: ((s.cwd ?? dir) as NSString).abbreviatingWithTildeInPath,
+                    state: stateWords(session, past: true).0, endedAt: session.ended?.at ?? session.active_at ?? session.updated_at,
+                    involuntary: endedInvoluntarily(session.ended?.reason), command: command,
+                    dir: (dir as NSString).expandingTildeInPath, model: s.model_id, effort: s.effort, mode: session.transcript?.mode)
             }
     }
 
-    /// Opens every session that ended within the chosen time again, each in its own iTerm tab
-    /// (through clo, so each runs in tmux), a second apart.
+    /// Opens finished sessions again: those the sheet shows and leaves ticked, in new iTerm tabs a
+    /// second apart or detached through clo-remote. By default only the ones that crashed or closed
+    /// under you; the sessions that ended together most recently are chosen first.
     @objc func resumeClosedSessions() {
         guard let window = window else { return }
-        let choices: [(title: String, seconds: Double)] = [("15 minutes", 900), ("hour", 3600), ("6 hours", 21600), ("day", 86400)]
-        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 200, height: 26))
-        popup.addItems(withTitles: choices.map { "Closed in the last \($0.title)" })
-        popup.selectItem(at: 1)
+        let sheet = RecoverSheet(recoverCandidates(), now: Date().timeIntervalSince1970 * 1000, boot: bootTimeMs(),
+                                 detachedAvailable: cloRemoteAnswers())
+        sheet.alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self = self else { return }
+            self.openAgain(sheet.ticked.map { ($0.name, $0.command, $0.id, $0.dir, $0.model, $0.effort, $0.mode) }, detached: sheet.detached)
+        }
+    }
+
+    /// Opens sessions again: in new iTerm tabs a second apart, or detached through clo-remote one
+    /// after another, reporting those it could not start.
+    private func openAgain(_ items: [(name: String, command: String, id: String, dir: String, model: String?, effort: String?, mode: String?)], detached: Bool) {
+        guard !items.isEmpty else { return }
+        log("recover: resuming \(items.count) \(detached ? "detached" : "in iTerm tabs"): \(items.map(\.id).joined(separator: ", "))")
+        note("Resuming \(items.count) session\(items.count == 1 ? "" : "s")\(detached ? " detached" : "")", seconds: 6)
+        guard detached else {
+            for (i, item) in items.enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i)) { runInNewTab(item.command) }
+            }
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var failed: [String] = []
+            for item in items {
+                guard let model = item.model else { failed.append("\(item.name): no model recorded"); continue }
+                if let why = startDetached(dir: item.dir, model: model, effort: item.effort, mode: item.mode, resume: item.id) {
+                    failed.append("\(item.name): \(why)")
+                }
+            }
+            log("recover: detached, \(items.count - failed.count) started, failed: \(failed)")
+            DispatchQueue.main.async {
+                self?.note(failed.isEmpty ? "Resumed \(items.count) detached"
+                    : "Resumed \(items.count - failed.count) detached; not started: " + failed.joined(separator: "; "), seconds: failed.isEmpty ? 6 : 30)
+            }
+        }
+    }
+
+    /// Where Restart All saves the sessions it ends.
+    private var restartRecordPath: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/CC Sessions/restart-all.json")
+    }
+
+    /// Brings back every session the last Restart All ended that is not running again, each the way it
+    /// was: those shown in iTerm in new tabs, the detached ones through clo-remote.
+    @objc func finishLastRestartAll() {
+        guard let window = window else { return }
         let alert = NSAlert()
+        guard let data = fm.contents(atPath: restartRecordPath),
+              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sessions = record["sessions"] as? [[String: Any]] else {
+            alert.messageText = "No Restart All has been recorded"
+            alert.beginSheetModal(for: window)
+            return
+        }
+        var when = "the last Restart All"
+        if let saved = (record["savedAt"] as? String).flatMap({ ISO8601DateFormatter().date(from: $0) }) {
+            let f = DateFormatter()
+            f.dateFormat = Calendar.current.isDateInToday(saved) ? "HH:mm" : "EEE d MMM HH:mm"
+            when = "the Restart All at \(f.string(from: saved))"
+        }
+        let live = Set(allRows.filter { !$0.past }.compactMap { $0.session.summary.session_id })
+        let missing = sessions.filter { ($0["id"] as? String).map { !live.contains($0) } ?? false }
+        guard !missing.isEmpty else {
+            alert.messageText = "Every session from \(when) is running again"
+            alert.informativeText = "\(sessions.count) session\(sessions.count == 1 ? "" : "s") in its record."
+            alert.beginSheetModal(for: window)
+            return
+        }
+        typealias Item = (name: String, command: String, id: String, dir: String, model: String?, effort: String?, mode: String?)
+        func item(_ r: [String: Any]) -> Item? {
+            guard let id = r["id"] as? String, let dir = r["dir"] as? String else { return nil }
+            let model = r["model"] as? String, effort = r["effort"] as? String, mode = r["mode"] as? String
+            return ((r["name"] as? String) ?? String(id.prefix(8)), resumeCommand(id: id, dir: dir, model: model, effort: effort, mode: mode),
+                    id, dir, model, effort?.isEmpty == true ? nil : effort, mode?.isEmpty == true ? nil : mode)
+        }
+        let tabs = missing.filter { $0["attached"] as? Bool ?? true }.compactMap(item)
+        let detached = missing.filter { !($0["attached"] as? Bool ?? true) }.compactMap(item)
+        alert.messageText = "Resume \(missing.count) of \(sessions.count) sessions from \(when)?"
+        var text = "The rest are running again. "
+        text += "\(tabs.count) shown in iTerm return in new tabs, \(detached.count) detached return through clo-remote.\n"
+        text += missing.prefix(12).map { "\u{2022} " + (($0["name"] as? String) ?? "session") }.joined(separator: "\n")
+        if missing.count > 12 { text += "\n\u{2026} and \(missing.count - 12) more" }
+        if !detached.isEmpty && !cloRemoteAnswers() { text += "\n\nclo-remote does not answer now: the detached ones will fail." }
+        alert.informativeText = text
         alert.addButton(withTitle: "Resume")
         alert.addButton(withTitle: "Cancel")
-        alert.accessoryView = popup
-        let describe = {
-            let found = self.closedSessions(within: choices[popup.indexOfSelectedItem].seconds)
-            let names = found.prefix(12).map { "\u{2022} " + ($0.session.summary.session_name ?? $0.session.summary.session_id.map { String($0.prefix(8)) } ?? "session") }
-            alert.messageText = found.isEmpty ? "No closed sessions to resume" : "Resume \(found.count) closed session\(found.count == 1 ? "" : "s")?"
-            alert.informativeText = found.isEmpty ? "None ended in that time, or each is open again."
-                : "Each opens in its own iTerm tab with its model, effort and permission mode.\n" + names.joined(separator: "\n") + (found.count > 12 ? "\n\u{2026} and \(found.count - 12) more" : "")
-            alert.buttons.first?.isEnabled = !found.isEmpty
-        }
-        let target = PopupAction(describe)
-        popup.target = target
-        popup.action = #selector(PopupAction.fire)
-        describe()
         alert.beginSheetModal(for: window) { [weak self] response in
-            withExtendedLifetime(target) {}
             guard response == .alertFirstButtonReturn, let self = self else { return }
-            let found = self.closedSessions(within: choices[popup.indexOfSelectedItem].seconds)
-            self.note("Resuming \(found.count) session\(found.count == 1 ? "" : "s")", seconds: 6)
-            for (i, entry) in found.enumerated() {
-                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i)) { runInNewTab(entry.command) }
-            }
+            self.openAgain(tabs, detached: false)
+            self.openAgain(detached, detached: true)
         }
     }
 
@@ -9442,7 +9812,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
         tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("cache"))?.title =
             isCache(tableView.sortDescriptors.first?.key) && cacheOrder == .soonest ? "Cache · soonest" : "Cache"
-        let keep = selected?.session.summary.session_id
+        let keep = keptSelection
         sortRows()
         refreshTable(full: true)
         select(keep)
@@ -9979,6 +10349,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
             }
         }
+        // CC_SESSIONS_RECOVER_PNG=<path> saves the Resume Closed Sessions sheet over made-up sessions.
+        if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_RECOVER_PNG"] {
+            let now = Date().timeIntervalSince1970 * 1000
+            func made(_ id: String, _ name: String, _ folder: String, _ state: String, minutes: Double) -> RecoverCandidate {
+                RecoverCandidate(id: id, name: name, folder: folder, state: state, endedAt: now - minutes * 60000,
+                                 involuntary: state != "exited", command: "", dir: folder, model: "m", effort: nil, mode: nil)
+            }
+            let sheet = RecoverSheet([
+                made("a", "Fixture build and unit runs", "~/dev/project-a", "closed", minutes: 12),
+                made("b", "Status line usage window with a much longer topic that has to be cut short", "~/dev/project-b/with-a-long-folder-name", "closed", minutes: 12.3),
+                made("c", "Third fixture", "~/dev/project-c", "crashed", minutes: 12.6),
+                made("d", "A session the user exited", "~/dev/project-d", "exited", minutes: 13),
+                made("e", "Older crash", "~/dev/project-e", "crashed", minutes: 400),
+            ], now: now, boot: now - 86400000 * 2, detachedAvailable: false)
+            if let index = ProcessInfo.processInfo.environment["CC_SESSIONS_RECOVER_RANGE"].flatMap(Int.init) { sheet.chooseRange(index) }
+            // Dark, as a sheet on the sessions window is. The alert's own background is a blur the capture
+            // leaves white, so a plain fill goes under its controls.
+            sheet.alert.window.appearance = NSAppearance(named: .darkAqua)
+            sheet.alert.layout()
+            if let content = sheet.alert.window.contentView {
+                let fill = NSBox(frame: content.bounds)
+                fill.boxType = .custom
+                fill.borderWidth = 0
+                fill.fillColor = NSColor(srgbRed: 0.17, green: 0.17, blue: 0.18, alpha: 1)
+                fill.autoresizingMask = [.width, .height]
+                content.addSubview(fill, positioned: .below, relativeTo: nil)
+                content.layoutSubtreeIfNeeded()
+                if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                    content.cacheDisplay(in: content.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+                }
+            }
+        }
         try? fm.removeItem(at: selfTestRoot)
         for problem in problems { print("self-test: \(problem)") }
         print(problems.isEmpty ? "self-test: every check passed" : "self-test: \(problems.count) failed")
@@ -10028,6 +10431,9 @@ func buildMenu() {
         withTitle: "Show Terminal", action: #selector(SessionsWindow.showSelectedTerminal),
         keyEquivalent: "\r")
     showItem.keyEquivalentModifierMask = [.command]
+    sessionMenu.addItem(
+        withTitle: "Resume Selected Sessions", action: #selector(SessionsWindow.resumeSelectedSessions),
+        keyEquivalent: "")
     sessionMenu.addItem(.separator())
     sessionMenu.addItem(
         withTitle: "Send Message to Sessions…", action: #selector(SessionsWindow.toggleSelectMode),
@@ -10037,6 +10443,9 @@ func buildMenu() {
         keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "Restart All Sessions and tmux…", action: #selector(SessionsWindow.restartAllSessions),
+        keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "Finish Last Restart All…", action: #selector(SessionsWindow.finishLastRestartAll),
         keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "Resume Closed Sessions…", action: #selector(SessionsWindow.resumeClosedSessions),
