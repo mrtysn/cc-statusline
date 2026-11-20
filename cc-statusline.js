@@ -1887,13 +1887,9 @@ if (process.argv[2] === 'live') {
   // `--force`, from the Usage window's Query now button, skips the age gate and
   // keeps MANUAL_MIN_MS between requests and any pause a refusal asked for.
   const force = process.argv.includes('--force');
-  // `--max-age <seconds>`, from the app while its window is open: the age gate is that,
-  // never under MANUAL_MIN_MS, so the window follows the account closely.
-  const maxAgeArg = Number(process.argv[process.argv.indexOf('--max-age') + 1]);
-  const gate = process.argv.includes('--max-age') && maxAgeArg > 0 ? Math.max(MANUAL_MIN_MS, maxAgeArg * 1000) : REFRESH_MS;
   const cache = readUsageCache();
   const age = Date.now() - (cache?.fetched_at ?? 0);
-  if (age >= (force ? MANUAL_MIN_MS : gate) && Date.now() >= (cache?.retry_after_at ?? 0) && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
+  if (age >= (force ? MANUAL_MIN_MS : REFRESH_MS) && Date.now() >= (cache?.retry_after_at ?? 0) && takeLock()) refreshUsage(null).catch((err) => logError(`refresh: ${err.message}`));
   if (!force) maybeRefreshApiCredit();
 } else if (process.argv[2] === 'refresh-api-credit') {
   // By hand, regardless of the 30-minute gate: the Usage window's Query now button and
