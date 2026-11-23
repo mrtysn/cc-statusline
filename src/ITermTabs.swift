@@ -60,30 +60,29 @@ struct ListedWindow: Equatable {
 /// session: its tmux pane (`tmuxWindowPane`, empty for a plain tab), tty, profile, unique id and
 /// name. One line per window (`W`) and per tab (`T`), fields split by tabs, the name last so a
 /// tab inside it cannot shift the other fields. Two passes over `windows`, hotkey then the rest,
-/// since iTerm cannot hand out a window reference for keeping in a list (`contents of` an item of
-/// `windows` fails with -1728).
+/// inline: iTerm cannot hand out a window reference for keeping in a list (`contents of` an item of
+/// `windows` fails with -1728), and `tabs of` a window passed to a handler comes back empty. The
+/// separators are made outside the `tell`, where `tab` would name iTerm's tab class, not the character.
 let itermListingScript = """
-    on listWindow(w)
-      tell application id "\(itermBundleId)"
-        set out to "W" & tab & ((is hotkey window of w) as text) & linefeed
-        repeat with t in tabs of w
-          set s to current session of t
-          set p to ""
-          try
-            set p to ((variable named "tmuxWindowPane") of s) as text
-          end try
-          set out to out & "T" & tab & p & tab & (tty of s) & tab & (profile name of s) & tab & (unique id of s) & tab & (name of s) & linefeed
-        end repeat
-        return out
-      end tell
-    end listWindow
+    set TB to character id 9
+    set LF to character id 10
     tell application id "\(itermBundleId)"
       set out to ""
-      repeat with w in windows
-        if is hotkey window of w then set out to out & my listWindow(w)
-      end repeat
-      repeat with w in windows
-        if not (is hotkey window of w) then set out to out & my listWindow(w)
+      repeat with pass from 1 to 2
+        repeat with w in windows
+          set hk to is hotkey window of w
+          if (pass is 1 and hk) or (pass is 2 and not hk) then
+            set out to out & "W" & TB & (hk as text) & LF
+            repeat with t in tabs of w
+              set s to current session of t
+              set p to ""
+              try
+                set p to ((variable named "tmuxWindowPane") of s) as text
+              end try
+              set out to out & "T" & TB & p & TB & (tty of s) & TB & (profile name of s) & TB & (unique id of s) & TB & (name of s) & LF
+            end repeat
+          end if
+        end repeat
       end repeat
       return out
     end tell
@@ -436,8 +435,8 @@ func itermSessionContents(_ uniqueId: String) -> String {
 /// Saves every iTerm window and tab in order; returns the report line, or the reason it could not.
 func saveITermTabs() -> (record: SavedTabs?, message: String) {
     guard runningITermPid() != nil else { return (nil, "iTerm2 is not running: nothing saved") }
-    guard let windows = currentITermListing() else {
-        return (nil, "Could not read iTerm2's tabs: its AppleScript failed (cc-sessions.log has the error). Nothing was saved and iTerm2 was left running")
+    guard let windows = currentITermListing(), !windows.isEmpty, windows.contains(where: { !$0.tabs.isEmpty }) else {
+        return (nil, "Could not read iTerm2's tabs: its AppleScript failed or listed none (cc-sessions.log has what it returned). Nothing was saved and iTerm2 was left running")
     }
     let panes = tmuxSessionsByPane(in: tmuxOutput(["list-panes", "-a", "-F", tmuxPaneSessionFormat]) ?? "")
     let savedAt = ISO8601DateFormatter().string(from: Date())
