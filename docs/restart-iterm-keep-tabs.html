@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Restart iTerm2, keep tabs</title>
+<meta name="provenance" content="written=2026-11-23 repo=cc-statusline revision=4860247ca06b session=7a9fff44-bbd1-4bac-881d-e9777479ddcc">
+<link data-ws="style" rel="stylesheet" href="../ws/page.css">
+<script data-ws="script" src="../ws/page.js"></script>
+</head>
+<body class="ws-doc">
+<nav class="ws-toc" aria-label="Contents">
+<p class="ws-toc-title">Restart iTerm2, keep tabs</p>
+<ul>
+<li><a href="#goal">Goal</a></li>
+<li><a href="#what-exists-today">What exists today</a></li>
+<li><a href="#design">Design</a></li>
+<li><a href="#keeping-the-order">Keeping the order</a></li>
+<li><a href="#risks-and-unknowns">Risks and unknowns</a></li>
+<li><a href="#testing">Testing</a></li>
+<li><a href="#open-questions">Open questions</a></li>
+</ul>
+</nav>
+<main>
+<h1>Restart iTerm2, keep tabs</h1>
+<section id="goal">
+<h2>Goal</h2>
+<p>Quit and reopen iTerm2 while Claude sessions are busy, and come back to the same tabs in the same order, each showing the same session, with no session interrupted. This is a frequent step, for example when iTerm2 has a pending security update.</p>
+<p>The owner chose:</p>
+<ul>
+<li>On demand, not automatic on every launch.</li>
+<li>Keep the exact tab order, not only the list of tabs.</li>
+</ul>
+</section>
+<section id="what-exists-today">
+<h2>What exists today</h2>
+<ul>
+<li><strong>Sessions survive.</strong> Every clo session runs in the default tmux server, which is a child of launchd, not of iTerm2. iTerm2 shows each session through <code>tmux -CC</code>, so a quit only ends the control client.</li>
+<li><strong>One row at a time.</strong> Show Terminal and a double-click on a row both call <code>focusTerminal</code>. For a session with no terminal, it runs <code>tmux -CC attach-session -t '=name'</code> through <code>runInNewTab</code>, for that one session only.</li>
+<li><strong>No tab position is recorded.</strong> The README says so. A reattached tmux tab is added at the end of the hotkey window.</li>
+<li><strong>Restart All Sessions and tmux is the wrong tool.</strong> It stops every Claude, busy ones included ("cut off mid-turn"), and runs <code>tmux kill-server</code>.</li>
+<li><strong>Resume Closed Sessions and Finish Last Restart All</strong> only bring back sessions that have ended. A session still running in tmux is not theirs to touch.</li>
+</ul>
+</section>
+<section id="design">
+<h2>Design</h2>
+<p>Three new items in the Session menu. The first two work alone, which covers iTerm2's own Install and Relaunch prompt: Save, then the update, then Restore.</p>
+<h3>Save iTerm Tabs</h3>
+<ol>
+<li>Through AppleScript, read every tab of every iTerm2 window in order, hotkey window first. For each tab, read its current session's <code>tmuxWindowPane</code> variable and its tty.</li>
+<li>Map each pane number to its tmux session with <code>tmux list-panes -a -F '#{pane_id}\t#{session_name}'</code>.</li>
+<li>Mark a tab with no <code>tmuxWindowPane</code> as plain. Record its title and tty so it can be named later; it cannot come back.</li>
+<li>Write <code>Application Support/CC Sessions/iterm-tabs.json</code> beside <code>restart-all.json</code>. It holds the time saved and, per window, the ordered tabs: kind (tmux or plain), tmux session name and title.</li>
+<li>Report it in the status line, for example "Saved 6 tmux tabs, 1 plain tab".</li>
+</ol>
+<h3>Restore iTerm Tabs</h3>
+<ol>
+<li>Read <code>iterm-tabs.json</code>. Refuse with a message when it is missing, or older than the tmux server's sessions it names.</li>
+<li>For each tmux tab, in saved order: skip a session that has ended or already has a client. Otherwise run the same attach <code>focusTerminal</code> uses, then wait until <code>tmux list-clients -t '=name'</code> shows a client and iTerm2 shows its tab, before the next one. A tab that does not appear within its time limit is reported and skipped.</li>
+<li>Report what came back, what had ended, and the plain tabs that could not return, by title.</li>
+</ol>
+<h3>Restart iTerm2, Keep Tabs</h3>
+<ol>
+<li>Save, as above.</li>
+<li>Confirm in one dialog, naming the plain tabs that will be lost.</li>
+<li>Quit iTerm2 through AppleScript. Wait for its process to exit, then check that the tmux server still lists the saved sessions. If it does not, stop and report; restore nothing.</li>
+<li>Reopen iTerm2, wait until it answers Apple events, then Restore.</li>
+</ol>
+</section>
+<section id="keeping-the-order">
+<h2>Keeping the order</h2>
+<p>No iTerm2 Python API is needed. iTerm2 adds each tmux tab at the end of the window, and <code>AutoHideTmuxClientSession</code> buries the gateway tab that opened it. So attaching the saved sessions one after another, each only after the previous tab is shown, rebuilds the saved order in a window that starts empty.</p>
+<p>The restore must not go through clo, whose <code>iterm-place-tmux-tab.py</code> moves a tmux tab into the slot of the tab that launched it. <code>focusTerminal</code>'s attach already avoids clo.</p>
+<p>A window that is not empty at restore time breaks this. iTerm2 may open a default shell tab at launch, and the owner may open tabs before restoring. See Open questions.</p>
+</section>
+<section id="risks-and-unknowns">
+<h2>Risks and unknowns</h2>
+<ul>
+<li><strong>Whether quitting iTerm2 detaches or kills tmux windows is unverified.</strong> Two sessions created before the current iTerm2 launch were reattached afterwards (cc-sessions.log), but whether that iTerm2 quit or crashed is not recorded. The Restart item checks the tmux server after the quit and stops if sessions are gone, so a wrong guess costs no restore. It cannot bring killed sessions back.</li>
+<li><strong>iTerm2's quit confirmation.</strong> iTerm2 may ask before quitting with running sessions. The Restart item waits for the quit rather than answering for the owner.</li>
+<li><strong>Apple events after an install.</strong> Installing a new CC Sessions under a running copy makes macOS refuse its Apple events (-1743) until it is reopened. Every step here needs Apple events, so the feature works only after that reopen.</li>
+<li><strong>Several tmux servers.</strong> <code>tmuxWindowPane</code> is a pane number without its server. Save reads only the default server, as <code>focusITermTmuxPane</code> already does.</li>
+</ul>
+</section>
+<section id="testing">
+<h2>Testing</h2>
+<ul>
+<li>Self-test, on fixed output: AppleScript tab listings and <code>list-panes</code> text to the saved record, plain tabs included; the record to the attach order, skipping ended and attached sessions; refusal of a missing or stale record.</li>
+<li>Live and read-only: Save on the running iTerm2, comparing the record with the tabs on screen.</li>
+<li>Restore and Restart cannot be tested without quitting the owner's iTerm2. Their first real use is the live test, and the status line reports each step.</li>
+</ul>
+</section>
+<section id="open-questions">
+<h2>Open questions</h2>
+<ol>
+<li><strong>Which windows?</strong> All iTerm2 windows, each restored into its own window, or only the hotkey window.</li>
+<li><strong>A tab already in the window at restore time</strong>, such as iTerm2's default shell tab at launch. Close it when it is an idle fresh shell, put the restored tabs after it, or refuse to restore until the window is empty.</li>
+<li><strong>Plain tabs.</strong> Only name them in the report, or reopen each as a new shell in the same folder.</li>
+<li><strong>Restore check.</strong> Should Restore refuse a record saved before the last restart, or more than a set time ago, or always run it.</li>
+</ol>
+</section>
+</main>
+</body>
+</html>
