@@ -42,7 +42,7 @@ let package = Package(
                 .product(name: "MacAppStyle", package: "project-lifecycle"),
             ],
             path: "src",
-            sources: ["main.swift"]
+            sources: ["main.swift", "ITermTabs.swift"]
         ),
     ],
     swiftLanguageModes: [.v5]

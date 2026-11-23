@@ -2985,6 +2985,7 @@ func tmuxLookupProblems() -> [String] {
     }
     problems += restartProblems()
     problems += recoverProblems()
+    problems += itermTabsProblems()
     for (mode, want) in [("default", "manual"), ("manual", "manual"), ("plan", "plan"), ("auto", "auto"), ("acceptEdits", "acceptEdits"), ("bypassPermissions", nil), (nil, nil)] as [(String?, String?)] where remoteMode(mode) != want {
         problems.append("remoteMode(\(mode ?? "nil")) was \(remoteMode(mode) ?? "nil"), not \(want ?? "nil")")
     }
@@ -3740,9 +3741,10 @@ func replacedBundle(at path: String) -> Bool {
 }
 
 /// Runs an AppleScript and returns what it printed. Apple Events can be refused
-/// silently, so whatever osascript says is logged.
+/// silently, so whatever osascript says is logged; `logOutput: false` leaves out what it
+/// printed (a terminal's screen text, which can hold secrets) and logs only its size.
 @discardableResult
-func runScript(_ script: String, label: String, retrying: Bool = false) -> String {
+func runScript(_ script: String, label: String, retrying: Bool = false, logOutput: Bool = true) -> String {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     task.arguments = ["-e", script]
@@ -3760,7 +3762,7 @@ func runScript(_ script: String, label: String, retrying: Bool = false) -> Strin
     let stderr = String(data: (try? err.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8) ?? ""
     task.waitUntilExit()
     let result = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-    log("\(label): exit \(task.terminationStatus) out=\(result) err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+    log("\(label): exit \(task.terminationStatus) out=\(logOutput ? result : "<\(result.utf8.count) bytes, not logged>") err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
     // -1743: macOS refuses this process's Apple events. A copy that a reinstall replaced while it
     // ran is refused whatever the grant says, and wiping the grant would only lose the user's real
     // one: that copy has to be reopened. Otherwise the grant is down as refused and macOS answers
@@ -3777,7 +3779,7 @@ func runScript(_ script: String, label: String, retrying: Bool = false) -> Strin
             if (try? reset.run()) != nil {
                 reset.waitUntilExit()
                 log("\(label): reset the Automation grant to ask again")
-                return runScript(script, label: label, retrying: true)
+                return runScript(script, label: label, retrying: true, logOutput: logOutput)
             }
         } else {
             tellWindow("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation")
@@ -8238,6 +8240,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return true
         }
         if item.action == #selector(finishLastRestartAll) { return fm.fileExists(atPath: restartRecordPath) }
+        if item.action == #selector(restoreITermTabsAction) { return fm.fileExists(atPath: savedTabsPath) }
         if item.action == #selector(resumeSelectedSessions) {
             let n = selectedFinished.count
             item.title = n > 0 ? "Resume \(n) Selected Session\(n == 1 ? "" : "s")" : "Resume Selected Sessions (⌘-click rows)"
@@ -8765,6 +8768,62 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 log: { log("restart-all: \($0)") },
                 report: report)
             DispatchQueue.global(qos: .userInitiated).async { runRestart(found, steps) }
+        }
+    }
+
+    /// Records every iTerm window and tab in order, so Restore iTerm Tabs can rebuild them after iTerm
+    /// restarts (an update, a quit). See docs/restart-iterm-keep-tabs.html.
+    @objc func saveITermTabsAction() {
+        note("Saving iTerm tabs", seconds: 10)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (_, message) = saveITermTabs()
+            DispatchQueue.main.async { [weak self] in self?.note(message, seconds: 8) }
+        }
+    }
+
+    /// Opens the saved tabs again in their saved order, after whatever tabs iTerm has now.
+    @objc func restoreITermTabsAction() {
+        let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let message = restoreITermTabs(report: report)
+            report(message, 30)
+        }
+    }
+
+    /// Saves the tabs, quits iTerm once the owner confirms, and restores them into the next iTerm.
+    /// The tmux sessions keep running throughout; a plain tab's process ends with iTerm.
+    @objc func restartITermKeepTabs() {
+        guard let window = window else { return }
+        note("Saving iTerm tabs", seconds: 10)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (record, message) = saveITermTabs()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                guard let record = record else { self.note(message, seconds: 15); return }
+                let tabs = record.windows.flatMap(\.tabs)
+                let plain = tabs.filter { $0.kind == "plain" }, other = tabs.filter { $0.kind == "other" }
+                let alert = NSAlert()
+                alert.messageText = "Quit iTerm2 and bring back its \(tabs.count) tab\(tabs.count == 1 ? "" : "s")?"
+                var text = message + ". The tmux sessions keep running while iTerm2 is closed, and come back in their saved order."
+                if !plain.isEmpty {
+                    text += "\n\nThese plain tabs' programs end with iTerm2; each returns as a shell in its folder that prints what ran and its last screen lines:\n"
+                    text += plain.prefix(12).map { "\u{2022} \($0.name)" + ($0.command.map { " (\($0))" } ?? "") }.joined(separator: "\n")
+                }
+                if !other.isEmpty { text += "\n\nNot restored, tmux tabs of another server: " + other.map(\.name).joined(separator: ", ") }
+                text += "\n\niTerm2 may ask to confirm the quit; answer it there."
+                alert.informativeText = text
+                alert.addButton(withTitle: "Quit and Restore")
+                alert.addButton(withTitle: "Cancel")
+                alert.beginSheetModal(for: window) { response in
+                    guard response == .alertFirstButtonReturn else { return }
+                    let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
+                    let sessions = Set(tabs.compactMap(\.session))
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let result = runITermRestart(sessions: sessions, liveITermRestartSteps(report: report))
+                        report(result, 30)
+                    }
+                }
+            }
         }
     }
 
@@ -10455,6 +10514,16 @@ func buildMenu() {
         keyEquivalent: "")
     sessionMenu.addItem(
         withTitle: "Resume Closed Sessions…", action: #selector(SessionsWindow.resumeClosedSessions),
+        keyEquivalent: "")
+    sessionMenu.addItem(.separator())
+    sessionMenu.addItem(
+        withTitle: "Save iTerm Tabs", action: #selector(SessionsWindow.saveITermTabsAction),
+        keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "Restore iTerm Tabs", action: #selector(SessionsWindow.restoreITermTabsAction),
+        keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "Restart iTerm2, Keep Tabs…", action: #selector(SessionsWindow.restartITermKeepTabs),
         keyEquivalent: "")
     sessionMenu.addItem(.separator())
     sessionMenu.addItem(withTitle: "Repo Tags…", action: #selector(SessionsWindow.openRepoTags), keyEquivalent: "")
