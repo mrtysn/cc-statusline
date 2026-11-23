@@ -49,13 +49,14 @@
 <ol>
 <li>Through AppleScript, read every tab of every iTerm2 window in order, hotkey window first. For each tab, read its current session's <code>tmuxWindowPane</code> variable and its tty.</li>
 <li>Map each pane number to its tmux session with <code>tmux list-panes -a -F '#{pane_id}\t#{session_name}'</code>.</li>
-<li>Mark a tab with no <code>tmuxWindowPane</code> as plain. Record its title and tty so it can be named later; it cannot come back.</li>
+<li>Mark a tab with no <code>tmuxWindowPane</code> as plain. Its process cannot come back, so record what lets the owner pick up: its title and tty, its shell's folder (<code>lsof -a -p &lt;pid&gt; -d cwd</code>), the foreground command and arguments (<code>ps</code> on its tty), and the last lines of its screen (iTerm2's AppleScript session text).</li>
 <li>Write <code>Application Support/CC Sessions/iterm-tabs.json</code> beside <code>restart-all.json</code>. It holds the time saved and, per window, the ordered tabs: kind (tmux or plain), tmux session name and title.</li>
 <li>Report it in the status line, for example "Saved 6 tmux tabs, 1 plain tab".</li>
 </ol>
 <h3>Restore iTerm Tabs</h3>
 <ol>
-<li>Read <code>iterm-tabs.json</code>. Refuse with a message when it is missing, or older than the tmux server's sessions it names.</li>
+<li>Read <code>iterm-tabs.json</code>, whatever its age; refuse with a message only when it is missing. A tab closed on purpose after the save comes back if its session still runs, and the owner closes it again.</li>
+<li>For each plain tab, in its saved slot: open a shell in the saved folder that prints, as <code>#</code> comment lines, the command that was running and the saved screen lines.</li>
 <li>For each tmux tab, in saved order: skip a session that has ended or already has a client. Otherwise run the same attach <code>focusTerminal</code> uses, then wait until <code>tmux list-clients -t '=name'</code> shows a client and iTerm2 shows its tab, before the next one. A tab that does not appear within its time limit is reported and skipped.</li>
 <li>Report what came back, what had ended, and the plain tabs that could not return, by title.</li>
 </ol>
@@ -95,8 +96,8 @@
 <ol>
 <li><strong>Which windows?</strong> Decided: all iTerm2 windows, each restored into its own window with its tabs in order.</li>
 <li><strong>A tab already in the window at restore time</strong>, such as iTerm2's default shell tab at launch. Decided: keep it, and add the restored tabs after it.</li>
-<li><strong>Plain tabs.</strong> Only name them in the report, or reopen each as a new shell in the same folder.</li>
-<li><strong>Restore check.</strong> Should Restore refuse a record saved before the last restart, or more than a set time ago, or always run it.</li>
+<li><strong>Plain tabs.</strong> Decided: reopen each as a shell in its saved folder, printing what was running and its last screen lines as comments.</li>
+<li><strong>Restore check.</strong> Decided: always restore from the saved record, whatever its age.</li>
 </ol>
 </section>
 </main>
