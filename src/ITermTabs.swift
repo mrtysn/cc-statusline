@@ -487,6 +487,9 @@ func liveTmuxSessions() -> Set<String> {
 func liveTabRestoreSteps(report: @escaping (String, Double) -> Void) -> TabRestoreSteps {
     TabRestoreSteps(
         hotkeyWindow: { profile in
+            // Right after iTerm starts there is no hotkey window until its key is first pressed, and
+            // making one can fail for a few seconds while iTerm loads its profiles: keep trying, and
+            // log why each try failed, for up to 30 s.
             let script = """
                 tell application id "\(itermBundleId)"
                   repeat with w in windows
@@ -494,13 +497,21 @@ func liveTabRestoreSteps(report: @escaping (String, Double) -> Void) -> TabResto
                   end repeat
                   try
                     set w to (create hotkey window with profile \(appleScriptString(profile)))
-                    return (id of w) as text
+                  on error e
+                    return "error: " & e
                   end try
-                  return ""
+                  repeat with w in windows
+                    if is hotkey window of w then return (id of w) as text
+                  end repeat
+                  return "error: made a hotkey window, but none is listed"
                 end tell
                 """
-            let id = runScript(script, label: "iterm tabs: hotkey window")
-            return id.isEmpty ? nil : id
+            for attempt in 1...30 {
+                let answer = runScript(script, label: "iterm tabs: hotkey window (try \(attempt))")
+                if !answer.isEmpty, !answer.hasPrefix("error"), answer.allSatisfy(\.isNumber) { return answer }
+                usleep(1_000_000)
+            }
+            return nil
         },
         newWindow: { profile, command in
             let script = """
