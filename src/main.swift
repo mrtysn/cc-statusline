@@ -8797,10 +8797,25 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     /// Opens the saved tabs again in their saved order, after whatever tabs iTerm has now.
     @objc func restoreITermTabsAction() {
         let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
+        let names = tmuxSessionNames()
         DispatchQueue.global(qos: .userInitiated).async {
-            let message = restoreITermTabs(report: report)
+            let message = restoreITermTabs(report: report, names: names)
             report(message, 30)
         }
+    }
+
+    /// Each live session's name as this list shows it, by its tmux session: a restored tab's title
+    /// when its pane has none of its own.
+    private func tmuxSessionNames() -> [String: String] {
+        let panes = tmuxOutput(["list-panes", "-a", "-F", tmuxPaneFormat]) ?? ""
+        var names: [String: String] = [:]
+        for row in allRows where !row.past {
+            let s = row.session.summary
+            guard let tty = row.session.tty, let pane = tmuxPane(forTty: tty, in: panes),
+                  let name = s.session_name ?? s.topic, !name.isEmpty else { continue }
+            names[pane.session] = name
+        }
+        return names
     }
 
     /// Saves the tabs, quits iTerm once the owner confirms, and restores them into the next iTerm.
@@ -8831,8 +8846,9 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                     guard response == .alertFirstButtonReturn else { return }
                     let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
                     let sessions = Set(tabs.compactMap(\.session))
+                    let names = self.tmuxSessionNames()
                     DispatchQueue.global(qos: .userInitiated).async {
-                        let result = runITermRestart(sessions: sessions, liveITermRestartSteps(report: report))
+                        let result = runITermRestart(sessions: sessions, liveITermRestartSteps(report: report, names: names))
                         report(result, 30)
                     }
                 }

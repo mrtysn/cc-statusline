@@ -265,10 +265,30 @@ struct TabRestoreSteps {
     var selectLastTab: (_ window: String) -> Void
     var newTab: (_ window: String, _ profile: String, _ command: String) -> Bool
     var shownSessions: () -> Set<String>
+    /// Gives a reattached tmux session's tab its title again (see `restoreTitle`).
+    var retitle: (_ session: String) -> Void = { _ in }
     var pause: (Double) -> Void
     var log: (String) -> Void
     var report: (String, Double) -> Void
     var waitSeconds = 20
+}
+
+/// The title a reattached tab gets back. iTerm titles a `tmux -CC` tab from the title escape a
+/// program wrote into the pane, and a reattach does not replay it, so the tab shows only its job
+/// ("claude"). The pane's title as tmux keeps it (Claude Code's own, such as "✳ Topic") comes first;
+/// tmux's default, the host name, is no title. Otherwise the session's name in CC Sessions.
+func restoreTitle(paneTitle: String, host: String, fallback: String?) -> String? {
+    let title = paneTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !title.isEmpty, title != host, !host.hasPrefix(title + "."), title != host.components(separatedBy: ".").first {
+        return title
+    }
+    let name = fallback?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return name?.isEmpty == false ? name : nil
+}
+
+/// The escape that sets a terminal's window and tab title (OSC 0), with control characters removed.
+func titleEscape(_ title: String) -> String {
+    "\u{1B}]0;" + String(title.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F }) + "\u{07}"
 }
 
 /// Opens every planned tab in order. Before each new tab the window's last tab is selected, since
@@ -282,7 +302,7 @@ func runTabRestore(_ plan: RestorePlan, _ steps: TabRestoreSteps) -> String {
     func waitShown(_ action: RestoreAction) {
         guard case .attach(let session, _) = action else { steps.pause(0.5); return }
         for _ in 0..<max(1, steps.waitSeconds * 2) {
-            if steps.shownSessions().contains(session) { return }
+            if steps.shownSessions().contains(session) { steps.retitle(session); return }
             steps.pause(0.5)
         }
         notShown.append(session)
@@ -483,8 +503,24 @@ func liveTmuxSessions() -> Set<String> {
     Set((tmuxOutput(["list-sessions", "-F", "#{session_name}"]) ?? "").split(separator: "\n").map(String.init))
 }
 
-/// The restore steps that drive the real iTerm.
-func liveTabRestoreSteps(report: @escaping (String, Double) -> Void) -> TabRestoreSteps {
+/// Writes each pane's title escape (see `restoreTitle`) to the pane's tty, its output side: tmux
+/// passes it to iTerm as pane output, and the program in the pane can retitle it later as usual.
+func retitleTmuxSession(_ session: String, names: [String: String]) {
+    let host = ProcessInfo.processInfo.hostName
+    for line in (tmuxOutput(["list-panes", "-t", "=" + session, "-F", "#{pane_tty}\t#{pane_title}"]) ?? "").split(separator: "\n") {
+        let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2, parts[0].hasPrefix("/dev/"),
+              let title = restoreTitle(paneTitle: parts[1], host: host, fallback: names[session]),
+              let handle = FileHandle(forWritingAtPath: parts[0]) else { continue }
+        handle.write(Data(titleEscape(title).utf8))
+        try? handle.close()
+        log("iterm tabs: \(session): title set again")
+    }
+}
+
+/// The restore steps that drive the real iTerm. `names` is each tmux session's name in CC Sessions,
+/// the title of last resort.
+func liveTabRestoreSteps(report: @escaping (String, Double) -> Void, names: [String: String] = [:]) -> TabRestoreSteps {
     TabRestoreSteps(
         hotkeyWindow: { profile in
             // Right after iTerm starts there is no hotkey window until its key is first pressed, and
@@ -536,17 +572,18 @@ func liveTabRestoreSteps(report: @escaping (String, Double) -> Void) -> TabResto
             return runScript(script, label: "iterm tabs: new tab") == "ok"
         },
         shownSessions: { liveShownTmuxSessions() },
+        retitle: { retitleTmuxSession($0, names: names) },
         pause: { usleep(UInt32($0 * 1_000_000)) },
         log: { log("iterm tabs: \($0)") },
         report: report)
 }
 
 /// Restores the saved record into the running iTerm; returns the report line.
-func restoreITermTabs(report: @escaping (String, Double) -> Void) -> String {
+func restoreITermTabs(report: @escaping (String, Double) -> Void, names: [String: String] = [:]) -> String {
     guard let saved = loadSavedITermTabs() else { return "No saved iTerm tabs: choose Save iTerm Tabs first" }
     guard runningITermPid() != nil else { return "iTerm2 is not running: open it, then Restore iTerm Tabs" }
     let plan = restorePlan(saved, live: liveTmuxSessions(), shown: liveShownTmuxSessions())
-    let message = runTabRestore(plan, liveTabRestoreSteps(report: report))
+    let message = runTabRestore(plan, liveTabRestoreSteps(report: report, names: names))
     if plan.windows.contains(where: \.hotkey) {
         let reveal = """
             tell application id "\(itermBundleId)"
@@ -564,7 +601,7 @@ func restoreITermTabs(report: @escaping (String, Double) -> Void) -> String {
 }
 
 /// The restart steps that drive the real iTerm and tmux.
-func liveITermRestartSteps(report: @escaping (String, Double) -> Void) -> ITermRestartSteps {
+func liveITermRestartSteps(report: @escaping (String, Double) -> Void, names: [String: String] = [:]) -> ITermRestartSteps {
     ITermRestartSteps(
         itermPid: { runningITermPid() },
         requestQuit: {
@@ -588,7 +625,7 @@ func liveITermRestartSteps(report: @escaping (String, Double) -> Void) -> ITermR
         liveSessions: { liveTmuxSessions() },
         launchITerm: { _ = commandOutput("/usr/bin/open", ["-a", "iTerm"]) },
         itermAnswers: { !runScript("tell application id \"\(itermBundleId)\" to (count of windows) as text", label: "restart-iterm: answers").isEmpty },
-        restore: { restoreITermTabs(report: report) },
+        restore: { restoreITermTabs(report: report, names: names) },
         pause: { usleep(UInt32($0 * 1_000_000)) },
         log: { log($0) },
         report: report)
@@ -682,6 +719,18 @@ func itermTabsProblems() -> [String] {
                 "window D: tmux -CC attach-session -t '=c'", "select 2", "tab 2: tmux -CC attach-session -t '=e'"]
     if ordered.calls != want { problems.append("restore order was \(ordered.calls)") }
     if !ordered.result.hasPrefix("Restored 4 of 4") { problems.append("a full restore reported \(ordered.result)") }
+    var retitled: [String] = []
+    let titled = TabRestoreSteps(
+        hotkeyWindow: { _ in "1" }, newWindow: { _, _ in "2" }, selectLastTab: { _ in }, newTab: { _, _, _ in true },
+        shownSessions: { ["a", "c"] }, retitle: { retitled.append($0) }, pause: { _ in }, log: { _ in }, report: { _, _ in }, waitSeconds: 1)
+    runTabRestore(two, titled)
+    if retitled != ["a", "c"] { problems.append("reattached tabs that appeared were retitled as \(retitled), not a and c") }
+    if restoreTitle(paneTitle: "✳ Topic", host: "box.local", fallback: "Name") != "✳ Topic" { problems.append("a pane's own title did not come first") }
+    for host in ["box.local", "box"] where restoreTitle(paneTitle: "box", host: host, fallback: "Name") != "Name" {
+        problems.append("tmux's host-name title was kept over the CC Sessions name (host \(host))")
+    }
+    if restoreTitle(paneTitle: " ", host: "box", fallback: nil) != nil { problems.append("an empty title with no fallback still gave a title") }
+    if titleEscape("a\u{07}b\u{1B}c") != "\u{1B}]0;abc\u{07}" { problems.append("the title escape kept control characters") }
     let never = restore(RestorePlan(windows: [(true, "H", [.attach(session: "a", profile: "H")])], skipped: ["b: ended"]), showAfter: nil)
     if !never.result.contains("no tab appeared for a") || !never.result.contains("skipped b: ended") { problems.append("a tab that never appeared was reported as \(never.result)") }
 
