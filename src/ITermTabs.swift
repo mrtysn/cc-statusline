@@ -59,19 +59,13 @@ struct ListedWindow: Equatable {
 /// The AppleScript that lists every iTerm window, hotkey window first, and each tab's current
 /// session: its tmux pane (`tmuxWindowPane`, empty for a plain tab), tty, profile, unique id and
 /// name. One line per window (`W`) and per tab (`T`), fields split by tabs, the name last so a
-/// tab inside it cannot shift the other fields.
+/// tab inside it cannot shift the other fields. Two passes over `windows`, hotkey then the rest,
+/// since iTerm cannot hand out a window reference for keeping in a list (`contents of` an item of
+/// `windows` fails with -1728).
 let itermListingScript = """
-    tell application id "\(itermBundleId)"
-      set ordered to {}
-      repeat with w in windows
-        if is hotkey window of w then set end of ordered to contents of w
-      end repeat
-      repeat with w in windows
-        if not (is hotkey window of w) then set end of ordered to contents of w
-      end repeat
-      set out to ""
-      repeat with w in ordered
-        set out to out & "W" & tab & ((is hotkey window of w) as text) & linefeed
+    on listWindow(w)
+      tell application id "\(itermBundleId)"
+        set out to "W" & tab & ((is hotkey window of w) as text) & linefeed
         repeat with t in tabs of w
           set s to current session of t
           set p to ""
@@ -80,6 +74,16 @@ let itermListingScript = """
           end try
           set out to out & "T" & tab & p & tab & (tty of s) & tab & (profile name of s) & tab & (unique id of s) & tab & (name of s) & linefeed
         end repeat
+        return out
+      end tell
+    end listWindow
+    tell application id "\(itermBundleId)"
+      set out to ""
+      repeat with w in windows
+        if is hotkey window of w then set out to out & my listWindow(w)
+      end repeat
+      repeat with w in windows
+        if not (is hotkey window of w) then set out to out & my listWindow(w)
       end repeat
       return out
     end tell
@@ -431,7 +435,10 @@ func itermSessionContents(_ uniqueId: String) -> String {
 
 /// Saves every iTerm window and tab in order; returns the report line, or the reason it could not.
 func saveITermTabs() -> (record: SavedTabs?, message: String) {
-    guard let windows = currentITermListing() else { return (nil, "iTerm2 is not running or did not answer: nothing saved") }
+    guard runningITermPid() != nil else { return (nil, "iTerm2 is not running: nothing saved") }
+    guard let windows = currentITermListing() else {
+        return (nil, "Could not read iTerm2's tabs: its AppleScript failed (cc-sessions.log has the error). Nothing was saved and iTerm2 was left running")
+    }
     let panes = tmuxSessionsByPane(in: tmuxOutput(["list-panes", "-a", "-F", tmuxPaneSessionFormat]) ?? "")
     let savedAt = ISO8601DateFormatter().string(from: Date())
     try? fm.createDirectory(atPath: savedTabNotesFolder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])

@@ -8776,9 +8776,22 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     @objc func saveITermTabsAction() {
         note("Saving iTerm tabs", seconds: 10)
         DispatchQueue.global(qos: .userInitiated).async {
-            let (_, message) = saveITermTabs()
-            DispatchQueue.main.async { [weak self] in self?.note(message, seconds: 8) }
+            let (record, message) = saveITermTabs()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if record == nil { self.tellFailure("iTerm tabs not saved", message) } else { self.note(message, seconds: 8) }
+            }
         }
+    }
+
+    /// A failure of an action the owner chose, as a sheet: a status-line note fades before it is read.
+    private func tellFailure(_ title: String, _ message: String) {
+        note(message, seconds: 15)
+        guard let window = window else { return }
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.beginSheetModal(for: window)
     }
 
     /// Opens the saved tabs again in their saved order, after whatever tabs iTerm has now.
@@ -8799,7 +8812,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             let (record, message) = saveITermTabs()
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                guard let record = record else { self.note(message, seconds: 15); return }
+                guard let record = record else { self.tellFailure("iTerm2 was not restarted", message); return }
                 let tabs = record.windows.flatMap(\.tabs)
                 let plain = tabs.filter { $0.kind == "plain" }, other = tabs.filter { $0.kind == "other" }
                 let alert = NSAlert()
