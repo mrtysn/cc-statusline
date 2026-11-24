@@ -305,7 +305,9 @@ struct HealthIssue: Decodable {
     let problem: String
     let version: String?
     let first_seen: Double
+    let last_seen: Double?
     let count: Int
+    let example: String?
 }
 
 struct Snapshot: Decodable {
@@ -4786,6 +4788,129 @@ final class UsageWindow: NSWindowController {
     }
 }
 
+// MARK: - Format problems
+
+/// The Format Problems window: every expectation the status line or the app could not
+/// meet (the red ! on each status line), in words, with when it began, how often, the
+/// Claude Code version that brought it and what to do. Read-only text; the issues come
+/// from health.json through the snapshot, the log tail from error.log.
+final class HealthWindow: NSWindowController {
+    private let text = NSTextView()
+
+    init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 420),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "Format Problems"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 420, height: 260)
+        super.init(window: window)
+        guard let content = window.contentView else { return }
+        let scroll = NSScrollView(frame: content.bounds)
+        scroll.autoresizingMask = [.width, .height]
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        text.isEditable = false
+        text.isSelectable = true
+        text.drawsBackground = true
+        text.backgroundColor = Palette.background
+        text.textContainerInset = NSSize(width: 14, height: 12)
+        text.frame = NSRect(origin: .zero, size: scroll.contentSize)
+        text.minSize = NSSize(width: 0, height: scroll.contentSize.height)
+        text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.textContainer?.widthTracksTextView = true
+        text.autoresizingMask = [.width]
+        scroll.documentView = text
+        content.addSubview(scroll)
+        update([])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// What each known problem means for the reader and what, if anything, to do about it.
+    private static func advice(_ issue: HealthIssue) -> String {
+        if issue.problem.contains("http 401") {
+            return "The login token was refused. Claude Code renews it on its next API call and the status line "
+                + "retries by itself; if this stays after an hour, run /login in Claude Code."
+        }
+        if issue.problem.contains("http 429") {
+            return "The usage endpoint asked for a pause. Requests resume by themselves after it; nothing to do."
+        }
+        if issue.problem.contains("network") {
+            return "The usage endpoint could not be reached. It is retried on the next refresh."
+        }
+        return "Anthropic changed a format the tool reads, or the read failed. The matching segment may be missing "
+            + "or wrong until the tool is updated; the example below shows what arrived."
+    }
+
+    func update(_ issues: [HealthIssue]) {
+        let body = NSFont.systemFont(ofSize: 12)
+        let bold = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let out = NSMutableAttributedString()
+        func add(_ string: String, _ font: NSFont, _ colour: NSColor) {
+            out.append(NSAttributedString(string: string, attributes: [.font: font, .foregroundColor: colour]))
+        }
+        if issues.isEmpty {
+            add("No format problems. The red ! is off on every status line.\n", bold, Palette.text)
+        }
+        for issue in issues {
+            add("\(issue.problem)\n", bold, Palette.red)
+            var facts = "Since \(clock(issue.first_seen))"
+            if let last = issue.last_seen { facts += " · last seen \(clock(last))" }
+            facts += " · seen \(issue.count)×"
+            if let version = issue.version { facts += " · Claude Code \(version)" }
+            add(facts + "\n", body, Palette.dim)
+            add("Check: \(issue.key)\n", mono, Palette.dim)
+            add("\n" + Self.advice(issue) + "\n", body, Palette.text)
+            if let example = issue.example, !example.isEmpty {
+                add("\nExample received:\n\(example)\n", mono, Palette.dim)
+            }
+            add("\nCleared by the next pass that works.\n\n", body, Palette.dim)
+        }
+        add("Recent log (error.log)\n", bold, Palette.text)
+        let log = (try? String(contentsOf: cacheDir.appendingPathComponent("error.log"), encoding: .utf8)) ?? ""
+        let tail = log.split(separator: "\n").suffix(12).joined(separator: "\n")
+        add((tail.isEmpty ? "empty" : tail) + "\n", mono, Palette.dim)
+        text.textStorage?.setAttributedString(out)
+    }
+
+    func show() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// The window over a fixture issue, for the self-test: it must decode and draw the
+    /// problem. `CC_SESSIONS_HEALTH_PNG=<path>` saves the picture so the layout can be read.
+    static func selfTestProblems() -> [String] {
+        let json = """
+            [{"key": "usage/response", "problem": "usage endpoint rejected the login token: auth: http 401, token expired or not yet renewed by Claude Code",
+              "version": null, "first_seen": \(Date().timeIntervalSince1970 * 1000 - 3600000),
+              "last_seen": \(Date().timeIntervalSince1970 * 1000), "count": 2, "example": null}]
+            """
+        guard let issues = try? JSONDecoder().decode([HealthIssue].self, from: Data(json.utf8)) else {
+            return ["health fixture did not decode"]
+        }
+        let window = HealthWindow()
+        window.update(issues)
+        var problems: [String] = []
+        if !(window.text.string.contains("/login")) { problems.append("health window drew no advice for a 401") }
+        if let content = window.window?.contentView {
+            content.layoutSubtreeIfNeeded()
+            if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_HEALTH_PNG"],
+                let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+            {
+                content.cacheDisplay(in: content.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+            }
+        }
+        return problems
+    }
+}
+
 // MARK: - Leaderboard
 
 /// The weekly cap, in list-price dollars, that the quota readings imply: dollars spent between two
@@ -6767,6 +6892,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let listHotKey2 = GlobalHotKey(id: 3)
     private var listShortcutWindow: ShortcutWindow?
     private var usageWindow: UsageWindow?
+    private var healthWindow: HealthWindow?
     private var leaderboardWindow: LeaderboardWindow?
     /// The info icon beside the quotas that opens the Usage window.
     private let usageButton = NSButton(title: "", target: nil, action: nil)
@@ -7220,6 +7346,17 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if let refusal = listHotKey2.set(shortcut) { return refusal }
         shortcutStore.saveList2(shortcut)
         return nil
+    }
+
+    /// Session ▸ Format Problems…, and a click on the red tool row: every broken
+    /// expectation in words, with what to do.
+    @objc func openFormatProblems() {
+        if healthWindow == nil {
+            healthWindow = HealthWindow()
+            healthWindow?.window?.center()
+        }
+        healthWindow?.update(healthIssues)
+        healthWindow?.show()
     }
 
     /// Session ▸ Usage…, and a click on the quota bar: shows the Usage window with the
@@ -7761,6 +7898,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         counts = "\(live.count) live · \(past.count) finished"
         toolCost = (cost, footprint)
         healthIssues = snapshot.health ?? []
+        if healthWindow?.window?.isVisible == true { healthWindow?.update(healthIssues) }
         latest.refreshIfDue()
         if noteToken == nil { statusLabel.stringValue = "" }
         emptyLabel.stringValue = allRows.isEmpty
@@ -7837,11 +7975,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         field.lineBreakMode = .byTruncatingTail
         let cell = CentredCell(field)
         if key == "topic", !healthIssues.isEmpty {
+            cell.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(openFormatProblems)))
             cell.toolTip = healthIssues.map { issue in
                 let since = clock(issue.first_seen)
                 return "\(issue.problem) — since \(since)"
                     + (issue.version.map { ", Claude Code \($0)" } ?? "") + ", seen \(issue.count)×"
-            }.joined(separator: "\n") + "\nDetails in error.log; cleared once it works again."
+            }.joined(separator: "\n") + "\nClick for details; cleared once it works again."
         } else if key == "cpu", let cpu = toolCost.cpu {
             // The split, for when the total is worth looking into.
             cell.toolTip = String(format: "Status line redraws %.1f%%, app and its snapshots %.1f%%", cpu.redraws, cpu.app)
@@ -10481,6 +10620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             problems = ["fixture did not decode: \(error)"]
         }
         problems += UsageWindow.selfTestProblems()
+        problems += HealthWindow.selfTestProblems()
         problems += LeaderboardWindow.selfTestProblems()
         problems += tmuxLookupProblems()
         // CC_SESSIONS_WINDOW_PNG=<path> saves the list window's picture, to read its top row without opening the app.
@@ -10614,6 +10754,8 @@ func buildMenu() {
     sessionMenu.addItem(.separator())
     sessionMenu.addItem(withTitle: "Repo Tags…", action: #selector(SessionsWindow.openRepoTags), keyEquivalent: "")
     sessionMenu.addItem(withTitle: "Usage…", action: #selector(SessionsWindow.openUsage), keyEquivalent: "")
+    sessionMenu.addItem(
+        withTitle: "Format Problems…", action: #selector(SessionsWindow.openFormatProblems), keyEquivalent: "")
     sessionMenu.addItem(withTitle: "Leaderboard…", action: #selector(SessionsWindow.openLeaderboard), keyEquivalent: "l")
     sessionMenu.addItem(
         withTitle: "New Session Shortcut…", action: #selector(SessionsWindow.openShortcutSettings),
