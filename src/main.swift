@@ -4830,20 +4830,32 @@ final class HealthWindow: NSWindowController {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    /// What each known problem means for the reader and what, if anything, to do about it.
-    private static func advice(_ issue: HealthIssue) -> String {
+    /// What a problem means and whether the reader has anything to do. `action` is the
+    /// verdict line, `needed` colours it, `meaning` says why.
+    static func advice(_ issue: HealthIssue, now: Double = Date().timeIntervalSince1970 * 1000)
+        -> (action: String, needed: Bool, meaning: String)
+    {
+        let hours = (now - issue.first_seen) / 3_600_000
         if issue.problem.contains("http 401") {
-            return "The login token was refused. Claude Code renews it on its next API call and the status line "
-                + "retries by itself; if this stays after an hour, run /login in Claude Code."
+            let meaning = "The login token was refused. Claude Code renews it on its next API call and the "
+                + "status line retries by itself."
+            if hours >= 1 {
+                return ("Yes: run /login in Claude Code. This has stood for over an hour, so the token is not renewing by itself.",
+                    true, meaning)
+            }
+            return ("No, not yet. If it is still here in an hour, run /login in Claude Code.", false, meaning)
         }
         if issue.problem.contains("http 429") {
-            return "The usage endpoint asked for a pause. Requests resume by themselves after it; nothing to do."
+            return ("No. The usage endpoint asked for a pause; requests resume by themselves.", false,
+                "Too many usage requests were made.")
         }
         if issue.problem.contains("network") {
-            return "The usage endpoint could not be reached. It is retried on the next refresh."
+            return ("No. The usage endpoint could not be reached; it is retried on the next refresh.", false,
+                "A network failure, usually a dropped connection.")
         }
-        return "Anthropic changed a format the tool reads, or the read failed. The matching segment may be missing "
-            + "or wrong until the tool is updated; the example below shows what arrived."
+        return ("Nothing to do in Claude Code. The tool needs an update to read the new format: ask a session in this repo to fix it.",
+            true,
+            "Anthropic changed a format the tool reads, or a read failed. The matching segment may be missing or wrong until then; the example below shows what arrived.")
     }
 
     func update(_ issues: [HealthIssue]) {
@@ -4865,7 +4877,10 @@ final class HealthWindow: NSWindowController {
             if let version = issue.version { facts += " · Claude Code \(version)" }
             add(facts + "\n", body, Palette.dim)
             add("Check: \(issue.key)\n", mono, Palette.dim)
-            add("\n" + Self.advice(issue) + "\n", body, Palette.text)
+            let advice = Self.advice(issue)
+            add("\n" + advice.meaning + "\n", body, Palette.text)
+            add("\nAction for you: ", bold, Palette.text)
+            add(advice.action + "\n", bold, advice.needed ? Palette.yellow : Palette.dim)
             if let example = issue.example, !example.isEmpty {
                 add("\nExample received:\n\(example)\n", mono, Palette.dim)
             }
@@ -4897,7 +4912,7 @@ final class HealthWindow: NSWindowController {
         let window = HealthWindow()
         window.update(issues)
         var problems: [String] = []
-        if !(window.text.string.contains("/login")) { problems.append("health window drew no advice for a 401") }
+        if !(window.text.string.contains("Action for you")) { problems.append("health window drew no action line") }
         if let content = window.window?.contentView {
             content.layoutSubtreeIfNeeded()
             if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_HEALTH_PNG"],
