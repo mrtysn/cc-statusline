@@ -236,12 +236,19 @@ func appleScriptString(_ text: String) -> String {
     "\"" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
 }
 
+/// Attaches a tab to tmux session `session` through `clo --attach` where clo is installed: once
+/// the session ends, the tab keeps "closed <name> · <session id> · <folder>" above a shell. Plain
+/// `tmux -CC attach-session` otherwise. `command` skips the shell function `clo --init zsh` defines.
+func attachShellCommand(_ session: String) -> String {
+    "if command -v clo >/dev/null; then command clo --attach \(shellQuote(session)); else tmux -CC attach-session -t \(shellQuote("=" + session)); fi"
+}
+
 /// The command a restored tab starts with. Screen text never goes into it: a plain tab's notes
 /// are read from their file with `cat`.
 func restoreCommand(_ action: RestoreAction) -> String {
     switch action {
     case .attach(let session, _):
-        return "tmux -CC attach-session -t \(shellQuote("=" + session))"
+        return attachShellCommand(session)
     case .shell(let folder, let notes, _):
         var command = folder.map { "cd \(shellQuote($0)) 2>/dev/null || cd" } ?? "cd"
         if let notes = notes { command += "; cat \(shellQuote(notes)) 2>/dev/null" }
@@ -726,7 +733,9 @@ func itermTabsProblems() -> [String] {
         problems.append("restore plan was \(plan.windows)")
     }
     if plan.skipped != ["proj-b: ended", "foreign: a tmux tab of another server", "proj-c: already shown"] { problems.append("restore skipped \(plan.skipped)") }
-    if restoreCommand(.attach(session: "a'b", profile: "")) != "tmux -CC attach-session -t '=a'\\''b'" { problems.append("attach command was \(restoreCommand(.attach(session: "a'b", profile: "")))") }
+    if restoreCommand(.attach(session: "a'b", profile: "")) != "if command -v clo >/dev/null; then command clo --attach 'a'\\''b'; else tmux -CC attach-session -t '=a'\\''b'; fi" {
+        problems.append("attach command was \(restoreCommand(.attach(session: "a'b", profile: "")))")
+    }
     if restoreCommand(.shell(folder: "/x y", notes: "/n.txt", profile: "")) != "cd '/x y' 2>/dev/null || cd; cat '/n.txt' 2>/dev/null" {
         problems.append("plain tab command was \(restoreCommand(.shell(folder: "/x y", notes: "/n.txt", profile: "")))")
     }
@@ -734,17 +743,22 @@ func itermTabsProblems() -> [String] {
 
     // Restore order: the last tab is selected before every new tab, an attach waits for its tab,
     // a normal window starts with its first tab's command.
+    // The session an attach command names (test names carry no quote).
+    func attached(_ command: String) -> String? {
+        guard let start = command.range(of: "--attach '") else { return nil }
+        return String(command[start.upperBound...].prefix { $0 != "'" })
+    }
     func restore(_ plan: RestorePlan, showAfter: Int?) -> (calls: [String], result: String) {
         var calls: [String] = [], polls = 0, opened: Set<String> = []
         let steps = TabRestoreSteps(
             hotkeyWindow: { calls.append("hotkey \($0)"); return "1" },
-            newWindow: { profile, command in calls.append("window \(profile): \(command)"); if command.hasPrefix("tmux") { opened.insert(command) }; return "2" },
+            newWindow: { profile, command in calls.append("window \(profile): \(command)"); if let s = attached(command) { opened.insert(s) }; return "2" },
             selectLastTab: { calls.append("select \($0)") },
-            newTab: { window, _, command in calls.append("tab \(window): \(command)"); if command.hasPrefix("tmux") { opened.insert(command) }; return true },
+            newTab: { window, _, command in calls.append("tab \(window): \(command)"); if let s = attached(command) { opened.insert(s) }; return true },
             shownSessions: {
                 polls += 1
                 guard let after = showAfter, polls >= after else { return [] }
-                return Set(opened.compactMap { $0.components(separatedBy: "'=").last?.replacingOccurrences(of: "'", with: "") })
+                return opened
             },
             pause: { _ in }, log: { _ in }, report: { _, _ in }, waitSeconds: 2)
         let result = runTabRestore(plan, steps)
@@ -754,8 +768,8 @@ func itermTabsProblems() -> [String] {
         (true, "H", [.attach(session: "a", profile: "H"), .shell(folder: "/d", notes: nil, profile: "H")]),
         (false, "D", [.attach(session: "c", profile: "D"), .attach(session: "e", profile: "D")])], skipped: [])
     let ordered = restore(two, showAfter: 1)
-    let want = ["hotkey H", "select 1", "tab 1: tmux -CC attach-session -t '=a'", "select 1", "tab 1: cd '/d' 2>/dev/null || cd",
-                "window D: tmux -CC attach-session -t '=c'", "select 2", "tab 2: tmux -CC attach-session -t '=e'"]
+    let want = ["hotkey H", "select 1", "tab 1: \(attachShellCommand("a"))", "select 1", "tab 1: cd '/d' 2>/dev/null || cd",
+                "window D: \(attachShellCommand("c"))", "select 2", "tab 2: \(attachShellCommand("e"))"]
     if ordered.calls != want { problems.append("restore order was \(ordered.calls)") }
     if !ordered.result.hasPrefix("Restored 4 of 4") { problems.append("a full restore reported \(ordered.result)") }
     var retitled: [String] = []

@@ -2884,7 +2884,7 @@ func focusTerminal(tty: String) {
         if focusITermSession(tty: clientTty) { return }
     }
     log("focus \(tty): tmux session \(pane.session) has no terminal; attaching it in a new tab")
-    runInNewTab("tmux -CC attach-session -t '=\(pane.session)'")
+    runInNewTab(attachShellCommand(pane.session))
 }
 
 /// What `list-panes -a -F` prints for `tmuxPane(forTty:in:)`.
