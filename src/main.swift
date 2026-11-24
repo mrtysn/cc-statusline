@@ -3619,7 +3619,7 @@ func typeInTmuxPane(_ paneNumber: String, _ command: String) -> Bool {
 /// it go only to these names, once each, so the model cannot reword or misroute
 /// it; the user's own settings and hooks are not loaded. Returns, per name, nil
 /// when it was delivered, else why not.
-func relayMessage(_ text: String, to names: [String]) -> [String: String?] {
+func relayMessage(_ text: String, to names: [String], as relayName: String = "cc-sessions-relay") -> [String: String?] {
     var outcome: [String: String?] = Dictionary(uniqueKeysWithValues: names.map { ($0, "not sent") })
     let dir = fm.temporaryDirectory.appendingPathComponent("cc-sessions-relay-\(UUID().uuidString)")
     defer { try? fm.removeItem(at: dir) }
@@ -3645,7 +3645,7 @@ func relayMessage(_ text: String, to names: [String]) -> [String: String?] {
             + ". Set `to` to the name and `message` to \"-\": the text is filled in for you. Call no other tool,"
             + " retry nothing, and reply only \"done\"."
         let task = scriptProcess(URL(fileURLWithPath: "/usr/bin/env"), [
-            "claude", "-p", "--model", "haiku", "--name", "cc-sessions-relay",
+            "claude", "-p", "--model", "haiku", "--name", relayName,
             "--setting-sources", "project", "--settings", settingsJSON,
             "--allowedTools", "SendMessage", "--no-session-persistence",
             "--output-format", "stream-json", "--verbose",
@@ -10813,12 +10813,19 @@ func buildMenu() {
     NSApp.windowsMenu = windowMenu
 }
 
-// `CC_SESSIONS_SEND_TO=<peer name> CC_SESSIONS_SEND_TEXT=<text>`: sends through the
-// relay as the send bar does, prints what each name got, and quits with no window, so
+// `CC_SESSIONS_SEND_TO=<peer name>[,<peer name>] CC_SESSIONS_SEND_TEXT=<text>
+// [CC_SESSIONS_SEND_NAME=cross-mac-relay]`: sends through the relay as the send bar does, prints what each name got, and quits with no window, so
 // a change to the relay can be checked against a real session without clicking.
 if let names = ProcessInfo.processInfo.environment["CC_SESSIONS_SEND_TO"] {
     let text = ProcessInfo.processInfo.environment["CC_SESSIONS_SEND_TEXT"] ?? "CC Sessions relay check; no reply needed."
-    let outcome = relayMessage(text, to: names.split(separator: ",").map(String.init))
+    // `cross-mac-relay` is the name a message forwarded from the user's other Mac goes out under;
+    // the shared rule reads both names as the user's own words. No other name is accepted.
+    let relayName = ProcessInfo.processInfo.environment["CC_SESSIONS_SEND_NAME"] ?? "cc-sessions-relay"
+    guard ["cc-sessions-relay", "cross-mac-relay"].contains(relayName) else {
+        print("unknown relay name \(relayName)")
+        exit(2)
+    }
+    let outcome = relayMessage(text, to: names.split(separator: ",").map(String.init), as: relayName)
     for (name, why) in outcome.sorted(by: { $0.key < $1.key }) { print("\(name): \(why ?? "delivered")") }
     exit(outcome.values.allSatisfy { $0 == nil } ? 0 : 1)
 }
