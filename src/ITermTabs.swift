@@ -456,6 +456,9 @@ func itermSessionContents(_ uniqueId: String) -> String {
 func saveITermTabs() -> (record: SavedTabs?, message: String) {
     guard runningITermPid() != nil else { return (nil, "iTerm2 is not running: nothing saved") }
     guard let windows = currentITermListing(), !windows.isEmpty, windows.contains(where: { !$0.tabs.isEmpty }) else {
+        if replacedBundle(at: Bundle.main.bundlePath) {
+            return (nil, "CC Sessions was reinstalled while open, and macOS refuses this old copy's requests to iTerm2. Quit and reopen CC Sessions, then save again. Nothing was saved and iTerm2 was left running")
+        }
         return (nil, "Could not read iTerm2's tabs: its AppleScript failed or listed none (cc-sessions.log has what it returned). Nothing was saved and iTerm2 was left running")
     }
     let panes = tmuxSessionsByPane(in: tmuxOutput(["list-panes", "-a", "-F", tmuxPaneSessionFormat]) ?? "")

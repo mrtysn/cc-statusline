@@ -23,6 +23,24 @@ import MacAppStyle
 let fm = FileManager.default
 let home = fm.homeDirectoryForCurrentUser
 
+/// Which file a path holds: an install that writes a new executable, at the same path or not,
+/// changes its inode or its modification date.
+struct FileIdentity: Equatable {
+    let inode: UInt64
+    let modified: Date
+}
+
+func fileIdentity(_ path: String) -> FileIdentity? {
+    guard let attributes = try? fm.attributesOfItem(atPath: path),
+          let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+          let modified = attributes[.modificationDate] as? Date else { return nil }
+    return FileIdentity(inode: inode, modified: modified)
+}
+
+/// The executable this process started from, read before anything else runs: `replacedBundle`
+/// compares it with what is on disk now.
+let launchedExecutable: FileIdentity? = Bundle.main.executablePath.flatMap(fileIdentity)
+
 /// A self-test run (CC_SESSIONS_SELFTEST=1) builds the window over fixture sessions and keeps
 /// every file it writes in `selfTestRoot`, never in the real cache, support or log folders.
 let selfTest = ProcessInfo.processInfo.environment["CC_SESSIONS_SELFTEST"] == "1"
@@ -3734,10 +3752,15 @@ func tellWindow(_ message: String) {
     DispatchQueue.main.async { NotificationCenter.default.post(name: .tellWindow, object: nil, userInfo: ["message": message]) }
 }
 
-/// Whether the app at this path is a copy a reinstall has replaced: the install swaps the old bundle
-/// aside as `.previous` and deletes it, and a process still running from it is refused by macOS.
-func replacedBundle(at path: String) -> Bool {
-    path.hasSuffix(".previous") || !fm.fileExists(atPath: path)
+/// Whether the app at this path is a copy a reinstall has replaced, which macOS refuses Apple events
+/// whatever the Automation grant says. An install may swap the old bundle aside as `.previous`,
+/// delete it, or write the new one over it at the same path; the last is caught only by the
+/// executable no longer being the file this process started from.
+func replacedBundle(at path: String, executable: String? = Bundle.main.executablePath,
+                    launched: FileIdentity? = launchedExecutable) -> Bool {
+    if path.hasSuffix(".previous") || !fm.fileExists(atPath: path) { return true }
+    guard let executable, let launched else { return false }
+    return fileIdentity(executable) != launched
 }
 
 /// Runs an AppleScript and returns what it printed. Apple Events can be refused
@@ -7419,6 +7442,23 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         if !replacedBundle(at: "/x/CC Sessions.app.previous") || !replacedBundle(at: "/nonexistent/CC Sessions.app")
             || replacedBundle(at: NSHomeDirectory()) {
             problems.append("replacedBundle misjudges a swapped-aside, a missing or an existing bundle")
+        }
+        // An install that writes a new executable over the old path, as the one on Nov 23 did, is a
+        // replacement too: missing it once cost the user's iTerm Automation grant.
+        do {
+            let bundle = selfTestRoot.appendingPathComponent("Replaced.app")
+            let executable = bundle.appendingPathComponent("Contents/MacOS/Replaced")
+            try? fm.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? Data("old".utf8).write(to: executable)
+            let launched = fileIdentity(executable.path)
+            let sameBefore = replacedBundle(at: bundle.path, executable: executable.path, launched: launched)
+            let fresh = bundle.appendingPathComponent("Contents/MacOS/Replaced.new")
+            try? Data("new".utf8).write(to: fresh)
+            _ = try? fm.replaceItemAt(executable, withItemAt: fresh)
+            let replacedAfter = replacedBundle(at: bundle.path, executable: executable.path, launched: launched)
+            if launched == nil || sameBefore || !replacedAfter {
+                problems.append("replacedBundle misses a new executable written over the bundle's own path")
+            }
         }
 
         // A session with no reported context shows the transcript's estimate, marked as one.
