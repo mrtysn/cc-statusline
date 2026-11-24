@@ -249,11 +249,17 @@ func restoreCommand(_ action: RestoreAction) -> String {
     }
 }
 
-/// The command iTerm is given for a new tab or window: an interactive login shell runs it, then
-/// replaces itself with a plain login shell so the tab outlives it (as `runInNewTab` does).
+/// The command iTerm is given for a new tab or window: a login shell runs it, then replaces
+/// itself with a plain login shell so the tab outlives it (as `runInNewTab` does).
+///
+/// Not interactive (`-lc`, not `-lic`): an interactive first shell loads `.zshrc`, and with it
+/// powerlevel10k's gitstatus daemon. A short command (`cd; cat notes`) then `exec`s within the
+/// same second, under the same pid, so the next shell's gitstatus files get the same name
+/// (`<pid>.<EPOCHSECONDS>.1`); the first daemon, exiting, deletes the new shell's lock and the
+/// tab prints "gitstatus failed to initialize". `.zprofile` alone puts tmux on PATH.
 func tabStartCommand(_ command: String) -> String {
     let shell = getpwuid(getuid()).flatMap { String(validatingUTF8: $0.pointee.pw_shell) } ?? "/bin/zsh"
-    return "\(shell) -lic \(shellQuote("\(command); exec \(shell) -l"))"
+    return "\(shell) -lc \(shellQuote("\(command); exec \(shell) -l"))"
 }
 
 /// What a restore does to iTerm, so its order can be checked without one. Window ids are iTerm's.
