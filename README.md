@@ -115,7 +115,7 @@ Everything the tool reads comes from formats Anthropic can change without notice
 | Hook events | the event is one the hook is registered for, with a `session_id` |
 | npm registry | the answer has `version`; an outage does not count |
 
-Any recorded problem puts a red `!` at the end of every session's last status line row and turns the app's `cc-statusline` row red with the problem in words; its tooltip lists them all. `error.log` gets a `format:` line when a problem appears and a `format ok again:` line when it clears, which it does by itself on the next reading that passes.
+Any recorded problem puts a red `!` at the end of every session's last status line row and turns the app's `cc-statusline` row red with the problem in words; its tooltip lists them all, and a click on the row (or Session ▸ Format Problems…) opens a window with each problem's first and last time, count, Claude Code version, the example received, what to do about it, and the tail of `error.log`. `error.log` gets a `format:` line when a problem appears and a `format ok again:` line when it clears, which it does by itself on the next reading that passes.
 
 ## Leaderboard
 
