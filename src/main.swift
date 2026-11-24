@@ -7460,6 +7460,23 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                 problems.append("replacedBundle misses a new executable written over the bundle's own path")
             }
         }
+        // iTerm's stock "Default" beside a synced "Default": a restored tab asks for the default profile
+        // itself, never the shared name, or it comes back in the stock profile's font.
+        do {
+            let plist = selfTestRoot.appendingPathComponent("iterm2.plist")
+            let prefs: [String: Any] = [
+                "Default Bookmark Guid": "SYNCED",
+                "New Bookmarks": [["Name": "Default", "Guid": "STOCK"], ["Name": "Default", "Guid": "SYNCED"],
+                                  ["Name": "Hotkey Window", "Guid": "HOTKEY"]],
+            ]
+            try? PropertyListSerialization.data(fromPropertyList: prefs, format: .binary, options: 0).write(to: plist)
+            let profiles = itermProfileNames(plist: plist.path)
+            if profiles.counts["Default"] != 2 || profiles.defaultName != "Default"
+                || itermProfileClause("Default", profiles) != "default profile"
+                || itermProfileClause("Hotkey Window", profiles) != "profile \"Hotkey Window\"" {
+                problems.append("a restored tab under a profile name iTerm has twice is not made with the default profile")
+            }
+        }
 
         // A session with no reported context shows the transcript's estimate, marked as one.
         if let row = rows.firstIndex(where: { $0.session.summary.session_id == "fixture-b" }) {

@@ -486,6 +486,10 @@ func saveITermTabs() -> (record: SavedTabs?, message: String) {
     let tmux = tabs.filter { $0.kind == "tmux" }.count, plain = tabs.filter { $0.kind == "plain" }.count, other = tabs.count - tmux - plain
     var message = "Saved \(tmux) tmux tab\(tmux == 1 ? "" : "s") and \(plain) plain tab\(plain == 1 ? "" : "s") in \(record.windows.count) window\(record.windows.count == 1 ? "" : "s")"
     if other > 0 { message += "; \(other) tmux tab\(other == 1 ? "" : "s") of another server cannot be restored" }
+    let profiles = itermProfileNames()
+    for name in Set(tabs.map(\.profile)).sorted() where name != profiles.defaultName && profiles.counts[name, default: 0] > 1 {
+        message += "; iTerm2 has \(profiles.counts[name]!) profiles named \"\(name)\", so its tabs may come back with the other one's font: rename or delete the extra in iTerm2 > Settings > Profiles"
+    }
     log("iterm tabs: \(message)")
     return (record, message)
 }
@@ -524,7 +528,8 @@ func retitleTmuxSession(_ session: String, names: [String: String]) {
 /// The restore steps that drive the real iTerm. `names` is each tmux session's name in CC Sessions,
 /// the title of last resort.
 func liveTabRestoreSteps(report: @escaping (String, Double) -> Void, names: [String: String] = [:]) -> TabRestoreSteps {
-    TabRestoreSteps(
+    let profiles = itermProfileNames()
+    return TabRestoreSteps(
         hotkeyWindow: { profile in
             // Right after iTerm starts there is no hotkey window until its key is first pressed, and
             // making one can fail for a few seconds while iTerm loads its profiles: keep trying, and
@@ -555,7 +560,7 @@ func liveTabRestoreSteps(report: @escaping (String, Double) -> Void, names: [Str
         newWindow: { profile, command in
             let script = """
                 tell application id "\(itermBundleId)"
-                  set w to (create window with profile \(appleScriptString(profile)) command \(appleScriptString(tabStartCommand(command))))
+                  set w to (create window with \(itermProfileClause(profile, profiles)) command \(appleScriptString(tabStartCommand(command))))
                   return (id of w) as text
                 end tell
                 """
@@ -568,7 +573,7 @@ func liveTabRestoreSteps(report: @escaping (String, Double) -> Void, names: [Str
         newTab: { window, profile, command in
             let script = """
                 tell application id "\(itermBundleId)"
-                  tell window id \(window) to create tab with profile \(appleScriptString(profile)) command \(appleScriptString(tabStartCommand(command)))
+                  tell window id \(window) to create tab with \(itermProfileClause(profile, profiles)) command \(appleScriptString(tabStartCommand(command)))
                   return "ok"
                 end tell
                 """
@@ -579,6 +584,31 @@ func liveTabRestoreSteps(report: @escaping (String, Double) -> Void, names: [Str
         pause: { usleep(UInt32($0 * 1_000_000)) },
         log: { log("iterm tabs: \($0)") },
         report: report)
+}
+
+/// iTerm's profiles as its preferences list them: how many share each name, and the default's name.
+struct ITermProfileNames {
+    var counts: [String: Int]
+    var defaultName: String?
+}
+
+func itermProfileNames(plist: String = home.appendingPathComponent("Library/Preferences/com.googlecode.iterm2.plist").path) -> ITermProfileNames {
+    guard let data = fm.contents(atPath: plist),
+          let prefs = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any] else {
+        return ITermProfileNames(counts: [:], defaultName: nil)
+    }
+    let bookmarks = prefs["New Bookmarks"] as? [[String: Any]] ?? []
+    var counts: [String: Int] = [:]
+    for bookmark in bookmarks { if let name = bookmark["Name"] as? String { counts[name, default: 0] += 1 } }
+    let guid = prefs["Default Bookmark Guid"] as? String
+    return ITermProfileNames(counts: counts, defaultName: bookmarks.first { ($0["Guid"] as? String) == guid }?["Name"] as? String)
+}
+
+/// How a new tab or window names its profile in AppleScript. iTerm picks a profile by name, and where two
+/// share one (iTerm's stock Monaco "Default" beside a synced "Default") it took the stock one, so a tab saved
+/// under the default profile's name is made with `default profile`, which iTerm resolves by its Guid.
+func itermProfileClause(_ name: String, _ profiles: ITermProfileNames) -> String {
+    name == profiles.defaultName ? "default profile" : "profile \(appleScriptString(name))"
 }
 
 /// Restores the saved record into the running iTerm; returns the report line.
