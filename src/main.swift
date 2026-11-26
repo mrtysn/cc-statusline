@@ -700,6 +700,131 @@ enum SpawnGuard {
     }
 }
 
+/// The subagent-guard hook's spawn budget for each Claude account on this machine, kept in
+/// agents-shared's local file <XDG config>/agents-shared/subagent-spawn-budget: lines of
+/// "<account or *> <number or unlimited>", an account's own line winning over *, and 8 with no
+/// line. Account names come from the claude-accounts file beside it. The Guards menu reads and
+/// writes it; agents-shared's scripts/subagent-spawn-budget is what the hook reads it with.
+enum SpawnBudget {
+    static let all = "*"
+    static let defaultBudget = "8"
+
+    static var folder: URL {
+        (selfTest ? selfTestRoot.appendingPathComponent("xdg") : xdgDir("XDG_CONFIG_HOME", fallback: ".config"))
+            .appendingPathComponent("agents-shared")
+    }
+    static var file: URL { folder.appendingPathComponent("subagent-spawn-budget") }
+
+    /// The account names in claude-accounts, in file order.
+    static func accounts() -> [String] {
+        guard let text = try? String(contentsOf: folder.appendingPathComponent("claude-accounts"), encoding: .utf8)
+        else { return [] }
+        return text.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first?
+                .split(whereSeparator: { $0 == " " || $0 == "\t" }) ?? []
+            return fields.count >= 2 ? String(fields[0]) : nil
+        }
+    }
+
+    /// Each line's account (or *) and value, as the file has them.
+    static func lines() -> [String: String] {
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [:] }
+        var out: [String: String] = [:]
+        for line in text.split(separator: "\n") {
+            let fields = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first?
+                .split(whereSeparator: { $0 == " " || $0 == "\t" }) ?? []
+            if fields.count == 2 { out[String(fields[0])] = String(fields[1]) }
+        }
+        return out
+    }
+
+    /// What the hook uses for an account, and where that comes from.
+    static func effective(_ account: String) -> (value: String, from: String) {
+        let set = lines()
+        if account != all, let own = set[account] { return (own, "own line") }
+        if let star = set[all] { return (star, account == all ? "own line" : "all accounts") }
+        return (defaultBudget, "default")
+    }
+
+    /// A value the hook takes: a whole number or "unlimited"; empty removes the line.
+    static func valid(_ value: String) -> Bool {
+        value.isEmpty || value == "unlimited" || value.range(of: "^[0-9]+$", options: .regularExpression) != nil
+    }
+
+    /// Sets an account's (or *'s) line to `value`, or removes it when empty. Other lines and
+    /// comments stay as they are; a missing file is made with a header naming its shape.
+    @discardableResult
+    static func set(_ account: String, _ value: String) -> String? {
+        guard valid(value) else { return "Not a budget: \(value). A whole number, unlimited, or empty for the default." }
+        var rows = ((try? String(contentsOf: file, encoding: .utf8)) ?? "# account   budget (shape: agents-shared/scripts/subagent-spawn-budget.example)\n")
+            .components(separatedBy: "\n")
+        if rows.last == "" { rows.removeLast() }
+        let row = account.padding(toLength: max(12, account.count + 1), withPad: " ", startingAt: 0) + value
+        let at = rows.firstIndex { line in
+            line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first?
+                .split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) == account
+        }
+        switch (at, value.isEmpty) {
+        case (let i?, true): rows.remove(at: i)
+        case (let i?, false): rows[i] = row
+        case (nil, false): rows.append(row)
+        case (nil, true): return nil
+        }
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            try (rows.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
+        } catch {
+            return "Could not write \(file.path): \(error.localizedDescription)"
+        }
+        return nil
+    }
+
+    /// The Guards menu's submenu: All accounts first, then one item per account, each showing the
+    /// budget the hook uses and where it comes from. Rebuilt each time it opens.
+    final class Menu: NSObject, NSMenuDelegate {
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            for account in [SpawnBudget.all] + SpawnBudget.accounts() {
+                let (value, from) = SpawnBudget.effective(account)
+                let name = account == SpawnBudget.all ? "All accounts" : account
+                let item = NSMenuItem(
+                    title: "\(name): \(value)\(from == "own line" ? "" : " (\(from))")\u{2026}",
+                    action: #selector(SessionsWindow.editSpawnBudget(_:)), keyEquivalent: "")
+                item.representedObject = account
+                item.toolTip = "Spawns a session makes before subagent-guard asks once; written to \(SpawnBudget.file.path)"
+                menu.addItem(item)
+            }
+        }
+    }
+
+    static func selfTestProblems() -> [String] {
+        var problems: [String] = []
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? "work ~/.claude\npersonal ~/.claude-personal\n"
+            .write(to: folder.appendingPathComponent("claude-accounts"), atomically: true, encoding: .utf8)
+        defer { try? fm.removeItem(at: folder) }
+        if effective("work") != ("8", "default") { problems.append("spawn budget with no file is not the default 8") }
+        set(all, "42")
+        set("personal", "unlimited")
+        if effective("work") != ("42", "all accounts") { problems.append("spawn budget * does not cover an account") }
+        if effective("personal") != ("unlimited", "own line") { problems.append("spawn budget account line does not win over *") }
+        if set("work", "lots") == nil { problems.append("spawn budget takes a value the hook refuses") }
+        set("personal", "")
+        if effective("personal") != ("42", "all accounts") { problems.append("spawn budget line is not removed by an empty value") }
+        let text = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        if !text.hasPrefix("#") || !text.contains("*           42\n") || text.contains("personal") {
+            problems.append("spawn budget file reads wrong after edits: \(text)")
+        }
+        let menu = NSMenu()
+        Menu().menuNeedsUpdate(menu)
+        let titles = menu.items.map(\.title)
+        if titles != ["All accounts: 42\u{2026}", "work: 42 (all accounts)\u{2026}", "personal: 42 (all accounts)\u{2026}"] {
+            problems.append("spawn budget menu reads \(titles)")
+        }
+        return problems
+    }
+}
+
 /// The ssh-request-guard hook's asks, and the hosts cleared for each session.
 /// The hook appends one JSON line per ask to asks.jsonl; a host is cleared for a
 /// session by a line in session-allow/<session id>, the file
@@ -8472,6 +8597,22 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         refreshTable()
     }
 
+    /// One account's (or every account's) subagent spawn budget, from the Guards menu.
+    @objc func editSpawnBudget(_ sender: NSMenuItem) {
+        guard let account = sender.representedObject as? String else { return }
+        let name = account == SpawnBudget.all ? "all accounts" : account
+        let own = SpawnBudget.lines()[account] ?? ""
+        let (value, from) = SpawnBudget.effective(account)
+        ask("Subagent spawn budget for \(name)",
+            "Spawns a session makes before subagent-guard asks once; nesting is refused at any budget. "
+                + "A whole number or unlimited; empty \(account == SpawnBudget.all ? "goes back to 8" : "uses the all-accounts line, else 8"). "
+                + "Now \(value) (\(from)). Written to \(SpawnBudget.file.path), on this Mac only.",
+            placeholder: account == SpawnBudget.all ? "8" : SpawnBudget.effective(SpawnBudget.all).value,
+            value: own) { [weak self] input in
+            if let error = SpawnBudget.set(account, input.lowercased()) { self?.note(error) }
+        }
+    }
+
     /// Says, beside the list's controls, which guards are off for every session.
     private func drawGuardsLabel() {
         let off = [(GuardBypassAll.ssh, "ssh guard"), (GuardBypassAll.spawn, "subagent spawn guard")]
@@ -10635,6 +10776,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             problems = ["fixture did not decode: \(error)"]
         }
         problems += UsageWindow.selfTestProblems()
+        problems += SpawnBudget.selfTestProblems()
         problems += HealthWindow.selfTestProblems()
         problems += LeaderboardWindow.selfTestProblems()
         problems += tmuxLookupProblems()
@@ -10711,6 +10853,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 /// Without a menu the key equivalents do not exist, so ⌘Q and ⌘C do nothing.
+/// Held for the app's life: an NSMenu keeps its delegate weakly.
+let spawnBudgetMenu = SpawnBudget.Menu()
+
 func buildMenu() {
     let main = NSMenu()
 
@@ -10791,6 +10936,11 @@ func buildMenu() {
         withTitle: "Bypass subagent spawn guard for all sessions", action: #selector(SessionsWindow.toggleSpawnBypassAll),
         keyEquivalent: ""
     ).toolTip = "subagent-guard stops asking past its spawn budget in every session until this is turned off; nesting is still refused"
+    let budgetItem = NSMenuItem(title: "Subagent Spawn Budget", action: nil, keyEquivalent: "")
+    let budgetMenu = NSMenu(title: "Subagent Spawn Budget")
+    budgetMenu.delegate = spawnBudgetMenu
+    budgetItem.submenu = budgetMenu
+    guardsMenu.addItem(budgetItem)
     guardsItem.submenu = guardsMenu
     main.addItem(guardsItem)
 
