@@ -52,7 +52,7 @@
 <li>Map each pane number to its tmux session with <code>tmux list-panes -a -F '#{pane_id}\t#{session_name}'</code>.</li>
 <li>Mark a tab with no <code>tmuxWindowPane</code> as plain. Its process cannot come back, so record what lets the owner pick up: its shell's folder (<code>lsof -a -p &lt;pid&gt; -d cwd</code>), the foreground command and arguments (<code>ps</code> on its tty), and the last lines of its screen (iTerm2's AppleScript <code>contents</code>). The screen lines go in a file of their own beside the record, readable only by the owner (mode 600), since they can hold secrets.</li>
 <li>Write <code>Application Support/CC Sessions/iterm-tabs.json</code> beside <code>restart-all.json</code>. It holds the time saved and the windows in order. Each window has its kind (hotkey or normal), its profile name, and its ordered tabs. Each tab has its kind (tmux or plain), name and profile; a tmux tab adds its session name, and a plain tab its folder, command and the path of its screen file.</li>
-<li>Report it in the status line, for example "Saved 6 tmux tabs, 1 plain tab".</li>
+<li>Report it in the message bar under the session list, for example "Saved 6 tmux tabs, 1 plain tab".</li>
 </ol>
 <h3>Restore iTerm Tabs</h3>
 <ol>
@@ -106,7 +106,7 @@
 <h2>Testing</h2>
 <ul>
 <li>Self-test, on fixed output only: AppleScript tab listings and <code>list-panes</code> text to the saved record, plain tabs included; the record to the restore plan, in order, skipping ended sessions and those already shown; refusal of a missing record; a record of any age accepted.</li>
-<li>No test runs against the owner's live sessions or running iTerm2 while building: the owner asked for that. Save, Restore and Restart are first used for real by the owner, and the status line reports each step.</li>
+<li>No test runs against the owner's live sessions or running iTerm2 while building: the owner asked for that. Save, Restore and Restart are first used for real by the owner, and the message bar under the session list reports each step.</li>
 </ul>
 </section>
 <section id="open-questions">

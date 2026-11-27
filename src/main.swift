@@ -4282,7 +4282,9 @@ func colourSwatch(_ color: NSColor, ringed: Bool) -> NSImage {
 
 /// A line of feedback that takes no room while it is empty.
 final class StatusLabel: NSTextField {
-    override var stringValue: String { didSet { isHidden = stringValue.isEmpty } }
+    override var stringValue: String { didSet { isHidden = stringValue.isEmpty; changed?() } }
+    /// Told after every new value, so the strip it sits in can show or go.
+    var changed: (() -> Void)?
 
     init() {
         super.init(frame: .zero)
@@ -7061,6 +7063,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     private let guardsLabel = NSTextField(labelWithString: "")
     /// The send bar over the guards line, under the table; each shows only while it has something.
     private let bottomStack = NSStackView()
+    private let bottomLine = NSBox()
     /// The table reaches the window's bottom, or stops above the bottom strip while it shows.
     private var tableToBottom: NSLayoutConstraint?
     private var tableToStrip: NSLayoutConstraint?
@@ -7151,8 +7154,14 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         content.wantsLayer = true
         content.layer?.backgroundColor = Palette.background.cgColor
 
-        statusLabel.textColor = Palette.dim
+        // A line of feedback, in its own bar under the table: whole, on as many lines as it needs.
+        statusLabel.textColor = .labelColor
         statusLabel.font = NSFont.systemFont(ofSize: 12)
+        statusLabel.lineBreakMode = .byWordWrapping
+        statusLabel.maximumNumberOfLines = 0
+        statusLabel.cell?.wraps = true
+        statusLabel.cell?.isScrollable = false
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         // The account-wide quotas, once, above a table whose rows may run long.
@@ -7251,7 +7260,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         bottomStack.translatesAutoresizingMaskIntoConstraints = false
         bottomStack.addArrangedSubview(sendBar)
         bottomStack.addArrangedSubview(guardsLabel)
+        bottomStack.addArrangedSubview(statusLabel)
         content.addSubview(bottomStack)
+        bottomLine.boxType = .separator
+        bottomLine.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(bottomLine)
         tableToBottom = gridScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         tableToStrip = gridScroll.bottomAnchor.constraint(equalTo: bottomStack.topAnchor)
 
@@ -7261,6 +7274,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             bottomStack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             sendBar.widthAnchor.constraint(equalTo: bottomStack.widthAnchor, constant: -32),
             guardsLabel.trailingAnchor.constraint(lessThanOrEqualTo: bottomStack.trailingAnchor, constant: -16),
+            statusLabel.widthAnchor.constraint(equalTo: bottomStack.widthAnchor, constant: -32),
+            bottomLine.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            bottomLine.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            bottomLine.topAnchor.constraint(equalTo: bottomStack.topAnchor),
             quotaBar.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             quotaBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             usageButton.leadingAnchor.constraint(equalTo: quotaBar.trailingAnchor, constant: 8),
@@ -7283,8 +7300,8 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             refreshButton.widthAnchor.constraint(equalToConstant: 18),
             refreshButton.heightAnchor.constraint(equalToConstant: 18),
         ])
+        statusLabel.changed = { [weak self] in self?.fitBottomStrip() }
         drawGuardsLabel()
-
     }
 
     private struct Column {
@@ -7406,10 +7423,6 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         top.spacing = 8
         top.distribution = .fill
         // The list's controls, one row above the sound controls.
-        // A line of feedback shows above them only while it has something to say.
-        statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360).isActive = true
-        soundBar.addArrangedSubview(statusLabel)
         soundBar.addArrangedSubview(listControls)
         soundBar.addArrangedSubview(top)
     }
@@ -7926,6 +7939,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         }
 
         problems += selectModeProblems(fixture: fixture)
+        problems += messageBarProblems()
 
         // The list's controls end at the right edge, level with the pack name under them.
         window.contentView?.layoutSubtreeIfNeeded()
@@ -7936,6 +7950,24 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
         // Layout: resizes, fits the screen, shrinks to its minimum.
         problems += WindowChecks.verify(window).map { "window: \($0)" }
+        return problems
+    }
+
+    /// A message shows in the bar under the table, whole, and leaves no bar behind once cleared.
+    private func messageBarProblems() -> [String] {
+        var problems: [String] = []
+        guard let content = window?.contentView else { return ["no window for the message bar"] }
+        statusLabel.stringValue = ""
+        let long = String(repeating: "a long message that has to wrap ", count: 20)
+        note(long)
+        content.layoutSubtreeIfNeeded()
+        if bottomStack.isHidden || tableToStrip?.isActive != true { problems.append("a message shows no bar under the table") }
+        let bar = statusLabel.convert(statusLabel.bounds, to: content)
+        if bar.maxY > gridScroll.frame.minY + 1 || bar.minY < 0 { problems.append("the message is not under the table") }
+        if bar.maxX > content.bounds.width { problems.append("the message runs past the window") }
+        if statusLabel.frame.height < 30 { problems.append("a long message is not wrapped") }
+        statusLabel.stringValue = ""
+        if !bottomStack.isHidden || tableToBottom?.isActive != true { problems.append("the message bar stays after the message") }
         return problems
     }
 
@@ -8637,10 +8669,11 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         fitBottomStrip()
     }
 
-    /// The table stops above the strip under it while the send bar or the guards line shows.
+    /// The table stops above the strip under it while the send bar, the guards line or a message shows.
     private func fitBottomStrip() {
-        let empty = sendBar.isHidden && guardsLabel.isHidden
+        let empty = sendBar.isHidden && guardsLabel.isHidden && statusLabel.isHidden
         bottomStack.isHidden = empty
+        bottomLine.isHidden = empty
         // Off before on, so the two are never active together.
         if empty { tableToStrip?.isActive = false; tableToBottom?.isActive = true }
         else { tableToBottom?.isActive = false; tableToStrip?.isActive = true }
@@ -10924,9 +10957,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller.toggleSSHBypassAll()
             controller.toggleSpawnBypassAll()
         }
+        // CC_SESSIONS_WINDOW_NOTE=<text> draws it with that message in the bar under the table.
         if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_PNG"],
             let content = controller?.window?.contentView
         {
+            if let message = ProcessInfo.processInfo.environment["CC_SESSIONS_WINDOW_NOTE"] { controller?.note(message, seconds: 60) }
             // Laid out first: without a pass the picture shows controls where the window never draws them.
             content.layoutSubtreeIfNeeded()
             if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
