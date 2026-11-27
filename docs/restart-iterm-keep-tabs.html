@@ -15,6 +15,7 @@
 <li><a href="#goal">Goal</a></li>
 <li><a href="#what-exists-today">What exists today</a></li>
 <li><a href="#design">Design</a></li>
+<li><a href="#after-a-reboot">After a reboot</a></li>
 <li><a href="#keeping-the-order">Keeping the order</a></li>
 <li><a href="#risks-and-unknowns">Risks and unknowns</a></li>
 <li><a href="#testing">Testing</a></li>
@@ -28,7 +29,7 @@
 <p>Quit and reopen iTerm2 while Claude sessions are busy, and come back to the same tabs in the same order, each showing the same session, with no session interrupted. This is a frequent step, for example when iTerm2 has a pending security update.</p>
 <p>The owner chose:</p>
 <ul>
-<li>On demand, not automatic on every launch.</li>
+<li>On demand, not automatic on every launch. Widened on 27 November 2026: the app also saves on its own, and Restore works after a reboot (see <a href="#after-a-reboot">After a reboot</a>).</li>
 <li>Keep the exact tab order, not only the list of tabs.</li>
 </ul>
 </section>
@@ -60,7 +61,7 @@
 <li>Per saved window: the hotkey window is the existing one (made with its profile when absent); a normal window is created with its saved profile. Tabs already in a window are kept, and the restored tabs follow them.</li>
 <li>One loop over each window's tabs in saved order. Before creating each tab, select the window's last tab: this iTerm2 adds a new tab after the current one, not at the end (<code>AddNewTabAtEndOfTabs</code> is off), so a click during the restore would otherwise put tabs out of place.
 <ul>
-<li>A tmux tab: skip a session that has ended, or that iTerm2 already shows (a tab with its pane's <code>tmuxWindowPane</code>). Otherwise attach it in control mode, as <code>focusTerminal</code> does, and wait until iTerm2 shows its tab before the next one. Then give the tab its title back: a reattach does not replay the title escape the program wrote, so the tab shows only its job ("claude"). The title tmux keeps for the pane (Claude Code's own) is written again as an OSC 0 escape to the pane's tty, which tmux passes to iTerm2 as output; when the pane has none, the session's name in CC Sessions is used. A tab that does not appear within its time limit is reported and skipped.</li>
+<li>A tmux tab: resume a session that has ended (see <a href="#after-a-reboot">After a reboot</a>), skip one that iTerm2 already shows (a tab with its pane's <code>tmuxWindowPane</code>). Otherwise attach it in control mode, as <code>focusTerminal</code> does, and wait until iTerm2 shows its tab before the next one. Then give the tab its title back: a reattach does not replay the title escape the program wrote, so the tab shows only its job ("claude"). The title tmux keeps for the pane (Claude Code's own) is written again as an OSC 0 escape to the pane's tty, which tmux passes to iTerm2 as output; when the pane has none, the session's name in CC Sessions is used. A tab that does not appear within its time limit is reported and skipped.</li>
 <li>A plain tab: open a shell that changes to the saved folder and prints, as <code>#</code> comment lines, the command that was running, then shows the saved screen lines with <code>cat</code> on their file. Nothing from the screen goes through AppleScript or shell quoting.</li>
 </ul></li>
 <li>Report what came back, what had ended, and what did not appear.</li>
@@ -74,10 +75,22 @@
 <li>A busy session's hook may launch iTerm2 again before this step (see Risks). If iTerm2 is already running, use it; otherwise open it. Wait until it answers Apple events, then Restore.</li>
 </ol>
 </section>
+<section id="after-a-reboot">
+<h2>After a reboot</h2>
+<p>A reboot or a lost tmux server ends every session, so the first design restored nothing: the record held only tmux session names. Added on 27 November 2026, after exactly that.</p>
+<ul>
+<li><strong>Record.</strong> Each tmux tab also keeps its Claude session id, launch folder, current folder, model, effort, permission mode and name. The record keeps the boot session id, the tmux server's pid and iTerm2's pid.</li>
+<li><strong>Which id.</strong> clo's record for the tmux name comes first, since it follows <code>/clear</code> and resume; one from another folder belongs to another session and is ignored. clo can delete its record, so the saved id is the fallback.</li>
+<li><strong>Restore.</strong> A running tmux session is attached (on another server or boot, only when it holds the saved Claude session). Otherwise the Claude session is resumed in the tab's position; one running under another tmux name is attached; one running outside tmux is skipped; a tab with no session, or no prompt yet, becomes a shell that says so. A sheet asks first when anything will be resumed or the Mac restarted, and a sheet lists every outcome.</li>
+<li><strong>Automatic save.</strong> Every 30 seconds, when the tabs changed. A record from another boot, tmux server or iTerm2 is held until restored in full or saved over by hand; the current tabs go to <code>iterm-tabs-current.json</code>, which replaces the held record once its own run has ended with a Claude session in it. A smaller set must last 60 seconds, and a shutdown notice stops saving for five minutes.</li>
+<li><strong>Not recovered.</strong> A turn cut off mid-run, plain tabs' programs, scrollback, tabs of another tmux server.</li>
+<li><strong>Not yet seen in use.</strong> The shutdown guard, and a real restore after a reboot: the self-test covers the plan and the order on fixed data only.</li>
+</ul>
+</section>
 <section id="keeping-the-order">
 <h2>Keeping the order</h2>
 <p>No iTerm2 Python API is needed. iTerm2 adds each tmux tab at the end of the window, and <code>AutoHideTmuxClientSession</code> buries the gateway tab that opened it. A new plain tab goes after the current tab, so the restore selects the window's last tab before each one. Creating every tab in one loop, in saved order, each only after the previous one is shown, rebuilds the saved order after whatever tabs the window already has.</p>
-<p>The restore must not go through clo, whose <code>iterm-place-tmux-tab.py</code> moves a tmux tab into the slot of the tab that launched it. <code>focusTerminal</code>'s attach already avoids clo.</p>
+<p>An attach goes through <code>clo --attach</code>, which moves nothing. A resume goes through <code>clo --run-claude</code>, whose <code>iterm-place-tmux-tab.py</code> moves the new tmux tab into the slot of the tab that launched it, the position the restore chose; the restore waits for each new tab before the next.</p>
 </section>
 <section id="risks-and-unknowns">
 <h2>Risks and unknowns</h2>

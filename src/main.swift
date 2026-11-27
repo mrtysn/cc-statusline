@@ -3906,7 +3906,7 @@ func replacedBundle(at path: String, executable: String? = Bundle.main.executabl
 /// silently, so whatever osascript says is logged; `logOutput: false` leaves out what it
 /// printed (a terminal's screen text, which can hold secrets) and logs only its size.
 @discardableResult
-func runScript(_ script: String, label: String, retrying: Bool = false, logOutput: Bool = true) -> String {
+func runScript(_ script: String, label: String, retrying: Bool = false, logOutput: Bool = true, logSuccess: Bool = true) -> String {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     task.arguments = ["-e", script]
@@ -3924,7 +3924,9 @@ func runScript(_ script: String, label: String, retrying: Bool = false, logOutpu
     let stderr = String(data: (try? err.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8) ?? ""
     task.waitUntilExit()
     let result = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-    log("\(label): exit \(task.terminationStatus) out=\(logOutput ? result : "<\(result.utf8.count) bytes, not logged>") err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+    if logSuccess || task.terminationStatus != 0 {
+        log("\(label): exit \(task.terminationStatus) out=\(logOutput ? result : "<\(result.utf8.count) bytes, not logged>") err=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
     // -1743: macOS refuses this process's Apple events. A copy that a reinstall replaced while it
     // ran is refused whatever the grant says, and wiping the grant would only lose the user's real
     // one: that copy has to be reopened. Otherwise the grant is down as refused and macOS answers
@@ -3941,7 +3943,7 @@ func runScript(_ script: String, label: String, retrying: Bool = false, logOutpu
             if (try? reset.run()) != nil {
                 reset.waitUntilExit()
                 log("\(label): reset the Automation grant to ask again")
-                return runScript(script, label: label, retrying: true, logOutput: logOutput)
+                return runScript(script, label: label, retrying: true, logOutput: logOutput, logSuccess: logSuccess)
             }
         } else {
             tellWindow("Could not reach iTerm: allow CC Sessions under Privacy & Security > Automation")
@@ -8301,9 +8303,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
         // Countdowns keep running while nothing redraws, and a session only
         // becomes "finished" with the passage of time.
         pollDetachedPanes()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(macWillPowerOff), name: NSWorkspace.willPowerOffNotification, object: nil)
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.reload()
             self?.pollDetachedPanes()
+            self?.autosaveTabs()
             // The account's quotas, so a reset made on claude.ai reaches the bar with no
             // session redrawing: the script gates it to one request per five minutes.
             DispatchQueue.global(qos: .utility).async { refreshUsageOnce() }
@@ -8588,7 +8593,7 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
             return true
         }
         if item.action == #selector(finishLastRestartAll) { return fm.fileExists(atPath: restartRecordPath) }
-        if item.action == #selector(restoreITermTabsAction) { return fm.fileExists(atPath: savedTabsPath) }
+        if item.action == #selector(restoreITermTabsAction) { return fm.fileExists(atPath: savedTabsPath) || fm.fileExists(atPath: secondSavedTabsPath) }
         if item.action == #selector(resumeSelectedSessions) {
             let n = selectedFinished.count
             item.title = n > 0 ? "Resume \(n) Selected Session\(n == 1 ? "" : "s")" : "Resume Selected Sessions (⌘-click rows)"
@@ -9134,36 +9139,97 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     }
 
     /// Records every iTerm window and tab in order, so Restore iTerm Tabs can rebuild them after iTerm
-    /// restarts (an update, a quit). See docs/restart-iterm-keep-tabs.html.
+    /// or the Mac restarts. See docs/restart-iterm-keep-tabs.html.
     @objc func saveITermTabsAction() {
         note("Saving iTerm tabs", seconds: 10)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let (record, message) = saveITermTabs()
+        let seen = seenSessions()
+        itermTabsQueue.async {
+            let (record, message) = saveITermTabs(seen: seen)
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                if record == nil { self.tellFailure("iTerm tabs not saved", message) } else { self.note(message, seconds: 8) }
+                if record == nil { self.tellSheet("iTerm tabs not saved", message) } else { self.note(message, seconds: 8) }
             }
         }
     }
 
-    /// A failure of an action the owner chose, as a sheet: a status-line note fades before it is read.
-    private func tellFailure(_ title: String, _ message: String) {
+    /// The outcome of an action the owner chose, as a sheet: a status-line note fades before it is read.
+    private func tellSheet(_ title: String, _ message: String, lines: [String] = []) {
         note(message, seconds: 15)
         guard let window = window else { return }
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.beginSheetModal(for: window)
+        showWindow(nil)
+        tabsAlert(title, message, lines: lines).beginSheetModal(for: window)
     }
 
-    /// Opens the saved tabs again in their saved order, after whatever tabs iTerm has now.
+    /// Opens the saved tabs again in their saved order, after whatever tabs iTerm has now. It asks
+    /// first when sessions will be resumed or the Mac restarted since the save, and reports each tab.
     @objc func restoreITermTabsAction() {
-        let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
+        let seen = seenSessions()
         let names = tmuxSessionNames()
-        DispatchQueue.global(qos: .userInitiated).async {
-            let message = restoreITermTabs(report: report, names: names)
-            report(message, 30)
+        note("Reading the saved iTerm tabs", seconds: 10)
+        itermTabsQueue.async {
+            let (prepared, why) = prepareITermRestore(seen: seen)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                guard let prepared = prepared else { self.tellSheet("iTerm tabs not restored", why); return }
+                let resumes = prepared.plan.actions.contains { if case .resume = $0 { return true } else { return false } }
+                guard prepared.rebooted || resumes, !prepared.plan.actions.isEmpty, let window = self.window else {
+                    self.runITermRestore(prepared, names: names)
+                    return
+                }
+                let preview = restorePreview(prepared.plan)
+                let alert = tabsAlert(restoreQuestion(prepared), preview.counts, lines: preview.lines)
+                alert.addButton(withTitle: "Restore")
+                alert.addButton(withTitle: "Cancel")
+                self.showWindow(nil)
+                alert.beginSheetModal(for: window) { [weak self] response in
+                    if response == .alertFirstButtonReturn { self?.runITermRestore(prepared, names: names) }
+                }
+            }
         }
+    }
+
+    private func runITermRestore(_ prepared: PreparedRestore, names: [String: String]) {
+        let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
+        itermTabsQueue.async {
+            let result = performITermRestore(prepared, report: report, names: names)
+            DispatchQueue.main.async { [weak self] in self?.tellSheet("iTerm tabs restored", result.summary, lines: result.lines) }
+        }
+    }
+
+    /// Every session the list knows, as a save or restore needs it; one per id, the live one first.
+    private func seenSessions() -> [SeenSession] {
+        var ids = Set<String>()
+        return allRows.compactMap { row in
+            let s = row.session.summary
+            guard let id = s.session_id, let dir = s.project_dir, ids.insert(id).inserted else { return nil }
+            let claude = SavedClaude(id: id, dir: (dir as NSString).expandingTildeInPath, cwd: s.cwd, model: s.model_id, effort: s.effort,
+                                     mode: row.session.transcript?.mode, name: s.session_name ?? s.topic, prompted: row.session.transcript != nil)
+            return SeenSession(claude: claude, tty: row.session.tty, live: !row.past)
+        }
+    }
+
+    private var autosaveState = AutosaveState()
+    private var autosaveQueued = false
+    /// Set by a coming shutdown or logout: the tabs closing under it are not the tabs to keep.
+    private var autosaveStoppedUntil = Date.distantPast
+
+    /// The 30-second tick's save of the iTerm tabs, once the list has been read.
+    private func autosaveTabs() {
+        guard paintedOnce, !autosaveQueued, Date() > autosaveStoppedUntil else { return }
+        autosaveQueued = true
+        let seen = seenSessions()
+        itermTabsQueue.async { [weak self] in
+            guard let self = self else { return }
+            var state = DispatchQueue.main.sync { self.autosaveState }
+            autosaveITermTabs(seen: seen, state: &state)
+            DispatchQueue.main.async { self.autosaveState = state; self.autosaveQueued = false }
+        }
+    }
+
+    @objc private func macWillPowerOff() {
+        // A shutdown that is cancelled leaves the app running: saving starts again after five minutes.
+        autosaveStoppedUntil = Date().addingTimeInterval(300)
+        log("iterm tabs: autosave stopped, the Mac is shutting down or logging out")
     }
 
     /// Each live session's name as this list shows it, by its tmux session: a restored tab's title
@@ -9185,11 +9251,12 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
     @objc func restartITermKeepTabs() {
         guard let window = window else { return }
         note("Saving iTerm tabs", seconds: 10)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let (record, message) = saveITermTabs()
+        let seen = seenSessions()
+        itermTabsQueue.async {
+            let (record, message) = saveITermTabs(seen: seen)
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                guard let record = record else { self.tellFailure("iTerm2 was not restarted", message); return }
+                guard let record = record else { self.tellSheet("iTerm2 was not restarted", message); return }
                 let tabs = record.windows.flatMap(\.tabs)
                 let plain = tabs.filter { $0.kind == "plain" }, other = tabs.filter { $0.kind == "other" }
                 let alert = NSAlert()
@@ -9209,9 +9276,10 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
                     let report = { (message: String, seconds: Double) in DispatchQueue.main.async { [weak self] in self?.note(message, seconds: seconds) } }
                     let sessions = Set(tabs.compactMap(\.session))
                     let names = self.tmuxSessionNames()
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        let result = runITermRestart(sessions: sessions, liveITermRestartSteps(report: report, names: names))
-                        report(result, 30)
+                    itermTabsQueue.async {
+                        let result = runITermRestart(sessions: sessions, liveITermRestartSteps(seen: seen, report: report, names: names))
+                        let lines = result.components(separatedBy: "\n")
+                        DispatchQueue.main.async { [weak self] in self?.tellSheet("iTerm2 restart", lines[0], lines: Array(lines.dropFirst())) }
                     }
                 }
             }
@@ -10697,6 +10765,65 @@ final class SessionsWindow: NSWindowController, NSTableViewDataSource, NSTableVi
 
 // MARK: - Application
 
+/// Draws a sheet's picture without showing it.
+@MainActor
+func drawAlert(_ alert: NSAlert, to path: String) {
+    // Dark, as a sheet on the sessions window is. The alert's own background is a blur the capture
+    // leaves white, so a plain fill goes under its controls.
+    alert.window.appearance = NSAppearance(named: .darkAqua)
+    alert.layout()
+    guard let content = alert.window.contentView else { return }
+    let fill = NSBox(frame: content.bounds)
+    fill.boxType = .custom
+    fill.borderWidth = 0
+    fill.fillColor = NSColor(srgbRed: 0.17, green: 0.17, blue: 0.18, alpha: 1)
+    fill.autoresizingMask = [.width, .height]
+    content.addSubview(fill, positioned: .below, relativeTo: nil)
+    content.layoutSubtreeIfNeeded()
+    if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+        content.cacheDisplay(in: content.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    }
+}
+
+/// A sheet about the iTerm tabs: a title, a sentence and a scrolling line per tab.
+@MainActor
+func tabsAlert(_ title: String, _ message: String, lines: [String]) -> NSAlert {
+    let alert = NSAlert()
+    alert.messageText = title
+    alert.informativeText = message
+    guard !lines.isEmpty else { return alert }
+    let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 480, height: 0))
+    text.isEditable = false
+    text.drawsBackground = false
+    text.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+    text.textColor = .labelColor
+    text.string = lines.joined(separator: "\n")
+    text.isVerticallyResizable = true
+    text.textContainer?.widthTracksTextView = true
+    if let container = text.textContainer { text.layoutManager?.ensureLayout(for: container) }
+    let needed = text.textContainer.flatMap { text.layoutManager?.usedRect(for: $0).height } ?? 0
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 480, height: min(max(ceil(needed) + 4, 20), 320)))
+    scroll.drawsBackground = false
+    scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = true
+    text.frame.size.height = ceil(needed) + 4
+    scroll.documentView = text
+    alert.accessoryView = scroll
+    return alert
+}
+
+/// The title of the question asked before a restore.
+func restoreQuestion(_ prepared: PreparedRestore) -> String {
+    var when = ""
+    if let saved = ISO8601DateFormatter().date(from: prepared.record.savedAt) {
+        let f = DateFormatter()
+        f.dateFormat = Calendar.current.isDateInToday(saved) ? "HH:mm" : "EEE d MMM HH:mm"
+        when = " saved at \(f.string(from: saved))"
+    }
+    return prepared.rebooted ? "The Mac restarted since the tabs\(when). Restore them?" : "Restore the iTerm tabs\(when)?"
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: SessionsWindow?
@@ -10822,23 +10949,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 made("e", "Older crash", "~/dev/project-e", "crashed", minutes: 400),
             ], now: now, boot: now - 86400000 * 2, detachedAvailable: false)
             if let index = ProcessInfo.processInfo.environment["CC_SESSIONS_RECOVER_RANGE"].flatMap(Int.init) { sheet.chooseRange(index) }
-            // Dark, as a sheet on the sessions window is. The alert's own background is a blur the capture
-            // leaves white, so a plain fill goes under its controls.
-            sheet.alert.window.appearance = NSAppearance(named: .darkAqua)
-            sheet.alert.layout()
-            if let content = sheet.alert.window.contentView {
-                let fill = NSBox(frame: content.bounds)
-                fill.boxType = .custom
-                fill.borderWidth = 0
-                fill.fillColor = NSColor(srgbRed: 0.17, green: 0.17, blue: 0.18, alpha: 1)
-                fill.autoresizingMask = [.width, .height]
-                content.addSubview(fill, positioned: .below, relativeTo: nil)
-                content.layoutSubtreeIfNeeded()
-                if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
-                    content.cacheDisplay(in: content.bounds, to: rep)
-                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
-                }
-            }
+            drawAlert(sheet.alert, to: path)
+        }
+        // CC_SESSIONS_RESTORE_PNG=<path> saves the Restore iTerm Tabs question over made-up tabs.
+        if let path = ProcessInfo.processInfo.environment["CC_SESSIONS_RESTORE_PNG"] {
+            func made(_ name: String) -> SavedClaude { SavedClaude(id: name, dir: "/fixture", name: name) }
+            let plan = RestorePlan(windows: [(true, "H", [
+                .resume(made("Fixture build and unit runs"), profile: "H"),
+                .resume(made("Status line usage window with a much longer topic that has to be cut short somewhere"), profile: "H"),
+                .attach(session: "project-c-3f", profile: "H"), .shell(folder: "/fixture/four", notes: nil, profile: "H"),
+                .placeholder(session: "project-e-91", folder: nil, why: "ended; it held no Claude session", profile: "H")])],
+                skipped: ["project-f-02: already shown"])
+            let prepared = PreparedRestore(record: SavedTabs(savedAt: "2026-01-02T03:04:00Z", windows: []), plan: plan, rebooted: true)
+            let preview = restorePreview(plan)
+            let alert = tabsAlert(restoreQuestion(prepared), preview.counts, lines: preview.lines)
+            alert.addButton(withTitle: "Restore")
+            alert.addButton(withTitle: "Cancel")
+            drawAlert(alert, to: path)
         }
         try? fm.removeItem(at: selfTestRoot)
         for problem in problems { print("self-test: \(problem)") }
