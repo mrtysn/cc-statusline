@@ -10962,9 +10962,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 skipped: ["project-f-02: already shown"])
             let prepared = PreparedRestore(record: SavedTabs(savedAt: "2026-01-02T03:04:00Z", windows: []), plan: plan, rebooted: true)
             let preview = restorePreview(plan)
-            let alert = tabsAlert(restoreQuestion(prepared), preview.counts, lines: preview.lines)
-            alert.addButton(withTitle: "Restore")
-            alert.addButton(withTitle: "Cancel")
+            let alert: NSAlert
+            // CC_SESSIONS_RESTORE_RESULT=1 draws the sheet that reports a restore instead.
+            if ProcessInfo.processInfo.environment["CC_SESSIONS_RESTORE_RESULT"] == "1" {
+                let said = ["resumed as project-a-1c", "opened, but no tmux tab appeared after 45 s, check its tab", "reattached", "new shell", "cannot return, shell opened"]
+                alert = tabsAlert("iTerm tabs restored", "Opened 5 of 5 iTerm tabs; some did not come back",
+                                  lines: zip(said, plan.actions).map { "\($0): \($1.label)" } + plan.skipped.map { "skipped: \($0)" })
+            } else {
+                alert = tabsAlert(restoreQuestion(prepared), preview.counts, lines: preview.lines)
+                alert.addButton(withTitle: "Restore")
+                alert.addButton(withTitle: "Cancel")
+            }
             drawAlert(alert, to: path)
         }
         try? fm.removeItem(at: selfTestRoot)
